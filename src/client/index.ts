@@ -1765,7 +1765,7 @@ function Panel(): any {
     const currentSwitchMinutes = (): number => Math.max(0, Math.round(Number(swRange.value) || 0))
 
     /** 最近一次自动换号（后端只在**自动**切号时写；手动切不记）。null = 还没有过。 */
-    let lastAutoSwitchInfo: { at: number; from: string; to: string } | null = null
+    let lastAutoSwitchInfo: { at: number; from: string; to: string; reason?: string } | null = null
 
     const paintAutoSwitch = (): void => {
       const minutes = currentSwitchMinutes()
@@ -1778,8 +1778,16 @@ function Panel(): any {
       // 换号那一轮任务会"突然变慢"（全量重发 + 重建会话）。把上一次换号的时间与两端摆出来，
       // 用户看到没来由的卡顿时有地方对原因 —— 否则那只是个无法解释的变慢。
       const last = lastAutoSwitchInfo
+      // 顺手说清**为什么**换的：按时间轮换与"原账号出问题提前换走"，在用户眼里都是
+      // "任务突然变慢"，但后者意味着这个号刚出事 —— 而且它也解释了"为什么没等满间隔就换了"。
+      const why =
+        last?.reason === 'recently-throttled'
+          ? '，原账号刚被限流'
+          : last?.reason === 'current-unusable'
+            ? '，原账号不可用'
+            : ''
       swHint.textContent = last
-        ? `${base}上次自动换号：${shortTime(last.at)}（${last.from} → ${last.to}）。`
+        ? `${base}上次自动换号：${shortTime(last.at)}（${last.from} → ${last.to}${why}）。`
         : base
     }
     swRange.addEventListener('input', paintAutoSwitch)

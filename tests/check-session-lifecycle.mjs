@@ -317,7 +317,7 @@ await run('信封形式的 40029：归 RATE_LIMIT（可重试）+ 文案是「�
   assert.equal(thrown.code, 'RATE_LIMIT', `40029 是限流码，不能落到不可重试的 PROVIDER_ERROR，实际 ${thrown.code}`)
   assert.match(String(thrown.message), /网页版限流/, `文案要短且统一，实际：${thrown.message}`)
   const retryAfter = thrown.failure?.providerRetryAfterMs ?? thrown.providerRetryAfterMs
-  assert.ok(retryAfter >= 20_000, `节流退避要给足（≥20s），实际 ${retryAfter}`)
+  assert.ok(retryAfter >= 20_000, `没得换号时节流退避要给足（≥20s），实际 ${retryAfter}`)
 })
 
 await run('信封形式的老话术（码不认识）：按文案也要归 RATE_LIMIT', async () => {
@@ -374,6 +374,82 @@ await run('muted + canFailover 抛错 ⇒ 按"不能"处理（问不出来就别
   })
   const retryAfter = thrown?.failure?.providerRetryAfterMs ?? thrown?.providerRetryAfterMs
   assert.ok(retryAfter > 60_000, `异常要保守处理，实际 ${retryAfter}`)
+})
+
+// ── 事实 ⑧：限流也要走同一条"能不能换号"的分流（0.5.2）──
+// 之前限流固定给 20 秒退避 + **同一个号**重试 ⇒ 多半还失败 ⇒ 整轮停下来要用户手动重发。
+// 而封禁那条早就有了短退避 + 换号的救急路径 —— 两者不对称。现在补齐：
+// 能换号 ⇒ 2 秒（重发时检查点会换上别的号）；不能换号 ⇒ 仍 20 秒（同号立刻重试只会再撞一次）。
+const THROTTLE_ENVELOPE = throttleEnvelope(40029, 'request rejected by policy')
+
+await run('限流 + 能换号 ⇒ 也给短退避（换号比干等 20 秒有用）', async () => {
+  const kinds = []
+  const { thrown } = await scenario({
+    completionResponses: [jsonResponse(THROTTLE_ENVELOPE)],
+    canFailover: (kind) => {
+      kinds.push(kind)
+      return true
+    },
+  })
+  const retryAfter = thrown?.failure?.providerRetryAfterMs ?? thrown?.providerRetryAfterMs
+  assert.ok(retryAfter > 0 && retryAfter < 10_000, `能换号就该秒级重发，实际 ${retryAfter}`)
+  assert.ok(
+    kinds.length > 0 && kinds.every((kind) => kind === 'throttled'),
+    `宿主必须收到成因 'throttled'（它据此决定能不能换），实际 ${JSON.stringify(kinds)}`,
+  )
+})
+
+await run('限流 + 不能换号 ⇒ 仍是 20 秒退避（同号立刻重试只会再撞一次）', async () => {
+  const { thrown } = await scenario({
+    completionResponses: [jsonResponse(THROTTLE_ENVELOPE)],
+    canFailover: () => false,
+  })
+  const retryAfter = thrown?.failure?.providerRetryAfterMs ?? thrown?.providerRetryAfterMs
+  assert.equal(retryAfter, 20_000, `没得换号时保持原值，实际 ${retryAfter}`)
+})
+
+await run('限流 + 没注入 canFailover ⇒ 与旧行为完全一致（20 秒）', async () => {
+  const { thrown } = await scenario({ completionResponses: [jsonResponse(THROTTLE_ENVELOPE)] })
+  const retryAfter = thrown?.failure?.providerRetryAfterMs ?? thrown?.providerRetryAfterMs
+  assert.equal(retryAfter, 20_000, `默认保持旧行为，实际 ${retryAfter}`)
+})
+
+await run('限流 + canFailover 抛错 ⇒ 按"不能"处理（问不出来就别赌）', async () => {
+  const { thrown } = await scenario({
+    completionResponses: [jsonResponse(THROTTLE_ENVELOPE)],
+    canFailover: () => {
+      throw new Error('boom')
+    },
+  })
+  const retryAfter = thrown?.failure?.providerRetryAfterMs ?? thrown?.providerRetryAfterMs
+  assert.equal(retryAfter, 20_000, `异常时保守处理，实际 ${retryAfter}`)
+})
+
+await run('🔴 成因要传对：封禁给 muted、限流给 throttled（传错宿主会用错判据）', async () => {
+  const mutedKinds = []
+  await scenario({
+    completionResponses: [jsonResponse(REAL_MUTED)],
+    canFailover: (kind) => {
+      mutedKinds.push(kind)
+      return false
+    },
+  })
+  const throttleKinds = []
+  await scenario({
+    completionResponses: [jsonResponse(THROTTLE_ENVELOPE)],
+    canFailover: (kind) => {
+      throttleKinds.push(kind)
+      return false
+    },
+  })
+  assert.ok(
+    mutedKinds.length > 0 && mutedKinds.every((kind) => kind === 'muted'),
+    `封禁那条要传 'muted'，实际 ${JSON.stringify(mutedKinds)}`,
+  )
+  assert.ok(
+    throttleKinds.length > 0 && throttleKinds.every((kind) => kind === 'throttled'),
+    `限流那条要传 'throttled'，实际 ${JSON.stringify(throttleKinds)}`,
+  )
 })
 
 console.log(`通过 ${passed} 项${failures.length ? `，失败 ${failures.length} 项` : '，全部通过 OK'}`)

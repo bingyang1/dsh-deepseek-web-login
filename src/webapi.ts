@@ -133,6 +133,15 @@ export function muteUntilMs(json: any): number | undefined {
  * 它**不是**"等对面恢复"的退避，而是"我马上换个号再试一次"的信号。
  */
 const FAILOVER_RETRY_MS = 2_000
+/**
+ * 限流但**没得换号**时的退避。
+ *
+ * 为什么还留着 20 秒：限流是"发太快了"的反馈，同号立刻重试只会再撞一次。
+ * ⚠️ 但它同时意味着"这一轮基本就断了" —— 台账实测限流后能自动重发的几次，间隔都落在
+ * 27.8s ~ 60s 且那几次仍然失败。所以**能换号就一定走 `FAILOVER_RETRY_MS`**，
+ * 别让用户在这里干等（那是"任务卡住、要手动重发"的根源）。
+ */
+const THROTTLE_RETRY_MS = 20_000
 
 /**
  * 被限制时的用户可读文案。
@@ -1977,7 +1986,7 @@ export interface CompletionParams {
    *
    * ⚠️ 不注入 ⇒ 行为与以前完全一致。宿主返回异常时按 false 处理（保守）。
    */
-  canFailover?: () => boolean
+  canFailover?: (kind?: 'muted' | 'throttled') => boolean
 }
 
 /**
@@ -2010,9 +2019,9 @@ async function openCompletion(
    * 宿主给的「还能不能换号接着干」。问不出来（没注入 / 抛错）时按**不能**处理 ——
    * 保守方向：宁可让用户点一次「继续」，也不要给一个它其实接不上的短退避。
    */
-  const canFailover = (): boolean => {
+  const canFailover = (kind?: 'muted' | 'throttled'): boolean => {
     try {
-      return params.canFailover?.() === true
+      return params.canFailover?.(kind) === true
     } catch {
       return false
     }
@@ -2182,14 +2191,14 @@ async function openCompletion(
             // 让重试立刻发生；重发时自动换号的检查点会换上可用账号，整轮任务自己就能接下去。
             ...(muted && untilMs !== undefined
               ? {
-                  providerRetryAfterMs: canFailover() ? FAILOVER_RETRY_MS : Math.max(0, untilMs - Date.now()),
+                  providerRetryAfterMs: canFailover('muted') ? FAILOVER_RETRY_MS : Math.max(0, untilMs - Date.now()),
                 }
               : {}),
             // 绝对值单独带一份：宿主会把它记到账号上，在设置页显示倒计时
             ...(muted && untilMs !== undefined ? { mutedUntilMs: untilMs } : {}),
             ...(busy ? { providerRetryAfterMs: 5_000 } : {}),
             // 节流给 20s（与 SSE 路径的 throttleBackoffMs 首档一致）；并发那条只给 5s
-            ...(throttled ? { rateLimitKind: 'throttled' as const, providerRetryAfterMs: 20_000 } : {}),
+            ...(throttled ? { rateLimitKind: 'throttled' as const, providerRetryAfterMs: canFailover('throttled') ? FAILOVER_RETRY_MS : THROTTLE_RETRY_MS } : {}),
           },
         )
       : new AdapterLlmError(

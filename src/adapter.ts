@@ -496,8 +496,11 @@ export interface AdapterDeps {
    * 当前账号被限时问宿主：「换个账号还能不能接着干」——
    * 原样转给 webapi 的 `CompletionParams.canFailover`，由它决定失败时给长退避还是短退避。
    * 适配器刻意不自己判断：账号库长什么样只有宿主知道。
+   *
+   * `kind` 是**这次失败的成因**（'muted' 封禁 / 'throttled' 限流）—— 两条路径"能不能换"的
+   * 判据不一样（限流那条还受窗口与冷却约束），所以要把成因传下去，不能只用一个布尔概括。
    */
-  canFailover?: () => boolean
+  canFailover?: (kind?: 'muted' | 'throttled') => boolean
 }
 
 function modelInfoFor(provider: string, spec: ModelSpec, requestedId?: string) {

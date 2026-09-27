@@ -20,7 +20,15 @@ import { join } from 'node:path'
 const HOME = mkdtempSync(join(tmpdir(), 'dswl-autoswitch-'))
 process.env.DSH_HOME = HOME
 
-const { decideAutoSwitch, isSwitchDue, pickNextAccount } = await import('../src/auto-switch.ts')
+const {
+  decideAutoSwitch,
+  freshThrottledIds,
+  isSwitchDue,
+  isThrottleSwitchAllowed,
+  pickNextAccount,
+  THROTTLE_SWITCH_COOLDOWN_MS,
+  THROTTLE_SWITCH_WINDOW_MS,
+} = await import('../src/auto-switch.ts')
 const { AUTO_SWITCH_BOUNDS, DEFAULT_AUTO_SWITCH_MINUTES, clampAutoSwitchMinutes } = await import(
   '../src/gate.ts'
 )
@@ -263,6 +271,174 @@ await test('clamp 与默认值自洽：0 是关闭而不是被兜成默认', () 
   assert.equal(clampAutoSwitchMinutes(0), 0)
   assert.equal(clampAutoSwitchMinutes(Number.NaN), DEFAULT_AUTO_SWITCH_MINUTES)
   assert.equal(DEFAULT_AUTO_SWITCH_MINUTES, 0, '默认关闭 —— 否则老用户升级后会被悄悄换号')
+})
+
+// ── 限流：第三条切号路径（0.5.2）─────────────────────────────────────
+//
+// 语义：限流是**瞬时**状态（不像封禁会写进账号记录的 `limit`），所以单独用"限流时刻表"判。
+// 两条约束缺一不可：① 在窗口内（刚被限流）② 冷却已过（距上次换号够久）——
+// 少了②，"每个号都被限流"就会一路换下去，那正是最该避免的形态。
+
+await test('刚被限流 + 冷却已过 ⇒ 换号，理由是 recently-throttled', () => {
+  const decision = decideAutoSwitch({
+    minutes: 20,
+    lastSwitchAt: NOW - 10 * MIN, // 10 分钟前换过 ⇒ 冷却（3 分钟）已过
+    now: NOW,
+    accounts: [ok('a'), ok('b')],
+    currentId: 'a',
+    throttledAt: new Map([['a', NOW - 5_000]]), // 5 秒前刚被限流
+  })
+  assert.deepEqual(decision, { action: 'switch', nextId: 'b', reason: 'recently-throttled' })
+})
+
+await test('🔴 冷却期内不换 —— 防的是"每个号都被限流时一路换下去"', () => {
+  const decision = decideAutoSwitch({
+    minutes: 20,
+    lastSwitchAt: NOW - 30_000, // 30 秒前刚换过 ⇒ 冷却没过
+    now: NOW,
+    accounts: [ok('a'), ok('b'), ok('c')],
+    currentId: 'a',
+    throttledAt: new Map([['a', NOW - 5_000]]),
+  })
+  assert.equal(decision.action, 'skip', '冷却期内必须忍住 —— 否则 9 个号会在几分钟内被轮一遍')
+  assert.equal(decision.reason, 'not-due')
+})
+
+await test('限流发生在窗口之外（很久以前）⇒ 这一条不成立（到点归到点，别混为一谈）', () => {
+  const decision = decideAutoSwitch({
+    minutes: 20,
+    lastSwitchAt: NOW - 15 * MIN, // 未到点（20 分钟），但已过冷却（3 分钟）
+    now: NOW,
+    accounts: [ok('a'), ok('b')],
+    currentId: 'a',
+    throttledAt: new Map([['a', NOW - 10 * MIN]]), // 远超窗口
+  })
+  assert.equal(decision.action, 'skip', '窗口外的限流不该成为换号理由 —— 那时多半早恢复了')
+  assert.equal(decision.reason, 'not-due')
+})
+
+await test('不传限流时刻表 ⇒ 行为与从前完全一致（不会因限流换号）', () => {
+  const base = {
+    minutes: 20,
+    lastSwitchAt: NOW - 5 * MIN,
+    now: NOW,
+    accounts: [ok('a'), ok('b')],
+    currentId: 'a',
+  }
+  assert.equal(decideAutoSwitch(base).action, 'skip')
+  assert.equal(decideAutoSwitch({ ...base, throttledAt: new Map() }).action, 'skip')
+})
+
+await test('🔴 排除项：切号时跳过"同样刚被限流的号"（切过去只会白搭一轮全量重发）', () => {
+  const decision = decideAutoSwitch({
+    minutes: 20,
+    lastSwitchAt: NOW - 10 * MIN,
+    now: NOW,
+    accounts: [ok('a'), ok('b'), ok('c')],
+    currentId: 'a',
+    throttledAt: new Map([
+      ['a', NOW - 5_000],
+      ['b', NOW - 3_000], // b 也刚被限流过 ⇒ 不该切到 b
+    ]),
+  })
+  assert.deepEqual(decision, { action: 'switch', nextId: 'c', reason: 'recently-throttled' })
+})
+
+await test('所有候选都刚被限流 ⇒ 不换（换谁都发不出去）', () => {
+  const decision = decideAutoSwitch({
+    minutes: 20,
+    lastSwitchAt: NOW - 10 * MIN,
+    now: NOW,
+    accounts: [ok('a'), ok('b')],
+    currentId: 'a',
+    throttledAt: new Map([
+      ['a', NOW - 1_000],
+      ['b', NOW - 1_000],
+    ]),
+  })
+  assert.equal(decision.action, 'skip')
+  assert.equal(decision.reason, 'no-candidate')
+})
+
+await test('限流与"到点"同时成立时，理由取更具体的那个（recently-throttled）', () => {
+  const decision = decideAutoSwitch({
+    minutes: 20,
+    lastSwitchAt: NOW - 30 * MIN, // 也到点了
+    now: NOW,
+    accounts: [ok('a'), ok('b')],
+    currentId: 'a',
+    throttledAt: new Map([['a', NOW - 1_000]]),
+  })
+  assert.equal(decision.reason, 'recently-throttled')
+})
+
+await test('"当前账号不可用"的优先级仍高于限流（失效 / 封禁优先切走）', () => {
+  const decision = decideAutoSwitch({
+    minutes: 20,
+    lastSwitchAt: NOW - 30_000, // 冷却期内
+    now: NOW,
+    accounts: [{ id: 'a', lastVerifyError: { at: 'x', message: '401' } }, ok('b')],
+    currentId: 'a',
+    throttledAt: new Map([['a', NOW - 1_000]]),
+  })
+  assert.deepEqual(decision, { action: 'switch', nextId: 'b', reason: 'current-unusable' })
+})
+
+await test('isThrottleSwitchAllowed：窗口 / 冷却 / 缺值三条边界', () => {
+  const last = NOW - 10 * MIN
+  assert.equal(isThrottleSwitchAllowed({ throttledAt: NOW, lastSwitchAt: last, now: NOW }), true)
+  assert.equal(isThrottleSwitchAllowed({ throttledAt: 0, lastSwitchAt: last, now: NOW }), false, '0 = 没被限流过')
+  assert.equal(isThrottleSwitchAllowed({ throttledAt: undefined, lastSwitchAt: last, now: NOW }), false)
+  assert.equal(
+    isThrottleSwitchAllowed({ throttledAt: NOW - THROTTLE_SWITCH_WINDOW_MS - 1, lastSwitchAt: last, now: NOW }),
+    false,
+    '窗口外',
+  )
+  assert.equal(
+    isThrottleSwitchAllowed({ throttledAt: NOW, lastSwitchAt: NOW - THROTTLE_SWITCH_COOLDOWN_MS + 1, now: NOW }),
+    false,
+    '冷却未过',
+  )
+  assert.equal(
+    isThrottleSwitchAllowed({ throttledAt: NOW, lastSwitchAt: NOW - THROTTLE_SWITCH_COOLDOWN_MS, now: NOW }),
+    true,
+    '冷却正好到点就算过',
+  )
+})
+
+await test('🔴 宿主 canFailover 与决策必须同答（给了短退避却不换号＝更快地撞同一个限流）', () => {
+  // 模拟真实时序：失败那一刻问 canFailover（拿"当下"当限流时刻），
+  // 2 秒后重发时 maybeAutoSwitch 才拿到真正写入的限流时刻。
+  for (const sinceLastSwitch of [0, 30_000, 10 * MIN]) {
+    const lastSwitchAt = NOW - sinceLastSwitch
+    const failoverSays = isThrottleSwitchAllowed({ throttledAt: NOW, lastSwitchAt, now: NOW })
+    const decision = decideAutoSwitch({
+      minutes: 20,
+      lastSwitchAt,
+      now: NOW + 2_000,
+      accounts: [ok('a'), ok('b')],
+      currentId: 'a',
+      throttledAt: new Map([['a', NOW]]),
+    })
+    assert.equal(
+      decision.action === 'switch',
+      failoverSays,
+      `距上次换号 ${sinceLastSwitch}ms 时两边给出了不同答案：canFailover=${failoverSays}，决策=${decision.action}`,
+    )
+  }
+})
+
+await test('freshThrottledIds：只留窗口内的', () => {
+  const fresh = freshThrottledIds(
+    new Map([
+      ['a', NOW - 1_000],
+      ['b', NOW - 10 * MIN],
+      ['c', NOW - THROTTLE_SWITCH_WINDOW_MS - 1],
+    ]),
+    NOW,
+  )
+  assert.deepEqual([...fresh], ['a'])
+  assert.equal(freshThrottledIds(undefined, NOW).size, 0)
 })
 
 console.log(`通过 ${passed} 项${failures.length ? `，失败 ${failures.length} 项` : '，全部通过 OK'}`)

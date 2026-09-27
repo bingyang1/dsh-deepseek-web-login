@@ -44,7 +44,7 @@ import {
   DEFAULT_AUTO_SWITCH_MINUTES,
   type GateSettings,
 } from './gate.ts'
-import { decideAutoSwitch, pickNextAccount, type SwitchableAccount } from './auto-switch.ts'
+import { decideAutoSwitch, freshThrottledIds, isThrottleSwitchAllowed, pickNextAccount, type SwitchableAccount } from './auto-switch.ts'
 import { browserLogin, clearBrowserLoginProfile, findSystemBrowser } from './browser-login.ts'
 import { canOpenElectronWindow, clearLoginPartition, clearLoginState, closeLoginWindow, captureFromPartition, getFingerprintReport, getLastLoginResult, getLoginProgress, isLoginWindowOpen, loginWithToken, logout, openExternalLogin, openLoginWindow } from './login.ts'
 import { beginAddAccount, beginRelogin, commitCapturedAuth, endAddAccount, endRelogin } from './account-add.ts'
@@ -381,6 +381,17 @@ export function apply(ctx: any, config: Config = {}): void {
   let autoSwitching = false
   /** 本轮探活失败过的账号 —— 不选它们，避免在同一个坏号上反复试。进程重启即清空。 */
   const autoSwitchSkip = new Set<string>()
+  /**
+   * 各账号最近一次**被限流**（throttled，不是封禁）的时刻 —— 只放内存，进程重启即清空。
+   *
+   * 为什么不写进账号记录：限流是**瞬时**反馈（窗口几十秒到十几分钟），而账号记录里的 `limit`
+   * 表达的是"服务端给了明确解除时间的账号级限制"。混在一起会让界面把"刚才发太快了"
+   * 显示成"账号受限"，而且那记录会一直留在库里。
+   *
+   * 两个用途：① 判断当前账号是不是"刚被限流"（该不该为它提前换号）
+   * ② 作为**排除项**（`freshThrottledIds`）—— 别切到另一个同样刚被限流的号上，那是白换一轮。
+   */
+  const throttleAt = new Map<string, number>()
 
   async function maybeAutoSwitch(): Promise<void> {
     if (autoSwitching) return // 上一次还在探活，别叠加
@@ -393,6 +404,8 @@ export function apply(ctx: any, config: Config = {}): void {
       now: Date.now(),
       accounts: accounts as SwitchableAccount[],
       currentId: activeAccountId(),
+      // 内存里的限流时刻：既决定"当前账号该不该提前切走"，也用来排除同样刚被限流的号。
+      throttledAt: throttleAt,
     })
     if (decision.action !== 'switch') return
     autoSwitching = true
@@ -429,7 +442,11 @@ export function apply(ctx: any, config: Config = {}): void {
       }
       logger.info?.(
         `deepseek-web: 已自动切换账号到 ${decision.nextId}（每 ${minutes} 分钟轮换` +
-          (decision.reason === 'current-unusable' ? '；原账号不可用，提前切走' : '') +
+          (decision.reason === 'current-unusable'
+            ? '；原账号不可用，提前切走'
+            : decision.reason === 'recently-throttled'
+              ? '；原账号刚被限流，提前切走'
+              : '') +
           '）—— 换号会让投喂链断掉，下一轮会全量重发',
       )
     } catch (error: any) {
@@ -445,13 +462,26 @@ export function apply(ctx: any, config: Config = {}): void {
    *
    * ⚠️ 只在用户**明确开了**自动换号（间隔 > 0）时才为真。默认关闭 ⇒ 保持原行为
    * （长退避 ⇒ 重试策略放弃），免得把一个没打算换号的用户悄悄换到别的账号上。
+   *
+   * `kind` 区分成因：封禁（'muted'）是"这个号暂时废了"，换了就走；限流（'throttled'）
+   * 则要过窗口与冷却（见 `isThrottleSwitchAllowed`）—— 否则"每个号都被限流"时会一路换下去。
    */
-  const canFailover = (): boolean => {
+  const canFailover = (kind?: 'muted' | 'throttled'): boolean => {
     const minutes = gate.settings().autoSwitchMinutes ?? DEFAULT_AUTO_SWITCH_MINUTES
     if (!Number.isFinite(minutes) || minutes <= 0) return false
     if (autoSwitching) return false // 正在切，别叠加
+    const now = Date.now()
+    // 限流这条路径要过**窗口 + 冷却**（与 decideAutoSwitch 共用同一个判据）。
+    // ⚠️ 这里拿 `now` 当"被限流的时刻"：调用方传 `'throttled'` 就等于告诉我们这次失败就是限流，
+    //    而真正的记录（throttleAt）要等错误上报之后才写 —— 比这里晚。
+    //    两边必须给出同一个答案，否则会出现最难查的那类故障：
+    //    给了短退避让重试快点发生，而重发时其实并不换号 ⇒ 更快地撞同一个限流，比不给还糟。
+    if (kind === 'throttled' && !isThrottleSwitchAllowed({ throttledAt: now, lastSwitchAt: lastAutoSwitchAt, now })) {
+      return false
+    }
+    const fresh = freshThrottledIds(throttleAt, now)
     const accounts = listAccounts().filter((account) => !autoSwitchSkip.has(account.id))
-    return pickNextAccount(accounts as SwitchableAccount[], activeAccountId(), Date.now()) !== undefined
+    return pickNextAccount(accounts as SwitchableAccount[], activeAccountId(), now, fresh) !== undefined
   }
 
   // 上下文投喂方式（2026-09-14）：设置页保存的值优先于 cordis config，即时生效无需重启。
@@ -588,6 +618,10 @@ export function apply(ctx: any, config: Config = {}): void {
     try {
       // 优先用**发起时**捕获的 id；只在拿不到时才回退到"此刻"的当前账号。
       const accountId = info.accountId ?? activeAccountId()
+      // 限流（`throttled`）与封禁（`muted`）刻意分开：限流只记内存时刻，不落盘（见 throttleAt 的注释）。
+      // ⚠️ 这一笔比 `canFailover('throttled')` **更晚**发生（那个在错误抛出的过程中就问了），
+      // 所以宿主那边是拿"当下时刻"当限流时刻来判断的 —— 两边必须同答，见 canFailover 的注释。
+      if (!info.ok && info.throttled && accountId) throttleAt.set(accountId, Date.now())
       const muted = Number.isFinite(info.mutedUntilMs)
       if (!info.ok && muted && accountId) {
         updateAccount(accountId, {
