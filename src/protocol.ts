@@ -87,14 +87,38 @@ const CORE_TOOLS = new Set([
 ])
 
 /**
- * 长尾工具的描述上限。240 字符 ≈ 首句 + 一句补充，够模型判断"这工具干什么"。
- * ⚠️ 长尾工具**也不输出参数描述**（参数名/类型/必填性仍在签名里）—— 那是它们体积的另一半。
+ * 长尾工具「一行说明」里那句话的上限。
+ *
+ * 长尾工具只占**一行**：`` `name(签名)` — 首句 ``（抄 cuckoo 的 `getFormattedJsApiForPrompt`，
+ * 它对每个工具就是 `` 1. `read(path)` — 读取文件 ``）。
+ * 取**首句**而不是开头 160 字 —— 描述的第一句才是"这工具干什么"，后面的多是用法细节。
  */
-const MAX_LONGTAIL_DESCRIPTION_CHARS = 240
+const MAX_TAIL_DESCRIPTION_CHARS = 160
 
 /** 工具是否属于核心组（决定描述给多长、要不要带参数说明）。 */
 function isCoreTool(name: unknown): boolean {
   return CORE_TOOLS.has(String(name ?? ''))
+}
+
+/** 取描述的首句（到第一个句末点），再按上限截断。 */
+function tailSentence(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  const stop = flat.search(/\.(\s|$)/)
+  return truncate(stop >= 0 ? flat.slice(0, stop + 1) : flat, MAX_TAIL_DESCRIPTION_CHARS)
+}
+
+/**
+ * 长尾工具的**一行**形式：`` `name(签名)` — 首句 ``。
+ *
+ * 名字、签名、一句话三样都在，但只占一行 —— 长尾工具的价值就是"让模型知道它存在、怎么传参"。
+ * ⚠️ 签名认不出来时（`buildToolSignature` 返回 null）不冒险拼一行，只给名字 + 首句，
+ * 让模型知道有这个工具、但不会照着残缺签名瞎传参（它会被兜底文案要求去问用户）。
+ */
+function formatTailTool(tool: ToolSchemaLike): string {
+  const sentence = tailSentence(String(tool.description ?? ''))
+  const signature = buildToolSignature(tool, false)
+  if (signature === null) return `\`${tool.name}\` — ${sentence}`
+  return `\`${signature.replace(/\s+/g, ' ').trim()}\` — ${sentence}`
 }
 
 /**
@@ -406,8 +430,16 @@ export function buildToolSignature(tool: ToolSchemaLike, withParamDocs = true): 
 /**
  * 渲染工具目录。
  *
- * 每个工具占一段：`### 名字` / 工具描述（≤3200 字符，不轻易砍）/ **参数紧凑签名**。
- * 签名由 `buildToolSignature` 产出；它只在 schema 不敢降级时返回 null，那时才贴原始 JSON Schema。
+ * 结构（0.6.2）：
+ *
+ *     ## Available tools   ← 核心工具：一段一个（`### 名字` / 完整描述 / 紧凑签名 / 参数说明）
+ *     ## Other tools       ← 长尾工具：**一行一个** —— `` - `name(签名)` — 首句 ``
+ *
+ * 长尾用一行格式是抄 cuckoo 的（它的 `getFormattedJsApiForPrompt` 对每个工具就是
+ * `` 1. `read(path)` — 读取文件 ``）：同样三样信息（名字 / 签名 / 一句话），
+ * 三行能装下的，一行就够 —— 而 61 个工具里有 48 个是长尾。
+ *
+ * ⚠️ **两级都保留工具名与参数签名** ⇒ 模型照样能调用长尾工具，只是看不到长篇说明。
  */
 export function buildToolSection(
   tools: readonly ToolSchemaLike[] | undefined,
@@ -418,14 +450,29 @@ export function buildToolSection(
   // 预算取「内置上限」与「调用方给的额度」的较小值。
   // 调用方（serializePrompt）会按剩余空间算一个动态额度传进来 —— 见下面 F18 的注释。
   let budget = Math.max(0, Math.min(MAX_TOOLS_SECTION_CHARS, maxChars))
-  for (let index = 0; index < tools.length; index += 1) {
-    const tool = tools[index]
-    // 描述分级（0.6.1）：核心工具带完整描述 + 参数说明；长尾工具只留一句话 + 签名。
-    // ⚠️ 两级都**保留工具名与参数签名** ⇒ 模型照样能调用它们，
-    // 不会出现"要用的工具看不见"（这正是它比"禁用工具"温和的地方）。
-    const core = isCoreTool(tool.name)
+
+  const coreTools = tools.filter((tool) => isCoreTool(tool?.name))
+  const tailTools = tools.filter((tool) => !isCoreTool(tool?.name))
+
+  /**
+   * 预算用尽时的兜底：**必须把剩下的工具名说出来**，并明确要求别猜参数。
+   * 旧写法只有一句 "(remaining tools omitted for length)"，模型连"还有哪些工具存在"
+   * 都不知道，只能盲猜名字和参数 —— 实测 61 个工具里 26 个就是这样静默消失的。
+   */
+  const omittedNotice = (rest: readonly ToolSchemaLike[]): string => {
+    const names = rest.map((item) => String(item?.name ?? '')).filter(Boolean)
+    return (
+      `\n(⚠️ The following ${names.length} tools are NOT described above (omitted for length): ` +
+      `${names.join(', ')}. If you need one of them, ask the user for its exact parameters — ` +
+      'do NOT guess them.)'
+    )
+  }
+
+  // ① 核心工具：一段一个，带完整描述与参数说明
+  for (let index = 0; index < coreTools.length; index += 1) {
+    const tool = coreTools[index]
     // 优先紧凑签名；只有 schema 不敢降级时才贴原始 JSON（见 buildToolSignature 的注释）。
-    const signature = buildToolSignature(tool, core)
+    const signature = buildToolSignature(tool, true)
     let parametersText = signature ?? ''
     if (signature === null) {
       let schemaText = ''
@@ -439,30 +486,40 @@ export function buildToolSection(
     const block = [
       '',
       `### ${tool.name}`,
-      truncate(
-        String(tool.description ?? '').replace(/\s+/g, ' ').trim(),
-        core ? MAX_DESCRIPTION_CHARS : MAX_LONGTAIL_DESCRIPTION_CHARS,
-      ),
+      truncate(String(tool.description ?? '').replace(/\s+/g, ' ').trim(), MAX_DESCRIPTION_CHARS),
       parametersText,
     ].join('\n')
     if (budget - block.length < 0) {
-      // 预算用完。**必须把剩下的工具名说出来**：旧写法只有一句
-      // "(remaining tools omitted for length)"，模型连"还有哪些工具存在"都不知道，
-      // 只能盲猜名字和参数 —— 实测 61 个工具里 26 个就是这样静默消失的。
-      // 同时明确要求它别猜参数，改为向用户确认。
-      const rest = tools
-        .slice(index)
-        .map((item) => String(item?.name ?? ''))
-        .filter(Boolean)
-      parts.push(
-        `\n(⚠️ The following ${rest.length} tools are NOT described above (omitted for length): ` +
-          `${rest.join(', ')}. If you need one of them, ask the user for its exact parameters — ` +
-          'do NOT guess them.)',
-      )
-      break
+      parts.push(omittedNotice([...coreTools.slice(index), ...tailTools]))
+      return parts.join('\n')
     }
     budget -= block.length
     parts.push(block)
+  }
+
+  // ② 长尾工具：一行一个
+  if (tailTools.length > 0) {
+    const header = [
+      '',
+      '## Other tools',
+      '',
+      'Call these the same way. Parameter names and types are in the parentheses.',
+    ].join('\n')
+    if (budget - header.length < 0) {
+      parts.push(omittedNotice(tailTools))
+      return parts.join('\n')
+    }
+    budget -= header.length
+    parts.push(header)
+    for (let index = 0; index < tailTools.length; index += 1) {
+      const line = `- ${formatTailTool(tailTools[index])}`
+      if (budget - line.length < 0) {
+        parts.push(omittedNotice(tailTools.slice(index)))
+        break
+      }
+      budget -= line.length
+      parts.push(line)
+    }
   }
   return parts.join('\n')
 }

@@ -108,7 +108,13 @@ const checks = {
   'host 仍保留原有伪标记 ds_system（老现场不能回退）': host.includes('ds_system'),
   'host 工具目录超预算时必须列出被省略的工具名（不许静默丢弃）': host.includes('NOT described above'),
   'host 工具目录省略时明确要求「别猜参数」': host.includes('do NOT guess'),
-  'host 老的那句「remaining tools omitted for length」已不再出现': !host.includes('remaining tools omitted for length'),
+  'host 的省略兜底会真的把工具名拼进提示（不是只写一句"省略了"）':
+    /omittedNotice[\s\S]{0,600}?names\.join/.test(host),
+  // ⚠️ 这条**只在兜底函数附近扫**，不用全文 `!includes(...)`：
+  // lib 保留注释，而源码注释里为了说明"旧写法是错的"自然会引用旧那句话，
+  // 全文扫会把它误判成"退回了旧实现"（0.6.2 真踩过一次）。
+  'host 的省略兜底没退回旧那句「remaining tools omitted for length」':
+    !/omittedNotice[\s\S]{0,400}remaining tools omitted/.test(host),
   'host 启动闸门时 min/max 成对传入（漏传 max 会让随机区间变成固定间隔）':
     /maxIntervalMs:\s*\w+\?\.maxRequestIntervalMs/.test(host),
   'host 适配器配置也带上 maxRequestIntervalMs': host.includes('maxRequestIntervalMs: gate.settings().maxRequestIntervalMs'),

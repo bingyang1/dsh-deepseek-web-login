@@ -34,6 +34,15 @@ function test(name, fn) {
   }
 }
 
+/**
+ * 工具是否出现在目录里。
+ *
+ * ⚠️ 判据是 `name(`（工具名 + 参数签名），**不是** `### name`：
+ * 0.6.2 起长尾工具改成**一行格式**（`- \`name(签名)\` — 首句`），不再有 `###` 前缀。
+ * 用 `### name` 判会把 48 个长尾工具全判成"丢失"。
+ */
+const hasTool = (text, name) => text.includes(name + '(')
+
 /** 造一个工具；descLen 控制描述长度，用于逼近预算边界。 */
 const mkTool = (name, descLen = 60) => ({
   name,
@@ -46,7 +55,7 @@ const mkTool = (name, descLen = 60) => ({
 test('61 个工具（贴近实测规模）必须全部出现在目录里', () => {
   const tools = Array.from({ length: 61 }, (_, i) => mkTool(`tool_${String(i).padStart(2, '0')}`, 400))
   const section = buildToolSection(tools)
-  const missing = tools.filter((t) => !section.includes(`### ${t.name}`))
+  const missing = tools.filter((t) => !hasTool(section, t.name))
   assert.equal(missing.length, 0, `缺失：${missing.map((t) => t.name).join(', ')}`)
   assert.ok(!section.includes('NOT described above'), '不该触发"省略"提示')
 })
@@ -54,7 +63,7 @@ test('61 个工具（贴近实测规模）必须全部出现在目录里', () =>
 test('规模与实测一致时也不触发省略（61 个工具，每个约 800 字符描述）', () => {
   const tools = Array.from({ length: 61 }, (_, i) => mkTool(`t${String(i).padStart(2, '0')}`, 800))
   const section = buildToolSection(tools)
-  const missing = tools.filter((t) => !section.includes(`### ${t.name}`))
+  const missing = tools.filter((t) => !hasTool(section, t.name))
   assert.equal(missing.length, 0, `缺失 ${missing.length} 个：${missing.slice(0, 6).map((t) => t.name).join(', ')}…`)
 })
 
@@ -68,7 +77,7 @@ test('旧 bug 再现防护：名字以 w 开头、排序靠后的工具不会被
   ]
   const section = buildToolSection(tools)
   for (const name of ['write', 'web_search', 'web_fetch']) {
-    assert.ok(section.includes(`### ${name}`), `${name} 被截断了`)
+    assert.ok(hasTool(section, name), `${name} 被截断了`)
   }
 })
 
@@ -98,16 +107,17 @@ test('核心工具描述超过 3200 才截断，且带省略号', () => {
 // ── 兜底：真装不下时必须"说出名字"，不许静默丢弃 ───────────────
 
 test('超出预算时必须列出被省略的工具名（旧实现只写一句 remaining tools omitted）', () => {
-  // ⚠️ 0.6.1 起长尾描述被压到 240 字符 ⇒ 原来 90 个已撑不爆预算，得加到 250 个。
-  const tools = Array.from({ length: 250 }, (_, i) => mkTool(`tool_${String(i).padStart(3, '0')}`, 1300))
+  // ⚠️ 长尾工具的体积一路在降：0.6.1 描述压到 240、0.6.2 更是**一行**（首句 ≤160）⇒
+  // 原来 90 个、后来 250 个都已撑不爆预算，得加到 400 个。
+  const tools = Array.from({ length: 400 }, (_, i) => mkTool(`tool_${String(i).padStart(3, '0')}`, 1300))
   const section = buildToolSection(tools)
   assert.ok(/NOT described above/.test(section), '必须明确告知有工具未被描述')
-  assert.ok(section.includes('tool_249'), '最后一个被省略的工具名必须列出来')
+  assert.ok(section.includes('tool_399'), '最后一个被省略的工具名必须列出来')
   assert.ok(/omitted for length/.test(section), '应说明省略原因')
 })
 
 test('兜底文案必须要求"别猜参数"（否则模型会照半截定义瞎编）', () => {
-  const tools = Array.from({ length: 250 }, (_, i) => mkTool(`tool_${String(i).padStart(3, '0')}`, 1300))
+  const tools = Array.from({ length: 400 }, (_, i) => mkTool(`tool_${String(i).padStart(3, '0')}`, 1300))
   const section = buildToolSection(tools)
   assert.ok(/do NOT guess/i.test(section) || /not guess them/i.test(section), '缺少"别猜参数"的指令')
 })
@@ -134,7 +144,7 @@ test('head 预算足够：工具目录不被 truncateMiddle 从中间挖掉', ()
     messages,
     tools,
   })
-  const missing = tools.filter((t) => !prompt.includes(`### ${t.name}`))
+  const missing = tools.filter((t) => !hasTool(prompt, t.name))
   assert.equal(missing.length, 0, `head 被截后丢了 ${missing.length} 个工具：${missing.slice(0, 6).map((t) => t.name).join(', ')}`)
   // 转写确实被截了（证明这条用例真的走到了截断分支，而不是"因为没超长所以什么都没发生"）
   assert.ok(prompt.includes('chars omitted'), '转写未超长 → 这条用例没测到 head 预算，请加长 messages')
@@ -146,12 +156,15 @@ test('转写超长时仍会中段截断（历史可截，工具定义不可截�
   const prompt = serializePrompt({
     system: 'SYS',
     messages,
-    tools: [{ name: 't', description: 'd', parameters: {} }],
+    // ⚠️ 用**核心工具**（`pwsh`）而不是长尾：0.6.2 起长尾工具要先出一个约 95 字符的小节表头，
+    // 在 maxChars=5000 这种极小预算下（工具额度只剩 ~82）反而装不下，会走"列名兜底"。
+    // 核心工具没有表头开销，才测得到"工具定义必须保留"这件事本身。
+    tools: [{ name: 'pwsh', description: 'd', parameters: {} }],
     maxChars: 5000,
   })
   assert.ok(prompt.length <= 5000, `长度 ${prompt.length}`)
   assert.ok(prompt.includes('Tool Calling Protocol'), '协议头必须保留')
-  assert.ok(prompt.includes('### t'), '工具定义必须保留')
+  assert.ok(prompt.includes('pwsh('), '工具定义必须保留')
   assert.ok(prompt.includes('chars omitted'), '超长转写应当被截断')
 })
 
@@ -162,11 +175,15 @@ test('没有工具时返回空串（老行为）', () => {
   assert.equal(buildToolSection([]), '')
 })
 
-test('工具顺序保持 DSH 下发的原序（别打乱模型的参照）', () => {
-  const names = ['zeta', 'alpha', 'mid']
+test('分组：核心在前、长尾在后，且各自组内保持 DSH 原序', () => {
+  // ⚠️ 0.6.2 起是**分组**渲染（核心一段一个、长尾一行一个）⇒ 不再要求"全局原序"；
+  // 但**组内**的原序必须保住。
+  const names = ['zeta', 'pwsh', 'alpha', 'read', 'mid']
   const section = buildToolSection(names.map((n) => mkTool(n)))
-  const positions = names.map((n) => section.indexOf(`### ${n}`))
-  assert.deepEqual(positions, [...positions].sort((a, b) => a - b), '顺序被打乱了')
+  const at = (n) => section.indexOf(n + '(')
+  assert.ok(at('pwsh') < at('read'), '核心工具之间的原序被打乱')
+  assert.ok(at('zeta') < at('alpha') && at('alpha') < at('mid'), '长尾工具之间的原序被打乱')
+  assert.ok(at('read') < at('zeta'), '核心工具必须排在长尾之前')
 })
 
 test('描述里的换行与多余空白被压平（一块工具占的行数可控）', () => {
@@ -201,7 +218,7 @@ test('F18：预算充足时仍能装下全部工具（收缩不能矫枉过正�
     messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
     tools,
   })
-  const missing = tools.filter((t) => !prompt.includes(`### ${t.name}`))
+  const missing = tools.filter((t) => !hasTool(prompt, t.name))
   assert.equal(missing.length, 0, `默认预算下不该缺失：${missing.slice(0, 5).map((t) => t.name).join(', ')}`)
 })
 

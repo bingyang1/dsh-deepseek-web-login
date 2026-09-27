@@ -277,24 +277,29 @@ test('分级：核心工具的描述完整、且带参数说明', () => {
   assert.ok(section.includes('  command: The PowerShell command to execute.'), '核心工具应带参数说明')
 })
 
-test('分级：长尾工具的描述压到 240 且不带参数说明', () => {
+test('分级：长尾工具压成**一行**（`签名` — 首句），不带参数说明', () => {
   const section = buildToolSection([TAIL_SAMPLE])
-  assert.ok(section.includes('T'.repeat(237) + '...'), '长尾描述应截到 240')
-  assert.ok(!section.includes('T'.repeat(241)), '不该超过 240')
+  assert.ok(section.includes('- `job_list(limit?: number)` —'), '长尾应是一行：`签名` — 首句')
+  assert.ok(!section.includes('T'.repeat(200)), '首句该被截断（上限 160）')
   assert.ok(!section.includes('  limit: Max rows to return.'), '长尾工具不该带参数说明')
+  assert.ok(!section.includes('### job_list'), '长尾工具不该再占一整个小节')
 })
 
 test('分级：长尾工具照样能调用（名字与参数签名一个字都不少）', () => {
   const section = buildToolSection([TAIL_SAMPLE])
-  assert.ok(section.includes('### job_list'), '工具名必须还在 —— 否则模型不知道它存在')
-  assert.ok(section.includes('job_list(limit?: number)'), '参数签名必须还在 —— 否则模型不会传参')
+  assert.ok(section.includes('## Other tools'), '长尾该有自己的小节标题')
+  assert.ok(
+    section.includes('job_list(limit?: number)'),
+    '名字与参数签名必须都在 —— 否则模型不知道它存在、也不知道怎么传参',
+  )
 })
 
-test('分级不打乱工具顺序', () => {
+test('分组：核心在前、长尾在后，各自组内保持原序', () => {
   const tools = [CORE_SAMPLE, TAIL_SAMPLE, REAL.read]
   const section = buildToolSection(tools)
-  const at = (n) => section.indexOf(`### ${n}`)
-  assert.ok(at('pwsh') < at('job_list') && at('job_list') < at('read'), '顺序被打乱')
+  const at = (n) => section.indexOf(n + '(')
+  assert.ok(at('pwsh') < at('read'), '核心组内原序被打乱')
+  assert.ok(at('read') < at('job_list'), '核心工具必须排在长尾之前（长尾在一行小节里）')
 })
 
 test('分级后 61 个工具全装得下（每个描述 2500 字符）', () => {
@@ -314,7 +319,8 @@ test('分级后 61 个工具全装得下（每个描述 2500 字符）', () => {
   assert.equal(tools.length, 61)
   const section = buildToolSection(tools)
   assert.ok(!section.includes('NOT described above'), '分级后不该再触发"省略工具"兜底')
-  const missing = tools.filter((t) => !section.includes(`### ${t.name}`))
+  // ⚠️ 判据是 `name(`（名字 + 参数签名），不是 `### name` —— 长尾现在是一行格式，没有 `###`。
+  const missing = tools.filter((t) => !section.includes(t.name + '('))
   assert.equal(missing.length, 0, `缺失：${missing.map((t) => t.name).join(', ')}`)
   assert.ok(section.length < 56_000, `目录 ${section.length} 字符，超上限`)
 })
