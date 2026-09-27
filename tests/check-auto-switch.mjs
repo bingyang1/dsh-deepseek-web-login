@@ -283,6 +283,7 @@ await test('刚被限流 + 冷却已过 ⇒ 换号，理由是 recently-throttle
   const decision = decideAutoSwitch({
     minutes: 20,
     lastSwitchAt: NOW - 10 * MIN, // 10 分钟前换过 ⇒ 冷却（3 分钟）已过
+    lastSwitchedAt: NOW - 10 * MIN,
     now: NOW,
     accounts: [ok('a'), ok('b')],
     currentId: 'a',
@@ -295,6 +296,7 @@ await test('🔴 冷却期内不换 —— 防的是"每个号都被限流时一
   const decision = decideAutoSwitch({
     minutes: 20,
     lastSwitchAt: NOW - 30_000, // 30 秒前刚换过 ⇒ 冷却没过
+    lastSwitchedAt: NOW - 30_000,
     now: NOW,
     accounts: [ok('a'), ok('b'), ok('c')],
     currentId: 'a',
@@ -333,6 +335,7 @@ await test('🔴 排除项：切号时跳过"同样刚被限流的号"（切过�
   const decision = decideAutoSwitch({
     minutes: 20,
     lastSwitchAt: NOW - 10 * MIN,
+    lastSwitchedAt: NOW - 10 * MIN,
     now: NOW,
     accounts: [ok('a'), ok('b'), ok('c')],
     currentId: 'a',
@@ -348,6 +351,7 @@ await test('所有候选都刚被限流 ⇒ 不换（换谁都发不出去）', 
   const decision = decideAutoSwitch({
     minutes: 20,
     lastSwitchAt: NOW - 10 * MIN,
+    lastSwitchedAt: NOW - 10 * MIN,
     now: NOW,
     accounts: [ok('a'), ok('b')],
     currentId: 'a',
@@ -406,15 +410,49 @@ await test('isThrottleSwitchAllowed：窗口 / 冷却 / 缺值三条边界', () 
   )
 })
 
+await test('🔴 本次启动还没换过号（lastSwitchedAt=0）⇒ 限流立刻可换', () => {
+  // 2026-09-27 的真实现场：插件 10:56:30 启动、10:57:54 撞限流（距启动 73 秒）。
+  // 当时的冷却拿 `lastSwitchAt`（= 启动时刻）算 ⇒ 73 秒 < 3 分钟 ⇒ 不换号，
+  // 用户看到的是"依旧没有自动切换账号"。下面两条把那个 bug 钉死。
+  const startedAt = NOW - 73_000
+  const decision = decideAutoSwitch({
+    minutes: 20,
+    lastSwitchAt: startedAt, // due 用：距启动才 73 秒，远未到 20 分钟
+    lastSwitchedAt: 0, // 本次没换过号 ⇒ 不套冷却
+    now: NOW,
+    accounts: [ok('a'), ok('b')],
+    currentId: 'a',
+    throttledAt: new Map([['a', NOW - 2_000]]),
+  })
+  assert.deepEqual(
+    decision,
+    { action: 'switch', nextId: 'b', reason: 'recently-throttled' },
+    '没换过号时不该套冷却 —— 限流是明确的坏状态，值得立刻换走',
+  )
+
+  const buggy = decideAutoSwitch({
+    minutes: 20,
+    lastSwitchAt: startedAt,
+    lastSwitchedAt: startedAt, // ← 旧写法：把"启动时刻"当成"上次换号"
+    now: NOW,
+    accounts: [ok('a'), ok('b')],
+    currentId: 'a',
+    throttledAt: new Map([['a', NOW - 2_000]]),
+  })
+  assert.equal(buggy.action, 'skip', '这条复现的就是那个 bug —— 重启后 3 分钟内的限流会被自己的冷却挡掉')
+})
+
 await test('🔴 宿主 canFailover 与决策必须同答（给了短退避却不换号＝更快地撞同一个限流）', () => {
   // 模拟真实时序：失败那一刻问 canFailover（拿"当下"当限流时刻），
   // 2 秒后重发时 maybeAutoSwitch 才拿到真正写入的限流时刻。
+  // ⚠️ 两边都只能用"上次**真的换过号**"的时刻（`lastSwitchedAt`）算冷却。
   for (const sinceLastSwitch of [0, 30_000, 10 * MIN]) {
-    const lastSwitchAt = NOW - sinceLastSwitch
-    const failoverSays = isThrottleSwitchAllowed({ throttledAt: NOW, lastSwitchAt, now: NOW })
+    const lastSwitchedAt = NOW - sinceLastSwitch
+    const failoverSays = isThrottleSwitchAllowed({ throttledAt: NOW, lastSwitchAt: lastSwitchedAt, now: NOW })
     const decision = decideAutoSwitch({
       minutes: 20,
-      lastSwitchAt,
+      lastSwitchAt: NOW - 15 * MIN, // due 刻意不成立（15 < 20 分钟），免得混进那条路径
+      lastSwitchedAt,
       now: NOW + 2_000,
       accounts: [ok('a'), ok('b')],
       currentId: 'a',

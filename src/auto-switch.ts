@@ -181,6 +181,16 @@ export function decideAutoSwitch(params: {
   currentId: string | undefined
   /** 各账号最近一次被限流的时刻（不含当前账号也行 —— 但含它才能走第 2 条路径）。 */
   throttledAt?: ReadonlyMap<string, number>
+  /**
+   * 上一次**真正换过号**的时刻（0 / undefined = 本次启动还没换过）。
+   *
+   * 🔴 限流那条的冷却必须用它，**不能**用 `lastSwitchAt` —— 后者在宿主里被初始化成
+   * "启动时刻"（`isSwitchDue` 要的是"从启动算起过了多久"）。拿它当"上次换号"会让
+   * **每次重启之后都有一段"限流也不换号"的窗口**：实测 2026-09-27，插件 10:56:30 启动、
+   * 10:57:54 撞限流，距"启动"仅 73 秒 < 冷却 3 分钟 ⇒ **被自己的冷却挡掉了**，
+   * 用户看到的就是"依旧没有自动切换账号"。
+   */
+  lastSwitchedAt?: number
   throttleWindowMs?: number
   throttleCooldownMs?: number
 }): AutoSwitchDecision {
@@ -194,7 +204,9 @@ export function decideAutoSwitch(params: {
   // 让既有的"无账号 ⇒ 报错提示登录"路径去处理，别在这里悄悄换号。
   const throttleSwitch = isThrottleSwitchAllowed({
     throttledAt: currentId === undefined ? undefined : params.throttledAt?.get(currentId),
-    lastSwitchAt,
+    // ⚠️ 传的是"上次**真正换过号**的时刻"，不是 `lastSwitchAt`（那个在宿主里被初始化成
+    // 启动时刻，拿它算冷却会让每次重启后都有一段时间"限流也不换号"）。见参数注释。
+    lastSwitchAt: params.lastSwitchedAt ?? 0,
     now,
     ...(params.throttleWindowMs === undefined ? {} : { windowMs: params.throttleWindowMs }),
     ...(params.throttleCooldownMs === undefined ? {} : { cooldownMs: params.throttleCooldownMs }),

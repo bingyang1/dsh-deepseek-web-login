@@ -372,6 +372,19 @@ export function apply(ctx: any, config: Config = {}): void {
   // 那种情况下等满 N 分钟没有意义，立刻切走。
   let lastAutoSwitchAt = Date.now()
   /**
+   * 上一次**真正换过号**的时刻（自动或手动），0 = 本次启动还没换过。
+   *
+   * 🔴 为什么不能用上面那个 `lastAutoSwitchAt` 代替：它在启动时被初始化成"启动时刻"
+   * （`isSwitchDue` 要的是"从启动算起过了多久"）。而限流换号有自己的**冷却**（距上次换号
+   * 至少 3 分钟），若拿"启动时刻"当"上次换号"，就会**每次重启后都开出一段"限流也不换号"
+   * 的窗口** —— 实测 2026-09-27：插件 10:56:30 启动、10:57:54 撞限流，距启动只有 73 秒
+   * ⇒ 被自己的冷却挡掉，用户看到的是"依旧没有自动切换账号"。
+   * 用它之后语义才对：**没换过号 ⇒ 不套冷却**（限流是明确的坏状态，值得立刻换走）。
+   *
+   * 只在**换号成功**（含手动切号）时更新；探活失败、换号抛错都不算换过号。
+   */
+  let lastSwitchedAt = 0
+  /**
    * 最近一次**自动**换号的记录（只给界面显示用，不落盘）。
    *
    * 只记自动换号：手动切号是用户自己的操作，界面不需要"提示"他刚做过什么。
@@ -406,6 +419,9 @@ export function apply(ctx: any, config: Config = {}): void {
       currentId: activeAccountId(),
       // 内存里的限流时刻：既决定"当前账号该不该提前切走"，也用来排除同样刚被限流的号。
       throttledAt: throttleAt,
+      // 限流那条的冷却用"上次**真的换过号**"的时刻 —— 不能传 lastAutoSwitchAt（它在启动时
+      // 就等于启动时刻，会让每次重启后的一段时间里"限流也不换号"）。见 lastSwitchedAt 的注释。
+      lastSwitchedAt,
     })
     if (decision.action !== 'switch') return
     autoSwitching = true
@@ -431,6 +447,8 @@ export function apply(ctx: any, config: Config = {}): void {
       const fromId = activeAccountId()
       if (!setActiveAccount(decision.nextId)) return
       lastAutoSwitchAt = Date.now()
+      // 「真的换过号了」—— 只有这里与"手动切号"两处推进它，限流那条的冷却据此计算。
+      lastSwitchedAt = Date.now()
       // 记下来给界面：换号那一轮会全量重发（体感是"任务突然变慢"），
       // 面板上摆出时间与两端，用户能把那次卡顿对上原因。
       const fromRecord = fromId ? readAccount(fromId) : undefined
@@ -476,7 +494,7 @@ export function apply(ctx: any, config: Config = {}): void {
     //    而真正的记录（throttleAt）要等错误上报之后才写 —— 比这里晚。
     //    两边必须给出同一个答案，否则会出现最难查的那类故障：
     //    给了短退避让重试快点发生，而重发时其实并不换号 ⇒ 更快地撞同一个限流，比不给还糟。
-    if (kind === 'throttled' && !isThrottleSwitchAllowed({ throttledAt: now, lastSwitchAt: lastAutoSwitchAt, now })) {
+    if (kind === 'throttled' && !isThrottleSwitchAllowed({ throttledAt: now, lastSwitchAt: lastSwitchedAt, now })) {
       return false
     }
     const fresh = freshThrottledIds(throttleAt, now)
@@ -1020,6 +1038,8 @@ export function apply(ctx: any, config: Config = {}): void {
               logger.info?.(`deepseek-web: 当前账号已切换为 ${id}`)
               // 手动切号也要重置自动轮换的计时 —— 否则用户刚切完，1 分钟后又被自动切走
               lastAutoSwitchAt = Date.now()
+              // 手动切号也算"真的换过号" ⇒ 限流冷却开始计（刚切到新号又被限流时，别立刻再换）
+              lastSwitchedAt = Date.now()
               sendJson(res, 200, { ok: true, activeId: id })
               return
             }
