@@ -124,32 +124,45 @@ const checks = {
   // **不经 dsh-llm 的 resolveRetryPolicy 规范化** ⇒ 三个延迟字段在运行期全是 undefined
   // ⇒ 本地退避算出 NaN ⇒ 事件写不进会话日志（DSH 拒收非有限数）⇒ **整轮 UNKNOWN 报错死掉**。
   // 这就是"自己停下来"的根因；上面那条 `maxDelayMs: MAX_…` 的正则**守不住它**（嵌套时照样命中）。
-  // ⚠️ 只在 RETRY_POLICY 字面量内部扫（lib 保留注释，全文扫会误判）。
-  'host 的重试策略是扁平字段（嵌套 backoff 会让延迟字段全 undefined ⇒ 退避算成 NaN ⇒ 整轮报错）':
+  // ⚠️ 所以这里**不看文本形状，而是把产物里的定义抽出来真求值**（产物不导出 RETRY_POLICY，
+  //    只能抽；抽出来的东西按 JS 语义跑，嵌套/改名/内联错都逃不过）。
+  'host 的重试策略在运行期真的解析成有限数（嵌套 backoff ⇒ 三个延迟字段全 undefined ⇒ 退避 NaN）':
     (() => {
-      const lit = /const RETRY_POLICY = Object\.freeze\(\{[\s\S]*?\n\}\)/.exec(host)
-      if (!lit) return false
-      const body = lit[0]
-      return (
-        !/\bbackoff\s*:/.test(body) &&
-        /initialDelayMs\s*:/.test(body) &&
-        /maxDelayMs\s*:/.test(body) &&
-        /jitterRatio\s*:/.test(body)
-      )
-    })(),
-  'host 的重试上限在运行期能解析成有限数（undefined/NaN ⇒ dsh-llm 判据恒不成立，还会写坏会话日志）':
-    (() => {
-      const one = (name) => {
-        const m = new RegExp('const ' + name + ' = ([^;\\n]+)').exec(host)
-        return m ? m[1] : ''
+      const decl = (name) => {
+        const m = new RegExp('const ' + name + ' = ([\\s\\S]*?);\\n').exec(host)
+        return m ? m[1] : null
       }
-      const factor = /Math\.round\(\s*THROTTLE_MAX_MS\s*\*\s*([\d.]+)\s*\)/.exec(one('MAX_THROTTLE_RETRY_MS'))
-      const cap = Number(one('THROTTLE_MAX_MS'))
-      if (!factor || !Number.isFinite(cap)) return false
-      const resolved = Math.round(cap * Number(factor[1]))
-      // ① 必须是有限数（NaN 就是本次故障）② 必须比 dsh-llm 的默认上限 10s 更宽，
-      // ③ 下限取现场实测值 49208（throttleBackoffMs 首档）—— 比它小就意味着又会"放弃重试"。
-      return Number.isFinite(resolved) && resolved > 10_000 && resolved >= 49_208
+      const literal = /const RETRY_POLICY = Object\.freeze\(\{[\s\S]*?\n\}\)/.exec(host)
+      if (!literal) return false
+      const parts = ['FAILOVER_RETRY_MS', 'THROTTLE_MAX_MS', 'MAX_THROTTLE_RETRY_MS'].map(decl)
+      if (parts.some((p) => p === null)) return false
+      const script = [
+        `const FAILOVER_RETRY_MS = ${parts[0]};`,
+        `const THROTTLE_MAX_MS = ${parts[1]};`,
+        `const MAX_THROTTLE_RETRY_MS = ${parts[2]};`,
+        literal[0],
+        'return RETRY_POLICY;',
+      ].join('\n')
+      let policy
+      try {
+        policy = new Function(script)()
+      } catch {
+        return false
+      }
+      const finite = ['initialDelayMs', 'maxDelayMs', 'jitterRatio'].every((k) =>
+        Number.isFinite(policy[k]),
+      )
+      return (
+        finite &&
+        policy.mode === 'normal' &&
+        policy.maxRetries === 5 &&
+        Array.isArray(policy.retryableCodes) &&
+        policy.retryableCodes.includes('RATE_LIMIT') &&
+        // 上限必须比 dsh-llm 的默认 10s 更宽，且覆盖现场实测的 49208（否则又会"放弃重试"）
+        policy.maxDelayMs > 10_000 &&
+        policy.maxDelayMs >= 49_208 &&
+        policy.initialDelayMs <= policy.maxDelayMs
+      )
     })(),
   'host 启动闸门时 min/max 成对传入（漏传 max 会让随机区间变成固定间隔）':
     /maxIntervalMs:\s*\w+\?\.maxRequestIntervalMs/.test(host),
