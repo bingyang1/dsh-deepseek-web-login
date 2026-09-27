@@ -236,7 +236,7 @@ const THROTTLE_JITTER_RATIO = 0.3
 /**
  * 我们**可能**上报给调用方（`dsh-llm-retry`）的**最大**限流退避。
  *
- * 🔴 它必须 ≤ 适配器声明的 `providerRetryPolicy().backoff.maxDelayMs`（见 `adapter.ts`）：
+ * 🔴 它必须 ≤ 适配器声明的 `providerRetryPolicy().maxDelayMs`（**扁平字段**，见 `adapter.ts`）：
  * dsh-llm 的重试策略在 normal 模式下，一旦「提供方要的延迟 > maxDelayMs」就**直接放弃重试**
  * （`return next()`），整轮随即以 error 结束 —— 表现就是"任务停在限流上，要用户手点继续"。
  *
