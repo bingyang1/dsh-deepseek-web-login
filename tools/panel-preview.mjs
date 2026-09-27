@@ -261,6 +261,12 @@ const demo = `
     </div>
     <code class="dsw-code">dsh plugin add ./dsh-deepseek-web-login-0.2.1.tgz</code>
   </div>
+  <div class="dsw-card">
+    <div class="dsw-cardhead">关于「自动换号」（默认关闭）</div>
+    <p class="dsw-hint">💡 账号库支持一键手动切换；「防风控」页的「自动换号」滑块可以让它按时间轮换 —— 但默认是关闭的，因为下面这些理由仍然成立：开它是在拿「降低机器特征」换「摊薄单账号密度」。</p>
+    <p class="dsw-hint">参考项目切的是「CLI 下次启动用哪个账号」——服务端看不到；而我们每次对话都实时发请求。真人不会在几分钟内换一个账号接着发消息，自动换号是极强的机器行为特征，与本插件在传输层指纹、随机间隔、会话清理上「降低机器可识别性」的努力直接冲突。⇒ 所以它默认关闭，而且判据只看时间、不看限流状态（"一被限流就换"更糟：同一出口 IP 上多号交替活跃，更像有组织的规避）。</p>
+    <p class="dsw-hint">另外：同一服务商会把多账号关联起来（同设备 / 同 IP / 同指纹 / 相近的行为模式）。一旦被判定为同一人的多开小号，处置通常比单账号超频更重，而且可能波及全部关联账号。所以账号库的目标是「在自己的多个正常账号之间切换更省事」，不是「靠轮换把限流绕过去」。</p>
+  </div>
 
   <div class="dsw-subtabs">
     <button class="dsw-subtab">今天</button><button class="dsw-subtab">近 7 天</button>
