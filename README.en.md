@@ -472,6 +472,48 @@ but only when the array itself is closed (a truncated stream must never be repai
 and an unparsable protocol block is never emitted as answer text again: with no other text in the step it
 reports a retryable `EMPTY_RESPONSE`, otherwise it appends a one-line notice and logs the raw block.
 
+## On "your plugin got my account banned"
+
+This attribution shows up from time to time. Before blaming the plugin, compare the **sizes** of what actually
+goes into your context.
+
+**What this plugin contributes**
+
+| Source | Size | Decided by |
+|---|---|---|
+| Tool protocol instructions (text written by this plugin) | **3,045 chars ≈ 950 tokens** | this plugin; unchanged for many versions |
+| Tool catalog (rendered by this plugin; content comes from the tools DSH hands over) | long-tail tools collapsed to one line since 0.6.2 — measured **-50%** like-for-like | **how many tool plugins you installed** |
+| Above + system header, in a 61-tool setup | ~64k chars ≈ 16k tokens | the bulk is the tool catalog, not the protocol |
+
+So the part that can fairly be blamed on this plugin is **those 3,000 characters**.
+
+**What actually inflates the context**
+
+- **MCP servers** — each one puts its whole tool schema into the context, on **every turn**
+- **Skills** — the more you install, the thicker the system prompt
+- **Jailbreak / "armor-breaking" prompts** — routinely tens of thousands of tokens, and they stay in context
+- **Global injection files** — `~/.dsh/prompt-inject.md` (41 KB on our machine) + `~/.dsh/AGENTS.md` (7 KB),
+  sent **in full, every turn** ≈ 49 KB ≈ 12k tokens, i.e. **16×** this plugin's protocol text
+
+A bigger context means heavier requests per turn, which makes volume/density heuristics more likely to trip.
+**That part has nothing to do with this plugin, and this plugin cannot control it.**
+
+**Maintainer's own experience (reference, not a guarantee)**
+
+Five consecutive days of daily use (including tool-call-heavy sessions) with **no ban**; of 178 requests in one
+day, 6 hit the web endpoint's "too frequent" throttle and all recovered after backoff.
+The distinction matters: **throttling is routine and recovers; a ban is a different thing.**
+
+**If you suspect you got hit, check in this order**
+
+1. Count your MCP servers and skills — every line is visible in `~/.dsh/profiles/desktop/cordis.patch.yml`
+2. `wc -c ~/.dsh/prompt-inject.md ~/.dsh/AGENTS.md` — see how large those two files are
+3. Open the "Token usage" tab and look at per-turn input (our median is around 100k tokens; the tool catalog is a small slice)
+4. Disable the MCP servers / plugin lines you do not use (`- id: xxx` + `disabled: true`, takes effect after restart)
+
+Everything this plugin can do about the risk (gating request density, serializing tool calls, session cleanup,
+slimming the tool catalog) is documented in the sections above. **The rest has to come from your own context.**
+
 ## Disclaimer
 
 > ⚠️ **Unofficial.** Not affiliated with, endorsed by, or sponsored by DeepSeek. "DeepSeek" is a trademark of its owner.
