@@ -54,13 +54,9 @@ function sharedRules(text) {
   return text.slice(from, to)
 }
 
-await test('默认（不传开关）就是批量版 —— 不碰这个开关的用户行为一点不变', () => {
-  assert.equal(toolProtocolInstructions(undefined), TOOL_PROTOCOL_INSTRUCTIONS)
-  assert.equal(toolProtocolInstructions(false), TOOL_PROTOCOL_INSTRUCTIONS, '显式 false 也是批量')
-})
-
-await test('传 true 才切到串行版', () => {
+await test('函数层：明确传值时按传的来（true=串行 / false=批量）', () => {
   assert.equal(toolProtocolInstructions(true), SERIAL_TOOL_PROTOCOL_INSTRUCTIONS)
+  assert.equal(toolProtocolInstructions(false), TOOL_PROTOCOL_INSTRUCTIONS)
 })
 
 await test('两版必须真的不同（否则开关是个摆设）', () => {
@@ -226,25 +222,30 @@ async function capturePrompt(config) {
   return prompt
 }
 
-await test('开了开关 ⇒ 发出去的 prompt 用的是串行版指令', async () => {
-  const prompt = await capturePrompt({ serialToolCalls: true })
-  assert.match(prompt, /exactly ONE tool in the "tool_calls" array/, '提示语那一段必须是串行版')
-  assert.doesNotMatch(prompt, /a batch is allowed/, '不能还留着批量版的 rule 1')
+await test('默认（什么都没设）⇒ 发出去的就是串行版 —— 0.5.0 起改的默认', async () => {
+  const prompt = await capturePrompt({})
+  assert.match(
+    prompt,
+    /exactly ONE tool in the "tool_calls" array/,
+    '默认必须是"一次只发一个工具调用"。要改回默认批量，先把这条用例连同 CHANGELOG 一起改。',
+  )
+  assert.doesNotMatch(prompt, /a batch is allowed/, '默认路径不该出现批量版那句')
+  assert.ok(prompt.includes(SERIAL_TOOL_PROTOCOL_INSTRUCTIONS), '整段串行版指令要原样出现')
 })
 
-await test('不开（默认）⇒ 发出去的 prompt 仍用批量版，逐字保持原样', async () => {
-  const prompt = await capturePrompt({})
-  assert.match(prompt, /a batch is allowed/, '默认路径必须还是批量版')
+await test('显式 serialToolCalls:false ⇒ 才用批量版', async () => {
+  const prompt = await capturePrompt({ serialToolCalls: false })
+  assert.match(prompt, /a batch is allowed/, '显式允许并行时才该是批量版')
   assert.doesNotMatch(prompt, /exactly ONE tool in the "tool_calls" array/)
   assert.ok(
     prompt.includes(TOOL_PROTOCOL_INSTRUCTIONS),
-    '整段批量版指令要**原样**出现（不是被改过几个字的变体）',
+    '整段批量版指令要原样出现（不是被改过几个字的变体）',
   )
 })
 
 await test('两版在 prompt 里的差异只在协议段，它之后的每一字都相同', async () => {
-  const on = await capturePrompt({ serialToolCalls: true })
-  const off = await capturePrompt({})
+  const on = await capturePrompt({})                          // 默认 = 串行
+  const off = await capturePrompt({ serialToolCalls: false })  // 显式 = 批量
   assert.notEqual(on, off, '开关必须真的改变发出去的文本')
   /** 取协议段**之后**的部分 = 工具目录 + 转写。 */
   const afterProtocol = (text) => {
@@ -269,7 +270,7 @@ await test('续写轮也用同一版指令（只改首轮⇒同一会话里指�
   const prompts = []
   const adapter = createAdapter({
     getAuth: () => AUTH,
-    config: { serialToolCalls: true },
+    config: {}, // 默认（串行）—— 顺带覆盖新默认
     noteCall: () => {},
     streamCompletion: (_auth, params) => {
       prompts.push(params?.prompt)

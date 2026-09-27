@@ -232,9 +232,9 @@ const demo = `
     </div>
     <p class="dsw-hint">每 30 分钟换到账号库里的下一个可用账号（失效或正在受限的会跳过；可用的不足两个就不换）。换号会让投喂链断掉：下一轮要全量重发，历史图也要重新上传 —— 间隔越短，这个代价出现得越频繁。</p>
     <div class="dsw-gate-row">
-      <label class="dsw-switch"><input type="checkbox" checked><span class="dsw-switch-track"></span><span>允许并行调用工具</span></label>
+      <label class="dsw-switch"><input type="checkbox"><span class="dsw-switch-track"></span><span>允许并行调用工具</span></label>
     </div>
-    <p class="dsw-hint">默认：模型可以一次发多个工具调用（同一批最多 3 个），DSH 会并行跑它们 —— 一轮请求推进多步，任务快。工具在 DSH 侧执行、不发 DeepSeek 请求，所以对网页端不可见。切换后的第一轮会全量重发一次。</p>
+    <p class="dsw-hint">默认：一次只发一个工具调用，等结果回来再决定下一步 —— 后一步能用上前一步的真实结果，逐步反应更稳。代价是每个工具各占一轮请求，任务总耗时明显变长。切换后的第一轮会全量重发一次。</p>
     <p class="dsw-gate-msg">当前：每 2~4 秒发一个请求，连续 15 次后休息 30~90 秒。</p>
   </div>
 

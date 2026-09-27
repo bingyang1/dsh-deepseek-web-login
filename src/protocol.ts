@@ -105,7 +105,7 @@ Rules:
 10. Each call must be able to run on its own: no shared shell variables across calls, no dependence on another call in the same batch.`
 
 /**
- * 「一次只调用一个工具」版协议指令（用户可在「防风控」页切换）。
+ * 「一次只调用一个工具」版协议指令 —— **0.5.0 起的默认**（用户可在「防风控」页切回批量）。
  *
  * 只有 rule 1 / 2 / 9 / 10 不同（rule 2 在串行模式下按**单数**写：确实只有一个调用）。
  * rule 3~8 **必须与上面那份逐字相同** —— 那几条是 JSON 正确性的防线
@@ -138,7 +138,12 @@ Rules:
 9. Do NOT batch. Emit one call, stop, and wait for its real result before you decide the next step. Needing several tools means several successive messages, one call each — the user has turned batching off for this session, so a multi-call array works against them.
 10. Unlike a batch, a call here MAY build on the previous step's result — read what came back and use it. That is the point of one-at-a-time. But never invent a result you have not received.`
 
-/** 本次请求该用哪一份协议指令。缺省＝批量版（保持既有行为逐字节不变）。 */
+/**
+ * 本次请求该用哪一份协议指令。
+ *
+ * ⚠️ 参数缺省仍是批量版（纯函数层），但**调用方传的是 `config.serialToolCalls !== false`**
+ * ⇒ 实际默认是**串行版**（0.5.0 起改的默认）。别只看这里就以为默认是批量。
+ */
 export function toolProtocolInstructions(serial?: boolean): string {
   return serial === true ? SERIAL_TOOL_PROTOCOL_INSTRUCTIONS : TOOL_PROTOCOL_INSTRUCTIONS
 }
@@ -373,7 +378,8 @@ export interface SerializeOptions {
   /**
    * 用「一次只调用一个工具」那版协议指令（见 `SERIAL_TOOL_PROTOCOL_INSTRUCTIONS`）。
    *
-   * **不给**（undefined）＝ 批量版 —— 那是既有行为，prompt 形态必须逐字节不变。
+   * **不给**（undefined）＝ 批量版（纯函数层）。⚠️ 但**调用方传的是 `config.serialToolCalls !== false`**
+   * ⇒ 实际默认走的是**串行版**（0.5.0 起改的默认）。别只看这里就以为默认是批量。
    */
   serialToolCalls?: boolean
 }

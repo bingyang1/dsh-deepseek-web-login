@@ -324,8 +324,8 @@ export function apply(ctx: any, config: Config = {}): void {
     maxRefImages: savedGate?.maxRefImages ?? config.maxRefImages ?? DEFAULT_MAX_REF_IMAGES,
     contextWindow: savedGate?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     autoSwitchMinutes: savedGate?.autoSwitchMinutes ?? DEFAULT_AUTO_SWITCH_MINUTES,
-    // 工具调用是否允批量（缺省批量＝旧行为）。adapter 每轮序列化 prompt 时现读 ⇒ 改完即时生效。
-    serialToolCalls: savedGate?.serialToolCalls === true,
+    // 工具调用是否允批量（**缺省＝串行**）。adapter 每轮序列化 prompt 时现读 ⇒ 改完即时生效。
+    serialToolCalls: savedGate?.serialToolCalls !== false,
     longRunBreakMs: savedGate?.longRunBreakMs,
     // ⚠️ 会话清理这几个字段必须**一起传**（2026-09-14 修）：设置页保存时写的是
     // `gate.settings()` 的返回值 —— 没存进闸门的字段会被**静默抹掉**，

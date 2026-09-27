@@ -1801,13 +1801,13 @@ function Panel(): any {
     const paintSerialTools = (): void => {
       const batched = serialInput.checked
       serialHint.textContent = batched
-        ? '默认：模型可以一次发多个工具调用（同一批最多 3 个），DSH 会并行跑它们 —— 一轮请求推进多步，任务快。' +
+        ? '允许并行：模型可以一次发多个工具调用（同一批最多 3 个），DSH 会并行跑它们 —— 一轮请求推进多步，任务更快。' +
           '工具在 DSH 侧执行、不发 DeepSeek 请求，所以对网页端不可见。切换后的第一轮会全量重发一次。'
-        : '一次只发一个工具调用，等结果回来再决定下一步 —— 后一步能用上前一步的真实结果，逐步反应更稳。' +
-          '代价：每个工具各占一轮请求，任务总耗时明显变长。切换后的第一轮会全量重发一次。'
+        : '默认：一次只发一个工具调用，等结果回来再决定下一步 —— 后一步能用上前一步的真实结果，逐步反应更稳。' +
+          '代价是每个工具各占一轮请求，任务总耗时明显变长。切换后的第一轮会全量重发一次。'
     }
-    // 初始先按默认（允许并行）画一次，免得读回设置之前闪一下"关闭"态
-    serialInput.checked = true
+    // 初始按**默认**（串行 ⇒ 开关不勾）画一次，免得读回设置之前闪一下错的状态
+    serialInput.checked = false
     paintSerialTools()
     serialInput.addEventListener('change', () => {
       paintSerialTools()
@@ -2726,8 +2726,8 @@ function Panel(): any {
       swRange.max = String(swBounds.max)
       swRange.value = String(g.autoSwitchMinutes ?? g.autoSwitchDefault ?? 0)
       paintAutoSwitch()
-      // 工具调用方式：后端给的是**当前值**（布尔）。缺省/旧宿主没这个字段 ⇒ 当"允许并行"。
-      serialInput.checked = g.serialToolCalls !== true
+      // 工具调用方式：后端给的是**当前值**（布尔，true = 一次一个）。缺省/旧宿主没这个字段 ⇒ 当串行。
+      serialInput.checked = g.serialToolCalls === false
       paintSerialTools()
 
       const mode = g.cleanup?.mode ?? 'deferred'

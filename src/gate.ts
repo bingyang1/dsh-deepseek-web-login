@@ -260,7 +260,8 @@ export interface GateSettings {
    */
   autoSwitchMinutes?: number
   /**
-   * 是否允许模型在一轮里批量发多个工具调用。`true` = 改用「一次一个」版协议指令。
+   * 是否允许模型在一轮里批量发多个工具调用。`true`（**缺省**）= 用「一次一个」版协议指令；
+   * 只有显式 `false` 才是批量。
    *
    * 同 contextWindow：**不参与节流逻辑**，只是搭同一份设置文件与同一个设置页，
    * 真正的执行方是 `protocol.ts` 的指令选择（见 `toolProtocolInstructions`）。
@@ -603,8 +604,9 @@ export function createRequestGate(options: RequestGateOptions = {}): RequestGate
   // 自动切换账号的间隔（同上：只是存着，真正的执行在宿主的切号钩子 —— 见 AUTO_SWITCH_BOUNDS）。
   let autoSwitchMinutes = clampAutoSwitchMinutes(options.autoSwitchMinutes ?? DEFAULT_AUTO_SWITCH_MINUTES)
   // 工具调用是否允批量（同上：只是存着，真正的执行在 protocol.ts 的指令选择）。
-  // 只有**显式 true** 才切串行 ⇒ 缺省路径与旧行为逐字节一致。
-  let serialToolCalls = options.serialToolCalls === true
+  // 🔴 **缺省＝串行**（0.5.0 起改的默认）：只有**显式 false** 才允许批量。
+  // 改默认的代价：升级后第一轮协议文本就变 ⇒ 投喂链断一次（全量重发 + 新会话）。
+  let serialToolCalls = options.serialToolCalls !== false
   let cleanupMode = options.sessionCleanup
   // 会话清理的三个区间（同样不参与节流逻辑）。存在这里是为了**能落盘**：
   // writeGateSettings 写的是 settings() 的返回值，不存就丢。
