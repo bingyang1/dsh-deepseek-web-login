@@ -104,6 +104,45 @@ Rules:
 9. Keep each batch SMALL — at most 3 calls, and prefer exactly 1. If you need more, send them in successive steps. Long payloads are the ones that most often come out malformed.
 10. Each call must be able to run on its own: no shared shell variables across calls, no dependence on another call in the same batch.`
 
+/**
+ * 「一次只调用一个工具」版协议指令（用户可在「防风控」页切换）。
+ *
+ * 只有 rule 1 / 2 / 9 / 10 不同（rule 2 在串行模式下按**单数**写：确实只有一个调用）。
+ * rule 3~8 **必须与上面那份逐字相同** —— 那几条是 JSON 正确性的防线
+ * （转义、换行、不许复述转写…），跟批量无关，改一处忘另一处就会让其中一版丢掉防线。
+ * `tests/check-tool-serial.mjs` 断言这两段逐字一致。
+ *
+ * ⚠️ 这是**引导模型**，不是强制：我们只改发给模型的文本，不拦截、不改写模型输出的
+ * tool_calls（那会破坏 DSH 的工具执行链路 —— 它从我们转发的事件里解析调用）。
+ * 模型偶尔仍可能发多个，那种情况下 DSH 照旧并行执行。文案里刻意不写"会被拒绝"，
+ * 因为我们确实不拒绝 —— 写了就是撒谎，模型学会忽略之后这条指令就废了。
+ */
+export const SERIAL_TOOL_PROTOCOL_INSTRUCTIONS = `# Tool Calling Protocol
+
+You can call tools to complete the user's task. When you need a tool, output ONLY a single JSON object, with no other text before or after it:
+
+{"tool_calls":[{"name":"<tool-name>","arguments":{<json-arguments>}}]}
+
+Rules:
+1. Put exactly ONE tool in the "tool_calls" array — one call per message, never a batch.
+2. Stop immediately after that JSON object. The runner executes the call and returns the result to you as the next message.
+3. Never fabricate, guess, or simulate tool output — always wait for the real result.
+4. When no tool is needed, answer normally in plain text and do NOT emit that JSON.
+5. "arguments" must be valid JSON (double-quoted strings, no trailing commas). When a value is a Windows path, escape backslashes as \\\\ (e.g. "C:\\\\Users\\\\me"); an unescaped single backslash makes the whole object unparsable. Close every brace: the call object and its "arguments" object each need their OWN closing "}" — one missing "}" makes the whole batch unparsable and the call will be discarded.
+5b. Two things break the JSON most often — check them before you emit:
+   (a) QUOTES INSIDE A VALUE. A shell/PowerShell command very often contains double quotes, e.g. Get-ChildItem "$env:USERPROFILE\\.dsh". Every such inner double quote MUST be escaped as \\" inside the JSON string. An unescaped one ends the string early and discards the whole call.
+   (b) LINE BREAKS INSIDE A VALUE. Never put a real line break inside a string; write \\n instead. When a command needs several statements, join them with ";" on ONE line, or use \\n escapes — do not paste them as actual newlines. Prefer single quotes inside commands to reduce escaping.
+6. Do NOT use XML/HTML-like markup for tool calls: no angle-bracket wrapper tags (no <tool_calls>, <invoke>, <parameter>), and none of the private delimiter-prefixed variants some DeepSeek surfaces use. The JSON object above is the ONLY accepted format. Markup is not just ignored — it leaks into the visible transcript (and into the web conversation) as broken output.
+7. Always answer in the same language the user writes in (these instructions are English only for precision; the JSON itself is language-neutral).
+8. NEVER reproduce the transcript. Do not restate previous turns, "[Tool Result …]" blocks, tool output, or the current prompt. Emit ONLY the calls you want to run right now. A payload that replays earlier calls or embeds tool results is discarded and costs a retry — measured case: a model emitted 15 replayed calls inside one 8152-char payload, and every one of them had to be thrown away.
+9. Do NOT batch. Emit one call, stop, and wait for its real result before you decide the next step. Needing several tools means several successive messages, one call each — the user has turned batching off for this session, so a multi-call array works against them.
+10. Unlike a batch, a call here MAY build on the previous step's result — read what came back and use it. That is the point of one-at-a-time. But never invent a result you have not received.`
+
+/** 本次请求该用哪一份协议指令。缺省＝批量版（保持既有行为逐字节不变）。 */
+export function toolProtocolInstructions(serial?: boolean): string {
+  return serial === true ? SERIAL_TOOL_PROTOCOL_INSTRUCTIONS : TOOL_PROTOCOL_INSTRUCTIONS
+}
+
 /** 判定「这是一段要执行的程序」的最小长度：短于它的多半只是行内提及某个 API。 */
 const MIN_TOOL_PROGRAM_CHARS = 80
 
@@ -331,6 +370,12 @@ export interface SerializeOptions {
    * 续写轮与既有单测走的就是这条路，prompt 形态必须逐字节不变。
    */
   keptImageKeys?: ReadonlySet<string>
+  /**
+   * 用「一次只调用一个工具」那版协议指令（见 `SERIAL_TOOL_PROTOCOL_INSTRUCTIONS`）。
+   *
+   * **不给**（undefined）＝ 批量版 —— 那是既有行为，prompt 形态必须逐字节不变。
+   */
+  serialToolCalls?: boolean
 }
 
 /**
@@ -370,12 +415,15 @@ export function serializePromptParts(options: SerializeOptions): PromptParts {
   // 模型会照着半截定义猜参数，比"干脆不列这个工具"更糟；而且 maxChars 越小时越容易触发。
   // 现在反过来：先把 system 与协议指令的固定开销扣掉，剩下的才是工具目录能用的额度。
   // 装不下就走 buildToolSection 自己的兜底（列出被省略的工具名），head 永远完整。
+  // ⚠️ 预算必须按**本次实际要发的那份**协议文本算（两份长度不同：串行版少了 rule 10 的一句、
+  // rule 1/9 也更短）—— 拿错一份，工具目录的额度就会算偏，head 可能超出 HEAD_RATIO。
+  const protocolText = toolProtocolInstructions(options.serialToolCalls)
   const toolBudget = Math.max(
     0,
-    Math.floor(maxChars * HEAD_RATIO) - system.length - TOOL_PROTOCOL_INSTRUCTIONS.length - PROTOCOL_SLACK_CHARS,
+    Math.floor(maxChars * HEAD_RATIO) - system.length - protocolText.length - PROTOCOL_SLACK_CHARS,
   )
   const toolSection = buildToolSection(options.tools, toolBudget)
-  const protocol = toolSection ? `\n\n${TOOL_PROTOCOL_INSTRUCTIONS}${toolSection}` : ''
+  const protocol = toolSection ? `\n\n${protocolText}${toolSection}` : ''
 
   const lines: string[] = []
   for (const message of options.messages ?? []) {

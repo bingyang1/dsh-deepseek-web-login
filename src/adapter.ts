@@ -354,6 +354,14 @@ export interface AdapterConfig {
    * 由 gate.json 存、index.ts 注入，这里只负责把它塞进模型信息（见 resolvedModelInfo）。
    */
   contextWindow?: number
+  /**
+   * 「一次只调用一个工具」：改用 `SERIAL_TOOL_PROTOCOL_INSTRUCTIONS` 那版协议指令。
+   *
+   * 与其它设置项同一条路：gate.json 存、index.ts 注入，这里只负责把它转给
+   * `serializePromptParts`（**两处调用点都要传** —— 只传首轮的话，续写轮会退回批量版，
+   * 同一会话里两版指令交替出现，head 抖动会把投喂链打断）。缺省 = 批量（旧行为）。
+   */
+  serialToolCalls?: boolean
   /** SSE 空闲超时（毫秒）。 */
   idleTimeoutMs?: number
   /** 是否在调用结束后删除网页端会话（默认 true）。 */
@@ -1121,6 +1129,8 @@ export function createAdapter(deps: AdapterDeps) {
       messages: options?.messages ?? [],
       tools: (options?.tools ?? []) as ToolSchemaLike[],
       maxChars: deps.config.maxPromptChars ?? DEFAULT_MAX_PROMPT_CHARS,
+      // 「一次一个工具」开关：只换协议指令那一段，其余 prompt 结构不变（缺省＝批量，逐字节同旧）。
+      serialToolCalls: deps.config.serialToolCalls === true,
       // 只对**首轮**传：它才是真正带 ref_file_ids 的那一次（续写轮 refFileIds 传空）。
       // 传了之后，被长度控制略过的图会写成 `[earlier image omitted]` 而不是 `[image attached]`
       // —— 标记与实发必须一致，否则模型会对着没送出去的图瞎猜。
@@ -1463,6 +1473,8 @@ export function createAdapter(deps: AdapterDeps) {
           ],
           tools: (options?.tools ?? []) as ToolSchemaLike[],
           maxChars: deps.config.maxPromptChars ?? DEFAULT_MAX_PROMPT_CHARS,
+          // 续写轮用**同一份**设置 —— 否则同一会话里首轮串行、续写退回批量，指令来回变。
+          serialToolCalls: deps.config.serialToolCalls === true,
         })
         currentPrompt = promptParts.full
         // 上一轮的过滤器/守卫状态已在上面收尾时吐净；续写用全新实例

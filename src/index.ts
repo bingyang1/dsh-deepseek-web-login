@@ -324,6 +324,8 @@ export function apply(ctx: any, config: Config = {}): void {
     maxRefImages: savedGate?.maxRefImages ?? config.maxRefImages ?? DEFAULT_MAX_REF_IMAGES,
     contextWindow: savedGate?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     autoSwitchMinutes: savedGate?.autoSwitchMinutes ?? DEFAULT_AUTO_SWITCH_MINUTES,
+    // 工具调用是否允批量（缺省批量＝旧行为）。adapter 每轮序列化 prompt 时现读 ⇒ 改完即时生效。
+    serialToolCalls: savedGate?.serialToolCalls === true,
     longRunBreakMs: savedGate?.longRunBreakMs,
     // ⚠️ 会话清理这几个字段必须**一起传**（2026-09-14 修）：设置页保存时写的是
     // `gate.settings()` 的返回值 —— 没存进闸门的字段会被**静默抹掉**，
@@ -812,6 +814,15 @@ export function apply(ctx: any, config: Config = {}): void {
                 // 0 = 关闭（默认）。宿主在每次请求前现读 gate.settings()，所以改完即时生效。
                 patch.autoSwitchMinutes = clampAutoSwitchMinutes(minutes)
               }
+              if (body.serialToolCalls !== undefined) {
+                // 只收真正的布尔值：`'false'` / 0 / 1 这类一律拒绝，
+                // 免得"看着关了实际开着"（字符串 'false' 是真值，最坑）。
+                if (typeof body.serialToolCalls !== 'boolean') {
+                  sendJson(res, 400, { ok: false, error: 'serialToolCalls 必须是布尔值' })
+                  return
+                }
+                patch.serialToolCalls = body.serialToolCalls
+              }
               if (Object.keys(patch).length === 0) {
                 sendJson(res, 400, { ok: false, error: '没有可更新的字段' })
                 return
@@ -823,6 +834,10 @@ export function apply(ctx: any, config: Config = {}): void {
               if (applied.maxRefImages !== undefined) adapterConfig.maxRefImages = applied.maxRefImages
               // 上下文窗口走同一条路：resolvedModelInfo 每次请求都会重算 ⇒ 改完立刻生效
               if (applied.contextWindow !== undefined) adapterConfig.contextWindow = applied.contextWindow
+              // 工具调用方式同样每轮现读。⚠️ 它改的是**协议文本**，而协议文本进 head，
+              // head 又是 decideFeed 的判据之一 ⇒ 切换会让投喂链断一次（下一轮全量重发 + 新会话），
+              // 之后稳定。界面上写了这句。
+              if (applied.serialToolCalls !== undefined) adapterConfig.serialToolCalls = applied.serialToolCalls
               // 清理策略由 cleaner 执行 → 同步生效
               if (patch.sessionCleanup) sessionCleaner.configure({ mode: patch.sessionCleanup })
               // 三个区间即时作用到清理器（它会用新区间重新随机取值）

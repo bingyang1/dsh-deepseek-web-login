@@ -1779,6 +1779,41 @@ function Panel(): any {
       void saveGate({ autoSwitchMinutes: currentSwitchMinutes() })
     })
 
+    // ── 工具调用方式：一次一个 / 允许多个（默认允许）──────────────────
+    // 用户想"让 DSH 调工具慢下来"。⚠️ 别和本卡最上面那个「允许并发」混为一谈：
+    //   · 「允许并发」＝ 对 DeepSeek **同时发两条请求**，实测 6 分钟就能换来 1 天封禁；
+    //   · 这个开关   ＝ 模型一轮里发**几个工具调用**。工具在 DSH 侧执行（读文件、跑命令），
+    //                   **不产生任何 DeepSeek 请求** ⇒ 对网页端完全不可见。
+    // 所以它跟风控的关系只在"请求数"上：关掉 ⇒ 每个工具各占一轮 ⇒ 总请求数变多、任务更慢。
+    const serialRow = el('div', 'dsw-gate-row')
+    const serialLabel = el('label', 'dsw-switch')
+    const serialInput = el('input') as HTMLInputElement
+    serialInput.type = 'checkbox'
+    const serialTrack = el('span', 'dsw-switch-track')
+    serialLabel.append(serialInput, serialTrack, el('span', undefined, '允许并行调用工具'))
+    serialRow.append(serialLabel)
+    gateCard.append(serialRow)
+    const serialHint = el('p', 'dsw-hint', '')
+    gateCard.append(serialHint)
+
+    // 注意这里是**双否定**：勾上 = 允许并行 = 传到后端的 serialToolCalls 为 false。
+    // 变量名取 checked 的语义（batched），别让读代码的人自己反推。
+    const paintSerialTools = (): void => {
+      const batched = serialInput.checked
+      serialHint.textContent = batched
+        ? '默认：模型可以一次发多个工具调用（同一批最多 3 个），DSH 会并行跑它们 —— 一轮请求推进多步，任务快。' +
+          '工具在 DSH 侧执行、不发 DeepSeek 请求，所以对网页端不可见。切换后的第一轮会全量重发一次。'
+        : '一次只发一个工具调用，等结果回来再决定下一步 —— 后一步能用上前一步的真实结果，逐步反应更稳。' +
+          '代价：每个工具各占一轮请求，任务总耗时明显变长。切换后的第一轮会全量重发一次。'
+    }
+    // 初始先按默认（允许并行）画一次，免得读回设置之前闪一下"关闭"态
+    serialInput.checked = true
+    paintSerialTools()
+    serialInput.addEventListener('change', () => {
+      paintSerialTools()
+      void saveGate({ serialToolCalls: !serialInput.checked })
+    })
+
     const cleanupRow = el('div', 'dsw-gate-row')
     cleanupRow.append(el('span', 'dsw-gate-label', '会话清理'))
     const cleanupBtns: Record<string, HTMLButtonElement> = {}
@@ -2691,6 +2726,9 @@ function Panel(): any {
       swRange.max = String(swBounds.max)
       swRange.value = String(g.autoSwitchMinutes ?? g.autoSwitchDefault ?? 0)
       paintAutoSwitch()
+      // 工具调用方式：后端给的是**当前值**（布尔）。缺省/旧宿主没这个字段 ⇒ 当"允许并行"。
+      serialInput.checked = g.serialToolCalls !== true
+      paintSerialTools()
 
       const mode = g.cleanup?.mode ?? 'deferred'
       for (const key of Object.keys(cleanupBtns)) {
@@ -2726,6 +2764,8 @@ function Panel(): any {
       maxRefImages?: number
       contextWindow?: number
       autoSwitchMinutes?: number
+      /** true = 一次只发一个工具调用（界面上的开关未勾选）。 */
+      serialToolCalls?: boolean
       cleanupBatch?: { min: number; max: number }
       cleanupDelayMs?: { min: number; max: number }
       cleanupGapMs?: { min: number; max: number }

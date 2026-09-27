@@ -259,6 +259,13 @@ export interface GateSettings {
    * 只是搭同一份设置文件与同一个设置页，真正的执行方是宿主的切号钩子（见 AUTO_SWITCH_BOUNDS）。
    */
   autoSwitchMinutes?: number
+  /**
+   * 是否允许模型在一轮里批量发多个工具调用。`true` = 改用「一次一个」版协议指令。
+   *
+   * 同 contextWindow：**不参与节流逻辑**，只是搭同一份设置文件与同一个设置页，
+   * 真正的执行方是 `protocol.ts` 的指令选择（见 `toolProtocolInstructions`）。
+   */
+  serialToolCalls?: boolean
 }
 
 /** 节流设置文件：`${DSH_HOME || ~/.dsh}/web-login/gate.json`（插件自治，与凭证同目录）。 */
@@ -320,6 +327,8 @@ export function readGateSettings(): Partial<GateSettings> | undefined {
     if (Number.isFinite(parsed?.autoSwitchMinutes)) {
       out.autoSwitchMinutes = clampAutoSwitchMinutes(Number(parsed.autoSwitchMinutes))
     }
+    // boolean 走 typeof，别套 Number.isFinite 那套（`Number(true)` 是 1，会被当成合法数字收下）
+    if (typeof parsed?.serialToolCalls === 'boolean') out.serialToolCalls = parsed.serialToolCalls
     return Object.keys(out).length > 0 ? out : undefined
   } catch {
     return undefined
@@ -365,6 +374,8 @@ export interface RequestGateOptions {
   contextWindow?: number
   /** 自动切换账号的间隔（分钟，0 = 关闭；同上，本模块不执行，只是存下来以便落盘与回显）。 */
   autoSwitchMinutes?: number
+  /** 关掉批量工具调用＝用「一次一个」版协议指令（同上，本模块不执行，只是存下来以便落盘与回显）。 */
+  serialToolCalls?: boolean
   /**
    * 会话清理策略（本模块不执行，同样只是存下来以便落盘与回显）。
    *
@@ -591,6 +602,9 @@ export function createRequestGate(options: RequestGateOptions = {}): RequestGate
   let contextWindow = clampContextWindow(options.contextWindow ?? DEFAULT_CONTEXT_WINDOW)
   // 自动切换账号的间隔（同上：只是存着，真正的执行在宿主的切号钩子 —— 见 AUTO_SWITCH_BOUNDS）。
   let autoSwitchMinutes = clampAutoSwitchMinutes(options.autoSwitchMinutes ?? DEFAULT_AUTO_SWITCH_MINUTES)
+  // 工具调用是否允批量（同上：只是存着，真正的执行在 protocol.ts 的指令选择）。
+  // 只有**显式 true** 才切串行 ⇒ 缺省路径与旧行为逐字节一致。
+  let serialToolCalls = options.serialToolCalls === true
   let cleanupMode = options.sessionCleanup
   // 会话清理的三个区间（同样不参与节流逻辑）。存在这里是为了**能落盘**：
   // writeGateSettings 写的是 settings() 的返回值，不存就丢。
@@ -615,6 +629,7 @@ export function createRequestGate(options: RequestGateOptions = {}): RequestGate
       maxRefImages,
       contextWindow,
       autoSwitchMinutes,
+      serialToolCalls,
     }
   }
 
@@ -627,6 +642,7 @@ export function createRequestGate(options: RequestGateOptions = {}): RequestGate
     if (next.maxRefImages !== undefined) maxRefImages = clampMaxRefImages(Number(next.maxRefImages))
     if (next.contextWindow !== undefined) contextWindow = clampContextWindow(Number(next.contextWindow))
     if (next.autoSwitchMinutes !== undefined) autoSwitchMinutes = clampAutoSwitchMinutes(Number(next.autoSwitchMinutes))
+    if (typeof next.serialToolCalls === 'boolean') serialToolCalls = next.serialToolCalls
     // 三个区间：非法的输入直接当"没给"（不报错、也不覆盖已有的有效值）
     if (next.cleanupBatch !== undefined) {
       const value = normalizeCleanupRange(next.cleanupBatch, CLEANUP_BATCH_BOUNDS)
