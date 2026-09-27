@@ -2,6 +2,48 @@
 
 本项目遵循大致语义化版本；日期为本地时间。
 
+## 0.6.0 — 2026-09-27
+
+> 工具目录改用**紧凑类型签名**下发，不再给模型贴原始 JSON。
+
+### 改进
+
+- **每个工具的参数不再原样贴 JSON**。原先那行是
+  `Parameters (JSON Schema): {"type":"object","properties":{…}}`，现在渲染成类型签名：
+
+  ```
+  ### read_file
+  Read a file.
+  read_file(file_path: string, offset?: number, limit?: number)
+    file_path: Path to read, resolved by the filesystem backend.
+    offset: 1-based first line to return. Defaults to 1.
+  ```
+
+  模型要写出 `arguments`，真正需要的只是**参数名、类型、必填性**；那串 JSON 里
+  `"type":"…"`、键名的引号、每个参数各套一层对象，全是结构性样板。
+- **两种参数形态都认**。DSH 自家工具是**扁平**写法（顶层键直接是参数名、`required: true`
+  挂在参数自己身上），而 `@deepseek-ai/dsh-tools` 的 `schemaOf()` 把它**原样透传**、不做规范化；
+  标准 JSON Schema 包裹形态（`{type:'object',properties:{…}}`）一并支持。
+- 嵌套对象/数组/枚举/`anyOf` 都能渲染：`{content: string, status: string}[]`、
+  `"view" | "create" | "str_replace" | "insert"`。
+
+### 实测（2026-09-27，取自 13 个真实 DSH 工具定义）
+
+- 参数段 **7,588 → 4,186 字符（省 45%）**，`required` 与参数描述全部保留、零回退。
+- 折算到**整个工具目录约省 18%** —— 目录里更大的一块是工具级描述（同批样本 10,369 字符），
+  那块**没动**：它藏的是"遇错怎么办"的指引，不许砍。
+- 按 61 个工具 / 50,942 字符的目录估，约 **省 9,500 字符 ≈ 2,400 token**，占单轮输入 **3%** 左右。
+  ⇒ 别指望它解决"提示词太长"：真正的大头是消息历史与环境注入，不在工具目录。
+
+### 说明 / 风险
+
+- ⚠️ **这是 head 的变化**：升级后**第一个任务会全量重发一次**（投喂链断），之后照常。
+- ⚠️ 模型看到的参数形态变了（JSON → 类型签名）。签名是模型最熟的形态，预期更好读；
+  但**首次实测若发现参数写错，请立刻反馈** —— 回退只改一处：`buildToolSection` 里不用
+  `buildToolSignature` 即退回原始 JSON（回退分支与"认不出就不许发空参数"由
+  `tests/check-tool-signature.mjs` 守着）。
+- 参数描述超过 160 字符会被截断；**工具级描述仍是 3200 上限，不受影响**。
+
 ## 0.5.3 — 2026-09-27
 
 > 修掉一个"重启后前 3 分钟里限流不换号"的窗口 —— 0.5.2 的漏洞。
