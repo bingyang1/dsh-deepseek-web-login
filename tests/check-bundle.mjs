@@ -120,6 +120,37 @@ const checks = {
     /providerRetryPolicy\([^)]*\)\s*\{\s*return RETRY_POLICY/.test(host),
   'host 的重试策略上限覆盖了我们的最大限流退避（只改一边就会又"放弃重试"）':
     /maxDelayMs:\s*MAX_THROTTLE_RETRY_MS/.test(host),
+  // 0.6.5：策略字段必须是**扁平**的。0.6.3 写成了 `backoff: {…}` 嵌套，而 adapter 返回的对象
+  // **不经 dsh-llm 的 resolveRetryPolicy 规范化** ⇒ 三个延迟字段在运行期全是 undefined
+  // ⇒ 本地退避算出 NaN ⇒ 事件写不进会话日志（DSH 拒收非有限数）⇒ **整轮 UNKNOWN 报错死掉**。
+  // 这就是"自己停下来"的根因；上面那条 `maxDelayMs: MAX_…` 的正则**守不住它**（嵌套时照样命中）。
+  // ⚠️ 只在 RETRY_POLICY 字面量内部扫（lib 保留注释，全文扫会误判）。
+  'host 的重试策略是扁平字段（嵌套 backoff 会让延迟字段全 undefined ⇒ 退避算成 NaN ⇒ 整轮报错）':
+    (() => {
+      const lit = /const RETRY_POLICY = Object\.freeze\(\{[\s\S]*?\n\}\)/.exec(host)
+      if (!lit) return false
+      const body = lit[0]
+      return (
+        !/\bbackoff\s*:/.test(body) &&
+        /initialDelayMs\s*:/.test(body) &&
+        /maxDelayMs\s*:/.test(body) &&
+        /jitterRatio\s*:/.test(body)
+      )
+    })(),
+  'host 的重试上限在运行期能解析成有限数（undefined/NaN ⇒ dsh-llm 判据恒不成立，还会写坏会话日志）':
+    (() => {
+      const one = (name) => {
+        const m = new RegExp('const ' + name + ' = ([^;\\n]+)').exec(host)
+        return m ? m[1] : ''
+      }
+      const factor = /Math\.round\(\s*THROTTLE_MAX_MS\s*\*\s*([\d.]+)\s*\)/.exec(one('MAX_THROTTLE_RETRY_MS'))
+      const cap = Number(one('THROTTLE_MAX_MS'))
+      if (!factor || !Number.isFinite(cap)) return false
+      const resolved = Math.round(cap * Number(factor[1]))
+      // ① 必须是有限数（NaN 就是本次故障）② 必须比 dsh-llm 的默认上限 10s 更宽，
+      // ③ 下限取现场实测值 49208（throttleBackoffMs 首档）—— 比它小就意味着又会"放弃重试"。
+      return Number.isFinite(resolved) && resolved > 10_000 && resolved >= 49_208
+    })(),
   'host 启动闸门时 min/max 成对传入（漏传 max 会让随机区间变成固定间隔）':
     /maxIntervalMs:\s*\w+\?\.maxRequestIntervalMs/.test(host),
   'host 适配器配置也带上 maxRequestIntervalMs': host.includes('maxRequestIntervalMs: gate.settings().maxRequestIntervalMs'),
