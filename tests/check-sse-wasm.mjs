@@ -215,6 +215,35 @@ await test('非数字的脏值不采信', async () => {
   assert.equal(finish.totalTokens, undefined)
 })
 
+// ── 限流退避与「能不能换号」：直接打 parseWebSse（不经宿主的 makeCanFailover 包装）──
+// 意义：宿主注入的 canFailover 可能抛错，parseWebSse 这一层**自己也要兜住** ——
+// 否则异常会从解析器里冒出来，把一条"该重试的限流"变成"整轮崩掉"。
+const THROTTLE_FRAME =
+  `data: ${JSON.stringify({ type: 'error', content: '消息发送过于频繁，请稍后重试' })}` + NL + NL
+
+async function throttleEventWith(canFailover) {
+  const events = []
+  const options = canFailover === undefined ? {} : { canFailover }
+  for await (const event of parseWebSse(sseBody(THROTTLE_FRAME), options)) events.push(event)
+  return events.find((e) => e.kind === 'error')
+}
+
+await test('canFailover 返回 true ⇒ 秒级退避（与 streamWebCompletion 那条同答）', async () => {
+  const err = await throttleEventWith(() => true)
+  assert.ok(err, '应产出 error 事件')
+  assert.equal(err.code, 'RATE_LIMIT')
+  assert.ok(err.retryAfterMs < 10_000, `能换号就该立刻重试，实际 ${err.retryAfterMs}`)
+})
+
+await test('canFailover 抛错 ⇒ 这一层自己兜住，按"不能换号"给长退避', async () => {
+  const err = await throttleEventWith(() => {
+    throw new Error('boom')
+  })
+  assert.ok(err, '异常不能被吞掉导致没有 error 事件')
+  assert.equal(err.code, 'RATE_LIMIT', '仍要归到可重试的 RATE_LIMIT')
+  assert.ok(err.retryAfterMs >= 20_000, `问不出来时按保守方向，实际 ${err.retryAfterMs}`)
+})
+
 console.log()
 console.log(`通过 ${passed} 项${failures.length ? `，失败 ${failures.length} 项` : '，全部通过 OK'}`)
 for (const f of failures) console.log('  ' + f)

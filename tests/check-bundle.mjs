@@ -115,6 +115,11 @@ const checks = {
   // 全文扫会把它误判成"退回了旧实现"（0.6.2 真踩过一次）。
   'host 的省略兜底没退回旧那句「remaining tools omitted for length」':
     !/omittedNotice[\s\S]{0,400}remaining tools omitted/.test(host),
+  // 0.6.3：限流之后"任务自己接下去"依赖这两条 —— 少任何一条都会退回"用户手点继续"。
+  'host 适配器给出了重试策略（返回 undefined ⇒ 退回 dsh-llm 的 10s 上限 ⇒ 限流不再自动重试）':
+    /providerRetryPolicy\([^)]*\)\s*\{\s*return RETRY_POLICY/.test(host),
+  'host 的重试策略上限覆盖了我们的最大限流退避（只改一边就会又"放弃重试"）':
+    /maxDelayMs:\s*MAX_THROTTLE_RETRY_MS/.test(host),
   'host 启动闸门时 min/max 成对传入（漏传 max 会让随机区间变成固定间隔）':
     /maxIntervalMs:\s*\w+\?\.maxRequestIntervalMs/.test(host),
   'host 适配器配置也带上 maxRequestIntervalMs': host.includes('maxRequestIntervalMs: gate.settings().maxRequestIntervalMs'),

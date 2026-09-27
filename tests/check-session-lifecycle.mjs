@@ -15,7 +15,7 @@
  * 用法: node tests/check-session-lifecycle.mjs
  */
 import assert from 'node:assert/strict'
-import { envelopeError, isBusyGenerating, isInvalidSessionError, isMutedError, isThrottled, muteUntilMs, resetSessionReuse, streamWebCompletion } from '../src/webapi.ts'
+import { envelopeError, isBusyGenerating, isInvalidSessionError, isMutedError, isThrottled, MAX_THROTTLE_RETRY_MS, muteUntilMs, resetSessionReuse, streamWebCompletion } from '../src/webapi.ts'
 
 let passed = 0
 const failures = []
@@ -266,17 +266,84 @@ await run('账号节流：webapi 产出的事件必须带 RATE_LIMIT + throttled
   assert.ok(err.retryAfterMs >= 20_000, `节流退避要给足（≥20s），实际 ${err.retryAfterMs}`)
 })
 
-await run('连续被限时退避渐长（20s 起、翻倍、上限 90s + 抖动）', async () => {
+await run('连续被限时退避渐长（首档 40s、翻倍、上限 90s + 抖动）', async () => {
   const one = await scenario({ completionResponses: [sseResponse(SSE_THROTTLE)] })
   const first = one.events.find((e) => e.kind === 'error')?.retryAfterMs ?? 0
   const two = await scenario({ completionResponses: [sseResponse(SSE_THROTTLE)] })
   const second = two.events.find((e) => e.kind === 'error')?.retryAfterMs ?? 0
   for (const v of [first, second]) {
     assert.ok(v >= 20_000, `退避至少 20s，实际 ${v}`)
-    assert.ok(v <= 120_000, `退避不该超过 90s + 抖动，实际 ${v}`)
+    assert.ok(v <= MAX_THROTTLE_RETRY_MS, `退避不该超过 90s + 30% 抖动（${MAX_THROTTLE_RETRY_MS}），实际 ${v}`)
   }
   // 越被限越要等久一点（到 90s 上限后持平，抖动可能让后一次略小，所以加这个分支）
   assert.ok(second > first || second >= 90_000, `应递增：第一次 ${first} → 第二次 ${second}`)
+})
+
+// ── 事实 ⑥（2026-09-27 现场）：SSE 节流的退避长短必须取决于「还能不能换号」──
+//
+// 用户实测：自动换号其实已经生效过，但节流之后整轮仍以 error 结束，得手点「继续」。
+// 会话日志原文：`failure:{code:"RATE_LIMIT", providerRetryAfterMs:49208}` —— 49208 > dsh-llm
+// 默认的 maxDelayMs(10s)，normal 模式下**直接放弃重试**。
+// 而"能换号就短退避"的逻辑当时只挂在 HTTP 路径上，**SSE 这条路（节流最常见的形态）根本
+// 拿不到 canFailover** ⇒ 无论能不能换号都抛 40~117s ⇒ 必然被放弃。
+
+await run('🔴 SSE 节流 + 能换号 ⇒ 秒级退避（重试立刻发生，重发时由检查点换号）', async () => {
+  const { events } = await scenario({
+    completionResponses: [sseResponse(SSE_THROTTLE)],
+    canFailover: () => true,
+  })
+  const err = events.find((e) => e.kind === 'error')
+  assert.ok(err, '应产出 error 事件')
+  assert.ok(
+    err.retryAfterMs > 0 && err.retryAfterMs < 10_000,
+    `能换号时必须给秒级退避，否则被判定"等太久"放弃重试 ⇒ 又变成"要用户手点继续"；实际 ${err.retryAfterMs}`,
+  )
+  assert.equal(err.rateLimitKind, 'throttled', '换号那条只作用于"账号节流"，别串到并发生成上')
+})
+
+await run('SSE 节流 + 不能换号 ⇒ 给足渐长退避，且不超过我们声明的上限', async () => {
+  const { events } = await scenario({
+    completionResponses: [sseResponse(SSE_THROTTLE)],
+    canFailover: () => false,
+  })
+  const err = events.find((e) => e.kind === 'error')
+  assert.ok(err.retryAfterMs >= 20_000, `同号立刻重试只会再撞一次，应给足退避，实际 ${err.retryAfterMs}`)
+  assert.ok(
+    err.retryAfterMs <= MAX_THROTTLE_RETRY_MS,
+    `超过我们声明的 maxDelayMs(${MAX_THROTTLE_RETRY_MS}) 就必被放弃，实际 ${err.retryAfterMs}`,
+  )
+})
+
+await run('SSE 节流 + canFailover 抛错 ⇒ 按"不能换号"处理（长退避，别赌）', async () => {
+  const { events } = await scenario({
+    completionResponses: [sseResponse(SSE_THROTTLE)],
+    canFailover: () => {
+      throw new Error('boom')
+    },
+  })
+  const err = events.find((e) => e.kind === 'error')
+  assert.ok(err.retryAfterMs >= 20_000, `问不出来时按保守方向（长退避），实际 ${err.retryAfterMs}`)
+})
+
+await run('SSE 节流 + 没注入 canFailover ⇒ 与旧行为一致（长退避）', async () => {
+  const { events } = await scenario({ completionResponses: [sseResponse(SSE_THROTTLE)] })
+  const err = events.find((e) => e.kind === 'error')
+  assert.ok(err.retryAfterMs >= 20_000, `不动这个开关的人必须无感，实际 ${err.retryAfterMs}`)
+})
+
+await run('toast 形态的节流同样认 canFailover（同一个语义两个出口，口径必须一致）', async () => {
+  const TOAST = `event: toast\ndata: ${JSON.stringify({ content: REAL_THROTTLE })}\n\n`
+  const { events } = await scenario({
+    completionResponses: [sseResponse(TOAST)],
+    canFailover: () => true,
+  })
+  const err = events.find((e) => e.kind === 'error')
+  assert.ok(err, `应产出 error 事件，实际 ${JSON.stringify(events)}`)
+  assert.equal(err.rateLimitKind, 'throttled', `toast 这条也要归到账号节流，实际 ${JSON.stringify(err)}`)
+  assert.ok(
+    err.retryAfterMs < 10_000,
+    `error 事件那条给短退避、toast 这条给长退避 ⇒ 用户会遇到"有时自己接下去、有时必须手点"；实际 ${err.retryAfterMs}`,
+  )
 })
 
 await run('SSE 错误事件里的「并发生成」→ 归类为可重试的 RATE_LIMIT', async () => {

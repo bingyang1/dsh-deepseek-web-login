@@ -16,6 +16,8 @@ import { staleAuthMessage } from './probe.ts'
 import { createRequestGate, DEFAULT_MAX_PROMPT_CHARS, DEFAULT_MAX_REF_IMAGES, DEFAULT_MIN_REQUEST_INTERVAL_MS, type RequestGate } from './gate.ts'
 import { summarizeCookieLife, type CookieLifeSummary } from './cookies.ts'
 import {
+  FAILOVER_RETRY_MS,
+  MAX_THROTTLE_RETRY_MS,
   scheduleDeleteSession,
   streamWebCompletion,
   uploadImageFile,
@@ -664,6 +666,40 @@ function allowsAutoContinue(purpose: unknown): boolean {
   return purpose === undefined || purpose === null || purpose === '' || purpose === 'chat'
 }
 
+/**
+ * 交给 dsh-llm 的**重试策略**（`LlmAdapter.providerRetryPolicy` 的返回值）。
+ *
+ * 🔴 为什么必须显式声明、**不能返回 undefined**：不声明就用 dsh-llm 的默认策略，其中
+ * `maxDelayMs = 10_000`；而我们的限流退避是 **40~117s**。normal 模式下策略一旦发现
+ * 「提供方要的延迟 > maxDelayMs」就**直接放弃重试**（`return next()`）⇒ 整轮以 error 结束、
+ * 用户得手点「继续」。
+ *
+ * 实测 2026-09-27 14:35:32（会话日志原文）：
+ *   `failure:{code:"RATE_LIMIT", providerRetryAfterMs:49208}` → 默认上限 10s
+ *   ⇒ **一次都没重试**，`turn/end` 直接是 error。这就是"自动换号了、但还得我发继续"的根因。
+ *
+ * 声明之后：提供方要的延迟 ≤ `maxDelayMs` 会被**照单等待并重试**（同一个打开的轮次里重跑
+ * 失败步骤，历史保持一致），任务自己接下去 —— 重发时"自动换号"的检查点还会换上可用账号。
+ *
+ * 取值理由：
+ * - `initialDelayMs` = `FAILOVER_RETRY_MS`：本地退避起点与"能换号"那条路一致；
+ * - `maxDelayMs` = `MAX_THROTTLE_RETRY_MS`（117s）：**必须 ≥ 我们可能上报的最大退避**，
+ *   否则又回到"要等太久 ⇒ 放弃"。`tests/check-llm-retry.mjs` 守这个不变量；
+ * - `maxRetries` = 5（与 dsh-llm 默认一致）：**有界** —— 避免账号真被封时无限打请求。
+ *   想更激进可以调大，或改 `mode: 'always'`（无尝试上限）；那会在坏账号上一直重试，默认不开；
+ * - `retryableCodes` 与 dsh-llm 默认一致（含 `RATE_LIMIT`）—— 我们只抛这几个码。
+ */
+export const RETRY_POLICY = Object.freeze({
+  mode: 'normal' as const,
+  maxRetries: 5,
+  retryableCodes: Object.freeze(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']),
+  backoff: Object.freeze({
+    initialDelayMs: FAILOVER_RETRY_MS,
+    maxDelayMs: MAX_THROTTLE_RETRY_MS,
+    jitterRatio: 0.2,
+  }),
+})
+
 /** 构造 deepseek-web 适配器（鸭子类型满足 LlmAdapter 契约，无需继承）。 */
 export function createAdapter(deps: AdapterDeps) {
   const logger = deps.config.logger
@@ -687,9 +723,13 @@ export function createAdapter(deps: AdapterDeps) {
       return { id: provider, name: 'DeepSeek 网页版（免费）' }
     },
 
-    /** 未配置策略 → 走 dsh-llm 默认重试码表（EMPTY_RESPONSE/RATE_LIMIT/SERVER/TIMEOUT/TRANSPORT）。 */
+    /**
+     * 重试策略：**必须显式给**（理由见 `RETRY_POLICY` 的注释）——
+     * 返回 `undefined` 会落到 dsh-llm 的默认上限 10s，而我们的限流退避是 40~117s，
+     * 于是"要等太久 ⇒ 放弃重试 ⇒ 用户手点继续"。
+     */
     providerRetryPolicy(_provider: string) {
-      return undefined
+      return RETRY_POLICY
     },
 
     /**

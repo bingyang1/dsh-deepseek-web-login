@@ -131,15 +131,20 @@ export function muteUntilMs(json: any): number | undefined {
  * 为什么是 2 秒而不是 0：让 dsh-llm-retry 立刻重发，但仍留一点余量 ——
  * 重发进入适配器时，"自动换号"的检查点要先跑完（可能含一次探活）。
  * 它**不是**"等对面恢复"的退避，而是"我马上换个号再试一次"的信号。
+ *
+ * 导出是为了让 `adapter.ts` 声明重试策略时拿它当 `initialDelayMs`（单一来源）。
  */
-const FAILOVER_RETRY_MS = 2_000
+export const FAILOVER_RETRY_MS = 2_000
 /**
- * 限流但**没得换号**时的退避。
+ * 限流但**没得换号**时的退避（HTTP 路径用的定值）。
  *
  * 为什么还留着 20 秒：限流是"发太快了"的反馈，同号立刻重试只会再撞一次。
  * ⚠️ 但它同时意味着"这一轮基本就断了" —— 台账实测限流后能自动重发的几次，间隔都落在
  * 27.8s ~ 60s 且那几次仍然失败。所以**能换号就一定走 `FAILOVER_RETRY_MS`**，
  * 别让用户在这里干等（那是"任务卡住、要手动重发"的根源）。
+ *
+ * ⚠️ 别拿它当"我们的最大退避"：SSE 路径走的是 `throttleBackoffMs`（渐长、上限更高），
+ * 见 `MAX_THROTTLE_RETRY_MS`。
  */
 const THROTTLE_RETRY_MS = 20_000
 
@@ -223,12 +228,37 @@ export function fetchImplKind(): 'injected' | 'node' {
 let throttleStreak = 0
 let lastThrottleAt = 0
 
-/** 取下一次节流退避（ms）：20s 起、每次翻倍、上限 90s，并加 0~30% 抖动。 */
+/** 限流退避：基数 20s、每次翻倍、封顶 90s，另加 0~30% 抖动。 */
+const THROTTLE_BASE_MS = 20_000
+const THROTTLE_MAX_MS = 90_000
+const THROTTLE_JITTER_RATIO = 0.3
+
+/**
+ * 我们**可能**上报给调用方（`dsh-llm-retry`）的**最大**限流退避。
+ *
+ * 🔴 它必须 ≤ 适配器声明的 `providerRetryPolicy().backoff.maxDelayMs`（见 `adapter.ts`）：
+ * dsh-llm 的重试策略在 normal 模式下，一旦「提供方要的延迟 > maxDelayMs」就**直接放弃重试**
+ * （`return next()`），整轮随即以 error 结束 —— 表现就是"任务停在限流上，要用户手点继续"。
+ *
+ * 实测 2026-09-27 14:35:32（会话日志原文）：
+ *   `failure: {code: "RATE_LIMIT", providerRetryAfterMs: 49208}` → 默认 maxDelayMs=10000
+ *   ⇒ 一次都没重试，`turn/end` 直接是 error。所以**两边的数字必须一起看**，别只改一边。
+ */
+export const MAX_THROTTLE_RETRY_MS = Math.round(THROTTLE_MAX_MS * (1 + THROTTLE_JITTER_RATIO))
+
+/**
+ * 取下一次节流退避（ms）。
+ *
+ * ⚠️ 实际的**首档是 40s，不是 20s**：`noteThrottled` 先把 `throttleStreak` 加一，
+ * 再调本函数算 `20s × 2^streak`。注释与代码曾不一致（多处写"20s 起"），
+ * 2026-09-27 按实测值（49208ms = 40000 + 23% 抖动）校正为 40s 起。
+ * 保序：40s → 80s → 90s（封顶），每次都加 0~30% 抖动。
+ */
 export function throttleBackoffMs(now: number = Date.now()): number {
   // 超过 5 分钟没被限，认为窗口已过，重新开始计数
   if (now - lastThrottleAt > 5 * 60_000) throttleStreak = 0
-  const base = Math.min(20_000 * 2 ** throttleStreak, 90_000)
-  const jitter = Math.round(base * 0.3 * Math.random())
+  const base = Math.min(THROTTLE_BASE_MS * 2 ** throttleStreak, THROTTLE_MAX_MS)
+  const jitter = Math.round(base * THROTTLE_JITTER_RATIO * Math.random())
   return base + jitter
 }
 
@@ -238,6 +268,23 @@ function noteThrottled(now: number = Date.now()): number {
   throttleStreak += 1
   lastThrottleAt = now
   return throttleBackoffMs(now)
+}
+
+/**
+ * 限流（SSE 路径）该向调用方要多久的退避。
+ *
+ * 能换号 ⇒ 短退避，让重试**立刻**发生（重发前的检查点会换上可用账号）；
+ * 不能 ⇒ 给足渐长退避。问不出来（没注入 / 抛错）时按"不能换号"处理：保守方向 ——
+ * 宁可多等一会儿，也不要给一个它其实接不上的短退避（那只会更快地撞同一个限流）。
+ *
+ * ⚠️ `noteThrottled()` 有副作用（推高 streak），所以**只在真要长退避时才调它** ——
+ * 能换号时不烧档位。
+ */
+function throttleRetryAfterMs(canFailover?: (kind?: 'muted' | 'throttled') => boolean): number {
+  try {
+    if (canFailover?.('throttled') === true) return FAILOVER_RETRY_MS
+  } catch {}
+  return noteThrottled()
 }
 
 /**
@@ -1293,6 +1340,18 @@ export interface SseStateOptions {
    * 那里对未知 kind 的处理没人守（多一种事件就多一处可能被当成"未知"丢掉）。
    */
   onResponseMessageId?: (id: number) => void
+  /**
+   * 宿主给的「当前账号被限流时，还能不能换号接着干」。
+   *
+   * 🔴 SSE 这条路径**必须**问它，而且答案要与 HTTP 那条路径一致：
+   * 能换号 ⇒ 给短退避（2s），让调用方（dsh-llm-retry）立刻重发，由重发前的检查点换上可用账号；
+   * 不能 ⇒ 给足渐长退避（40~117s）。
+   *
+   * 缺了它会怎样（实测 2026-09-27 14:35:32）：SSE 节流直接抛 49.2 秒，而 dsh-llm 的默认策略
+   * 上限是 10 秒 ⇒ **一次都不重试**、整轮以 error 结束 ⇒ 用户得手点「继续」；
+   * 而"能换号"的那套逻辑当时只挂在 HTTP 路径上，SSE（节流最常见的形态）根本走不到。
+   */
+  canFailover?: (kind?: 'muted' | 'throttled') => boolean
 }
 
 /** F28：思考的标准包装标签。孤儿兜底用（见 finish 里的判据）。 */
@@ -1538,9 +1597,10 @@ export function createSseState(options: SseStateOptions = {}) {
           event.retryAfterMs = 5_000
           event.rateLimitKind = 'concurrent'
         } else if (isThrottled(message)) {
-          // 账号级节流（「消息发送过于频繁，请稍后重试」）：连续被限就退避渐长，别一直撞
+          // 账号级节流（「消息发送过于频繁，请稍后重试」）：能换号就立刻重发（由重发前的
+          // 检查点换号），不能换号才给渐长退避。
           event.code = 'RATE_LIMIT'
-          event.retryAfterMs = noteThrottled()
+          event.retryAfterMs = throttleRetryAfterMs(options.canFailover)
           event.rateLimitKind = 'throttled'
         }
         out.push(event)
@@ -1557,7 +1617,7 @@ export function createSseState(options: SseStateOptions = {}) {
           event.rateLimitKind = 'concurrent'
         } else if (isThrottled(full)) {
           event.code = 'RATE_LIMIT'
-          event.retryAfterMs = noteThrottled()
+          event.retryAfterMs = throttleRetryAfterMs(options.canFailover)
           event.rateLimitKind = 'throttled'
         }
         out.push(event)
@@ -2008,6 +2068,26 @@ const defaultTransport: CompletionTransport = { createSession: createChatSession
  *  - 会话失效（invalid chat session id）→ **换一个新会话透明重试一次**（用户无感）；
  *  - 其它业务错误 → 按业务码抛出（AUTH / RATE_LIMIT / PROVIDER_ERROR…）。
  */
+/**
+ * 宿主给的「当前账号被限时，还能不能换号接着干」。
+ *
+ * 🔴 **单一来源**：`openCompletion`（HTTP 路径）与 `streamWebCompletion`（SSE 路径）都必须走它 ——
+ * 两条路径的答案不一致时会出现最难查的故障：SSE 给长退避放弃重试，而 HTTP 给短退避重发，
+ * 用户看到的就是"有时自己接下去了、有时必须手点继续"。
+ *
+ * 问不出来（没注入 / 抛错）时按**不能**处理 —— 保守方向：宁可让用户多点一次「继续」，
+ * 也不要给一个它其实接不上的短退避（那只会更快地撞同一个限流）。
+ */
+function makeCanFailover(params: CompletionParams): (kind?: 'muted' | 'throttled') => boolean {
+  return (kind) => {
+    try {
+      return params.canFailover?.(kind) === true
+    } catch {
+      return false
+    }
+  }
+}
+
 async function openCompletion(
   auth: WebAuth,
   params: CompletionParams,
@@ -2015,17 +2095,7 @@ async function openCompletion(
   transport: CompletionTransport,
 ): Promise<{ sessionId: string; resp: Response; feed: FeedDecision }> {
   let lastFailure: AdapterLlmError | undefined
-  /**
-   * 宿主给的「还能不能换号接着干」。问不出来（没注入 / 抛错）时按**不能**处理 ——
-   * 保守方向：宁可让用户点一次「继续」，也不要给一个它其实接不上的短退避。
-   */
-  const canFailover = (kind?: 'muted' | 'throttled'): boolean => {
-    try {
-      return params.canFailover?.(kind) === true
-    } catch {
-      return false
-    }
-  }
+  const canFailover = makeCanFailover(params)
   for (let attempt = 0; attempt < 2; attempt++) {
     const lease = await leaseSession(
       auth,
@@ -2197,7 +2267,9 @@ async function openCompletion(
             // 绝对值单独带一份：宿主会把它记到账号上，在设置页显示倒计时
             ...(muted && untilMs !== undefined ? { mutedUntilMs: untilMs } : {}),
             ...(busy ? { providerRetryAfterMs: 5_000 } : {}),
-            // 节流给 20s（与 SSE 路径的 throttleBackoffMs 首档一致）；并发那条只给 5s
+            // 节流：能换号给 2s（让重试立刻发生），否则 20s（HTTP 路径的定值；
+            // SSE 路径走渐长的 throttleRetryAfterMs，首档 40s —— 两条路都受同一个
+            // "能不能换号"支配，值不同只是因为 SSE 那边还有"越撞越长"的语义）
             ...(throttled ? { rateLimitKind: 'throttled' as const, providerRetryAfterMs: canFailover('throttled') ? FAILOVER_RETRY_MS : THROTTLE_RETRY_MS } : {}),
           },
         )
@@ -2239,6 +2311,8 @@ export async function* streamWebCompletion(
 ): AsyncGenerator<WebStreamEvent> {
   const controller = new AbortController()
   const signal = params.signal ? AbortSignal.any([params.signal, controller.signal]) : controller.signal
+  // SSE 路径也要问「还能不能换号」（与 openCompletion 同一个判据）：节流的退避长短由它决定。
+  const canFailover = makeCanFailover(params)
   const rawLimit = params.sessionReuseTurns ?? DEFAULT_SESSION_REUSE_TURNS
   const limit = Number.isFinite(rawLimit) ? Math.max(0, Math.floor(rawLimit)) : DEFAULT_SESSION_REUSE_TURNS
 
@@ -2354,6 +2428,9 @@ export async function* streamWebCompletion(
     if (timer) clearTimeout(timer)
     iterator = parseWebSse(body, {
       thinkingEnabled: params.thinkingEnabled,
+      // 🔴 必须传下去：SSE 节流的退避取决于"还能不能换号"。少了它，节流会抛 40~117s，
+      // 超过 dsh-llm 策略上限 ⇒ 一次都不重试、整轮失败（实测 2026-09-27 14:35:32）。
+      canFailover,
       onResponseMessageId: (id) => {
         responseMessageId = id
       },
