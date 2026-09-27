@@ -371,6 +371,13 @@ export function apply(ctx: any, config: Config = {}): void {
   // auto-switch.ts 的模块注释。唯一的例外是**当前账号自己不可用**（失效 / 受限未解除）——
   // 那种情况下等满 N 分钟没有意义，立刻切走。
   let lastAutoSwitchAt = Date.now()
+  /**
+   * 最近一次**自动**换号的记录（只给界面显示用，不落盘）。
+   *
+   * 只记自动换号：手动切号是用户自己的操作，界面不需要"提示"他刚做过什么。
+   * 刻意只放内存 —— 换号是运行时的行为，重启后从"还没有记录"开始，比留一份过期时间更诚实。
+   */
+  let lastAutoSwitch: { at: number; from: string; to: string; reason: string } | undefined
   let autoSwitching = false
   /** 本轮探活失败过的账号 —— 不选它们，避免在同一个坏号上反复试。进程重启即清空。 */
   const autoSwitchSkip = new Set<string>()
@@ -407,8 +414,19 @@ export function apply(ctx: any, config: Config = {}): void {
         )
         return
       }
+      // ⚠️ 切换前的账号 id 必须在 setActiveAccount **之前**取 —— 之后 activeAccountId() 已经是新的了
+      const fromId = activeAccountId()
       if (!setActiveAccount(decision.nextId)) return
       lastAutoSwitchAt = Date.now()
+      // 记下来给界面：换号那一轮会全量重发（体感是"任务突然变慢"），
+      // 面板上摆出时间与两端，用户能把那次卡顿对上原因。
+      const fromRecord = fromId ? readAccount(fromId) : undefined
+      lastAutoSwitch = {
+        at: lastAutoSwitchAt,
+        from: fromRecord ? accountTitle(fromRecord, maskIdentifier) : '（未知）',
+        to: accountTitle(target, maskIdentifier),
+        reason: decision.reason,
+      }
       logger.info?.(
         `deepseek-web: 已自动切换账号到 ${decision.nextId}（每 ${minutes} 分钟轮换` +
           (decision.reason === 'current-unusable' ? '；原账号不可用，提前切走' : '') +
@@ -719,6 +737,9 @@ export function apply(ctx: any, config: Config = {}): void {
                 contextWindowOptions: CONTEXT_WINDOW_OPTIONS,
                 autoSwitchBounds: AUTO_SWITCH_BOUNDS,
                 autoSwitchDefault: DEFAULT_AUTO_SWITCH_MINUTES,
+                // 最近一次自动换号（没换过就是 null）。界面靠它显示"上次换号：X（A → B）"——
+                // 换号那轮会全量重发，用户看到变慢时能对上原因。
+                lastAutoSwitch: lastAutoSwitch ?? null,
                 cleanup: sessionCleaner.policy(),
                 // 界面的滑块边界/默认值由后端给 —— 免得两边各写一套数字、改了一边忘另一边
                 cleanupBounds: {

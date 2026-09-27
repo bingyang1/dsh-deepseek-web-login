@@ -230,7 +230,7 @@ const demo = `
       <span class="dsw-gate-label">自动换号</span>
       <input type="range" class="dsw-range" min="0" max="120" step="1" value="30"><span class="dsw-gate-pair-value">30 分钟</span>
     </div>
-    <p class="dsw-hint">每 30 分钟换到账号库里的下一个可用账号（失效或正在受限的会跳过；可用的不足两个就不换）。换号会让投喂链断掉：下一轮要全量重发，历史图也要重新上传 —— 间隔越短，这个代价出现得越频繁。</p>
+    <p class="dsw-hint">每 30 分钟换到账号库里的下一个可用账号（失效或正在受限的会跳过；可用的不足两个就不换）。换号会让投喂链断掉：下一轮要全量重发，历史图也要重新上传 —— 间隔越短，这个代价出现得越频繁。上次自动换号：09:12（工作号 → lidi******@gmail.com）。</p>
     <div class="dsw-gate-row">
       <label class="dsw-switch"><input type="checkbox"><span class="dsw-switch-track"></span><span>允许并行调用工具</span></label>
     </div>

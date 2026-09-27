@@ -244,6 +244,21 @@ await test('GET /gate 把边界与默认值给到界面（免得两边各写一�
   assert.equal(data?.autoSwitchDefault, DEFAULT_AUTO_SWITCH_MINUTES, '默认必须是关闭（不动它的人行为不变）')
 })
 
+await test('GET /gate 带出「上次自动换号」（初始 null；界面靠它决定显不显示那一行）', async () => {
+  const { status, data } = await get('/gate')
+  assert.equal(status, 200)
+  assert.ok(
+    'lastAutoSwitch' in data,
+    '字段必须**存在**于响应里 —— 缺了的话界面永远不显示"上次换号"，而且没人会发现',
+  )
+  assert.equal(
+    data.lastAutoSwitch,
+    null,
+    '还没换过号时必须是 null 而不是 undefined —— JSON.stringify 会把 undefined 的键整个丢掉，' +
+      '那就等于字段不存在（这条正是上面那句要防的）',
+  )
+})
+
 await test('clamp 与默认值自洽：0 是关闭而不是被兜成默认', () => {
   assert.equal(clampAutoSwitchMinutes(0), 0)
   assert.equal(clampAutoSwitchMinutes(Number.NaN), DEFAULT_AUTO_SWITCH_MINUTES)

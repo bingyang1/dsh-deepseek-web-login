@@ -1764,14 +1764,23 @@ function Panel(): any {
 
     const currentSwitchMinutes = (): number => Math.max(0, Math.round(Number(swRange.value) || 0))
 
+    /** 最近一次自动换号（后端只在**自动**切号时写；手动切不记）。null = 还没有过。 */
+    let lastAutoSwitchInfo: { at: number; from: string; to: string } | null = null
+
     const paintAutoSwitch = (): void => {
       const minutes = currentSwitchMinutes()
       swValue.textContent = minutes === 0 ? '关闭' : `${minutes} 分钟`
-      swHint.textContent =
+      const base =
         minutes === 0
           ? '关闭时不会自动换号 —— 当前账号一直用到你手动切换为止。'
           : `每 ${minutes} 分钟换到账号库里的下一个可用账号（失效或正在受限的会跳过；可用的不足两个就不换）。` +
             '换号会让投喂链断掉：下一轮要全量重发，历史图也要重新上传 —— 间隔越短，这个代价出现得越频繁。'
+      // 换号那一轮任务会"突然变慢"（全量重发 + 重建会话）。把上一次换号的时间与两端摆出来，
+      // 用户看到没来由的卡顿时有地方对原因 —— 否则那只是个无法解释的变慢。
+      const last = lastAutoSwitchInfo
+      swHint.textContent = last
+        ? `${base}上次自动换号：${shortTime(last.at)}（${last.from} → ${last.to}）。`
+        : base
     }
     swRange.addEventListener('input', paintAutoSwitch)
     swRange.addEventListener('change', () => {
@@ -2727,6 +2736,8 @@ function Panel(): any {
       swRange.min = String(swBounds.min)
       swRange.max = String(swBounds.max)
       swRange.value = String(g.autoSwitchMinutes ?? g.autoSwitchDefault ?? 0)
+      // 后端没给（旧宿主）时按 null —— 只影响"上次换号"这一行的显示，不影响换号本身
+      lastAutoSwitchInfo = g.lastAutoSwitch ?? null
       paintAutoSwitch()
       // 工具调用方式：后端给的是**当前值**（布尔，true = 一次一个）。缺省/旧宿主没这个字段 ⇒ 当串行。
       serialInput.checked = g.serialToolCalls === false
