@@ -58,6 +58,46 @@ export interface FilterOutput {
 const MAX_DESCRIPTION_CHARS = 3_200
 
 /**
+ * 「核心工具」白名单 —— 只有它们值得在**每轮上下文**里都带上完整描述。
+ *
+ * 依据（2026-09-27 实测）：扫最近 8 个会话的 **826 次真实工具调用**，
+ *   pwsh 27.8% / run_code 24.9% / edit 16.9% / read 9.7% / write 8.0% / bash 5.6%
+ *   ⇒ **覆盖 90% 的调用只需要这几个**。
+ * 其余 50 多个工具（jobs / goal / ralph / workflow / web / subagent / cordis_*…）
+ * 在那 8 个会话里**一次都没被调用过**，却每个都在每轮上下文里占几百字符。
+ *
+ * ⚠️ 分级只压**说明文字**：工具名与参数签名字字不少 ⇒ 模型照样能调用它们，
+ * 只是看不到长篇说明（"遇错怎么办"那类指引只对常用工具才值得每轮都带着）。
+ * 要调整就把名字增删进这个集合 —— 这是唯一的开关。
+ */
+const CORE_TOOLS = new Set([
+  'pwsh',
+  'bash',
+  'run_code',
+  'read',
+  'write',
+  'edit',
+  'grep',
+  'glob',
+  'ls',
+  'todo_write',
+  'skill',
+  'present',
+  'ask_user_question',
+])
+
+/**
+ * 长尾工具的描述上限。240 字符 ≈ 首句 + 一句补充，够模型判断"这工具干什么"。
+ * ⚠️ 长尾工具**也不输出参数描述**（参数名/类型/必填性仍在签名里）—— 那是它们体积的另一半。
+ */
+const MAX_LONGTAIL_DESCRIPTION_CHARS = 240
+
+/** 工具是否属于核心组（决定描述给多长、要不要带参数说明）。 */
+function isCoreTool(name: unknown): boolean {
+  return CORE_TOOLS.has(String(name ?? ''))
+}
+
+/**
  * 工具目录（一节）的总预算。
  *
  * 2026-09-12 从 24_000 提到 56_000。理由：实测 DSH 下发 61 个工具、不截描述时共需
@@ -326,8 +366,11 @@ function renderParamType(schema: unknown, depth: number): string {
  *
  * ⚠️ 返回 `null` = "这份 parameters 不敢降级"，调用方必须回退到原始 JSON：
  * 宁可多花字符，也不能让模型看不见参数。
+ *
+ * @param withParamDocs 是否附上每个参数的说明。核心工具传 `true`，长尾工具传 `false`
+ *   —— 签名里已经有参数名、类型、必填性，那是模型写出正确 arguments 的**最小信息集**。
  */
-export function buildToolSignature(tool: ToolSchemaLike): string | null {
+export function buildToolSignature(tool: ToolSchemaLike, withParamDocs = true): string | null {
   try {
     const node = asRecord(tool.parameters)
     if (!node) return `${tool.name}()`
@@ -347,9 +390,12 @@ export function buildToolSignature(tool: ToolSchemaLike): string | null {
     }
 
     const lines = [`${tool.name}(${args.join(', ')})`]
-    for (const [name, def] of Object.entries(map)) {
-      const description = paramDescription(def)
-      if (description) lines.push(`  ${name}: ${truncate(description, MAX_PARAM_DESC_CHARS)}`)
+    // 长尾工具不带参数说明（`withParamDocs=false`）—— 那是它们体积的另一半。
+    if (withParamDocs) {
+      for (const [name, def] of Object.entries(map)) {
+        const description = paramDescription(def)
+        if (description) lines.push(`  ${name}: ${truncate(description, MAX_PARAM_DESC_CHARS)}`)
+      }
     }
     return lines.join('\n')
   } catch {
@@ -374,8 +420,12 @@ export function buildToolSection(
   let budget = Math.max(0, Math.min(MAX_TOOLS_SECTION_CHARS, maxChars))
   for (let index = 0; index < tools.length; index += 1) {
     const tool = tools[index]
+    // 描述分级（0.6.1）：核心工具带完整描述 + 参数说明；长尾工具只留一句话 + 签名。
+    // ⚠️ 两级都**保留工具名与参数签名** ⇒ 模型照样能调用它们，
+    // 不会出现"要用的工具看不见"（这正是它比"禁用工具"温和的地方）。
+    const core = isCoreTool(tool.name)
     // 优先紧凑签名；只有 schema 不敢降级时才贴原始 JSON（见 buildToolSignature 的注释）。
-    const signature = buildToolSignature(tool)
+    const signature = buildToolSignature(tool, core)
     let parametersText = signature ?? ''
     if (signature === null) {
       let schemaText = ''
@@ -389,7 +439,10 @@ export function buildToolSection(
     const block = [
       '',
       `### ${tool.name}`,
-      truncate(String(tool.description ?? '').replace(/\s+/g, ' ').trim(), MAX_DESCRIPTION_CHARS),
+      truncate(
+        String(tool.description ?? '').replace(/\s+/g, ' ').trim(),
+        core ? MAX_DESCRIPTION_CHARS : MAX_LONGTAIL_DESCRIPTION_CHARS,
+      ),
       parametersText,
     ].join('\n')
     if (budget - block.length < 0) {

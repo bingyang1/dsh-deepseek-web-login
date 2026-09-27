@@ -44,8 +44,8 @@ const REAL = {
       },
     },
   },
-  read_file: {
-    name: 'read_file',
+  read: {
+    name: 'read',
     description: 'Read a file.',
     parameters: {
       file_path: { type: 'string', required: true, description: 'Path to read, resolved by the filesystem backend.' },
@@ -92,8 +92,8 @@ const ALL_REAL = Object.values(REAL)
 // ── DSH 扁平形态 ────────────────────────────────────────────────
 
 test('扁平形态：必填不带 ?、可选带 ?，描述缩进列在下面', () => {
-  const sig = buildToolSignature(REAL.read_file)
-  assert.equal(head(sig), 'read_file(file_path: string, offset?: number, limit?: number)')
+  const sig = buildToolSignature(REAL.read)
+  assert.equal(head(sig), 'read(file_path: string, offset?: number, limit?: number)')
   assert.ok(sig.includes('  file_path: Path to read, resolved by the filesystem backend.'))
   assert.ok(sig.includes('  offset: 1-based first line to return. Defaults to 1.'))
 })
@@ -240,9 +240,10 @@ test('每个真实工具的参数名都还在（不许静默丢参数）', () =>
   }
 })
 
-test('工具级描述不受影响（仍归 MAX_DESCRIPTION_CHARS=3200 管）', () => {
+test('核心工具的工具级描述不受影响（仍归 MAX_DESCRIPTION_CHARS=3200 管）', () => {
   const long = 'D'.repeat(3100)
-  const section = buildToolSection([{ name: 't', description: long, parameters: { a: { type: 'string' } } }])
+  // ⚠️ 用核心工具名 —— 长尾工具的描述上限是 240（0.6.1 的分级）。
+  const section = buildToolSection([{ name: 'pwsh', description: long, parameters: { a: { type: 'string' } } }])
   assert.ok(section.includes(long), '3100 字符的工具描述必须完整保留')
 })
 
@@ -255,6 +256,67 @@ test('紧凑签名显著短于原始 JSON', () => {
   const newLen = ALL_REAL.reduce((sum, t) => sum + String(buildToolSignature(t) ?? '').length, 0)
   const saved = 1 - newLen / oldLen
   assert.ok(saved > 0.3, `参数段只省了 ${Math.round(saved * 100)}%，预期 > 30%`)
+})
+
+// ── 描述分级（0.6.1）：核心保留、长尾压缩，但**两级都能调用** ──────
+
+const CORE_SAMPLE = {
+  name: 'pwsh',
+  description: 'P'.repeat(2000),
+  parameters: { command: { type: 'string', required: true, description: 'The PowerShell command to execute.' } },
+}
+const TAIL_SAMPLE = {
+  name: 'job_list',
+  description: 'T'.repeat(1000),
+  parameters: { limit: { type: 'number', description: 'Max rows to return.' } },
+}
+
+test('分级：核心工具的描述完整、且带参数说明', () => {
+  const section = buildToolSection([CORE_SAMPLE])
+  assert.ok(section.includes('P'.repeat(2000)), '核心工具的描述不该被压')
+  assert.ok(section.includes('  command: The PowerShell command to execute.'), '核心工具应带参数说明')
+})
+
+test('分级：长尾工具的描述压到 240 且不带参数说明', () => {
+  const section = buildToolSection([TAIL_SAMPLE])
+  assert.ok(section.includes('T'.repeat(237) + '...'), '长尾描述应截到 240')
+  assert.ok(!section.includes('T'.repeat(241)), '不该超过 240')
+  assert.ok(!section.includes('  limit: Max rows to return.'), '长尾工具不该带参数说明')
+})
+
+test('分级：长尾工具照样能调用（名字与参数签名一个字都不少）', () => {
+  const section = buildToolSection([TAIL_SAMPLE])
+  assert.ok(section.includes('### job_list'), '工具名必须还在 —— 否则模型不知道它存在')
+  assert.ok(section.includes('job_list(limit?: number)'), '参数签名必须还在 —— 否则模型不会传参')
+})
+
+test('分级不打乱工具顺序', () => {
+  const tools = [CORE_SAMPLE, TAIL_SAMPLE, REAL.read]
+  const section = buildToolSection(tools)
+  const at = (n) => section.indexOf(`### ${n}`)
+  assert.ok(at('pwsh') < at('job_list') && at('job_list') < at('read'), '顺序被打乱')
+})
+
+test('分级后 61 个工具全装得下（每个描述 2500 字符）', () => {
+  const coreNames = [
+    'pwsh', 'bash', 'run_code', 'read', 'write', 'edit', 'grep', 'glob', 'ls',
+    'todo_write', 'skill', 'present', 'ask_user_question',
+  ]
+  const make = (name) => ({
+    name,
+    description: 'D'.repeat(2500),
+    parameters: { a: { type: 'string', required: true, description: 'x'.repeat(150) } },
+  })
+  const tools = [
+    ...coreNames.map(make),
+    ...Array.from({ length: 48 }, (_, i) => make(`tail_${String(i).padStart(2, '0')}`)),
+  ]
+  assert.equal(tools.length, 61)
+  const section = buildToolSection(tools)
+  assert.ok(!section.includes('NOT described above'), '分级后不该再触发"省略工具"兜底')
+  const missing = tools.filter((t) => !section.includes(`### ${t.name}`))
+  assert.equal(missing.length, 0, `缺失：${missing.map((t) => t.name).join(', ')}`)
+  assert.ok(section.length < 56_000, `目录 ${section.length} 字符，超上限`)
 })
 
 if (failures.length) {

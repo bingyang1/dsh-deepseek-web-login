@@ -82,14 +82,15 @@ test('3010 字符的长描述（pwsh 那类）必须完整保留', () => {
   assert.ok(section.includes(long.slice(0, long.length - 1)), '描述未完整保留')
 })
 
-test('3200 是新的描述上限，不是 400', () => {
+test('3200 是**核心工具**的描述上限，不是 400', () => {
   const d = 'x'.repeat(3100)
-  const section = buildToolSection([{ name: 'w', description: d, parameters: {} }])
+  // ⚠️ 必须用核心工具名：0.6.1 起长尾工具的描述上限是 240 字符（分级见 check-tool-signature）。
+  const section = buildToolSection([{ name: 'pwsh', description: d, parameters: {} }])
   assert.ok(section.includes(d), '3100 字符的描述应当完整保留（旧上限 400 会截掉 87%）')
 })
 
-test('超过 3200 才截断，且带省略号', () => {
-  const section = buildToolSection([{ name: 'w', description: 'y'.repeat(5000), parameters: {} }])
+test('核心工具描述超过 3200 才截断，且带省略号', () => {
+  const section = buildToolSection([{ name: 'pwsh', description: 'y'.repeat(5000), parameters: {} }])
   assert.ok(section.includes('y'.repeat(3197) + '...'), '应截到 3200 并带省略号')
   assert.ok(!section.includes('y'.repeat(3201)), '不应超过 3200')
 })
@@ -97,15 +98,16 @@ test('超过 3200 才截断，且带省略号', () => {
 // ── 兜底：真装不下时必须"说出名字"，不许静默丢弃 ───────────────
 
 test('超出预算时必须列出被省略的工具名（旧实现只写一句 remaining tools omitted）', () => {
-  const tools = Array.from({ length: 90 }, (_, i) => mkTool(`tool_${String(i).padStart(2, '0')}`, 1300))
+  // ⚠️ 0.6.1 起长尾描述被压到 240 字符 ⇒ 原来 90 个已撑不爆预算，得加到 250 个。
+  const tools = Array.from({ length: 250 }, (_, i) => mkTool(`tool_${String(i).padStart(3, '0')}`, 1300))
   const section = buildToolSection(tools)
   assert.ok(/NOT described above/.test(section), '必须明确告知有工具未被描述')
-  assert.ok(section.includes('tool_89'), '最后一个被省略的工具名必须列出来')
+  assert.ok(section.includes('tool_249'), '最后一个被省略的工具名必须列出来')
   assert.ok(/omitted for length/.test(section), '应说明省略原因')
 })
 
 test('兜底文案必须要求"别猜参数"（否则模型会照半截定义瞎编）', () => {
-  const tools = Array.from({ length: 90 }, (_, i) => mkTool(`tool_${String(i).padStart(2, '0')}`, 1300))
+  const tools = Array.from({ length: 250 }, (_, i) => mkTool(`tool_${String(i).padStart(3, '0')}`, 1300))
   const section = buildToolSection(tools)
   assert.ok(/do NOT guess/i.test(section) || /not guess them/i.test(section), '缺少"别猜参数"的指令')
 })
