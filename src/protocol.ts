@@ -188,7 +188,181 @@ function truncate(text: string, max: number): string {
   return `${text.slice(0, max - 3)}...`
 }
 
-/** 渲染工具目录（含 JSON Schema）。 */
+/**
+ * 参数级描述的截断长度。
+ *
+ * 紧凑签名保留的是「参数名 + 类型 + 必填性」—— 那是模型写出正确 arguments 的**最小信息集**。
+ * 参数描述是锦上添花：第 160 字符之后通常是举例或边角说明（`path` 这类参数压根没有），
+ * 砍掉它比砍掉工具级描述划算得多 —— 工具级描述里藏的是「遇错怎么办」。
+ */
+const MAX_PARAM_DESC_CHARS = 160
+
+/** 嵌套展开的深度上限：异常 schema（自引用、深层嵌套）不该把工具目录撑爆。 */
+const MAX_SIGNATURE_DEPTH = 4
+
+/** `parameters` 是对象时才当映射用（`parameters: []` 这类异常值直接忽略）。 */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
+}
+
+/**
+ * 「标准 JSON Schema 包裹」形态的顶层关键字。顶层**只**出现这些键 ⇒ 是
+ * `{type:'object',properties:{…},required:[…]}` 包裹；出现别的键 ⇒ 那些键就是参数名。
+ */
+const SCHEMA_TOP_KEYS = new Set([
+  'type',
+  'properties',
+  'required',
+  'additionalProperties',
+  'description',
+  'title',
+  'default',
+  'examples',
+  '$schema',
+  'definitions',
+  '$defs',
+])
+
+/**
+ * `parameters` 是「标准包裹」还是「DSH 扁平写法」。
+ *
+ * ⚠️ 两种都得认（2026-09-27 读 `@deepseek-ai/dsh-tools/lib/index.js` 的 `schemaOf()` 确认）：
+ * 它把工具定义里的 `parameters` **原样透传**给 provider，不做任何规范化。而 DSH 自家工具
+ * 清一色写**扁平**形态 —— 顶层键直接是参数名、`required: true` 写在参数自己身上：
+ *
+ *     parameters: { command: { type: 'string', required: true, description: '…' },
+ *                   description: { type: 'string', required: true, description: '…' } }
+ *
+ * 常见的标准包裹形态仍要支持（第三方工具可能按 OpenAI 惯例写）。
+ */
+function isWrappedSchema(node: Record<string, unknown>): boolean {
+  const properties = asRecord(node.properties)
+  if (!properties || Object.keys(properties).length === 0) return false
+  // `properties` 的**每个值都必须是对象**（标准 JSON Schema 必然如此）。少了这层判断，
+  // 一个"恰好叫 properties、类型是 string"的普通参数（值形如 `{type:'string', required:true}`，
+  // 它的**值**是 `'string'` / `true`）会被误判成包裹形态 ⇒ 发出去的参数名变成 `type` / `required`。
+  if (!Object.values(properties).every((value) => asRecord(value) !== null)) return false
+  return Object.keys(node).every((key) => SCHEMA_TOP_KEYS.has(key))
+}
+
+/** 参数自己身上的必填标记（DSH 扁平写法）。 */
+function isRequiredParam(def: unknown): boolean {
+  return asRecord(def)?.required === true
+}
+
+/** 读参数描述并压平空白。 */
+function paramDescription(schema: unknown): string {
+  const description = asRecord(schema)?.description
+  return typeof description === 'string' ? description.replace(/\s+/g, ' ').trim() : ''
+}
+
+/**
+ * 渲染**一层参数映射**（`{参数名: 定义}`）→ `['a: string', 'b?: number']`。
+ *
+ * ⚠️ `depth` 必须**由调用方透传**。第一版在这里硬编码了 `1`，于是每下沉一层深度就重置，
+ * `MAX_SIGNATURE_DEPTH` 完全失效 —— 深层嵌套（甚至自引用 schema）会一路展开到栈溢出，
+ * 再被 catch 吞掉，表现为"莫名其妙回退到原始 JSON"。
+ */
+function renderParamMap(map: Record<string, unknown>, requiredList: readonly string[], depth: number): string[] {
+  const fromList = new Set(requiredList)
+  return Object.entries(map).map(([name, def]) => {
+    const required = fromList.has(name) || isRequiredParam(def)
+    return `${name}${required ? '' : '?'}: ${renderParamType(def, depth)}`
+  })
+}
+
+/**
+ * 渲染一个参数的类型表达式：`string` / `T[]` / `{a: T, b?: U}` / `"x" | "y"`。
+ *
+ * 认不出来的形态一律退化成 `any` —— 签名本身永远合法。只有整份 parameters
+ * 都不敢降级时，才由 `buildToolSignature` 返回 null 让调用方回退到原始 JSON。
+ */
+function renderParamType(schema: unknown, depth: number): string {
+  const node = asRecord(schema)
+  if (!node) return 'any'
+  if (depth > MAX_SIGNATURE_DEPTH) return 'any'
+
+  // 枚举是**值**联合（带引号），anyOf/oneOf 是**类型**联合（不带）—— 别混。
+  if (Array.isArray(node.enum) && node.enum.length > 0) {
+    return node.enum.map((value) => JSON.stringify(value)).join(' | ')
+  }
+  const variants = Array.isArray(node.anyOf) ? node.anyOf : Array.isArray(node.oneOf) ? node.oneOf : null
+  if (variants && variants.length > 0) {
+    const rendered = variants.map((item) => renderParamType(item, depth + 1))
+    return [...new Set(rendered)].join(' | ')
+  }
+
+  const declared = typeof node.type === 'string' ? node.type : ''
+  if (declared === 'array' || (!declared && node.items !== undefined)) {
+    const item = renderParamType(node.items, depth + 1)
+    // 联合类型必须加括号：`(string | number)[]`，否则读成 `string | number[]`。
+    return item.includes('|') ? `(${item})[]` : `${item}[]`
+  }
+
+  const properties = asRecord(node.properties)
+  if (declared === 'object' || properties) {
+    const inner = properties ? renderParamMap(properties, [], depth + 1) : []
+    // 只渲染"有实质约束"的 additionalProperties。`false` / `true` 都不渲染 ——
+    // 模型的默认心智就是"只传列出来的键"，为它们多写一行纯属噪音。
+    // ⚠️ 这段必须在 `properties` 为空时也跑：只有 `additionalProperties` 而没有
+    // `properties` 的 object 参数，第一版会提前 `return 'object'` 把约束丢掉。
+    const extra = asRecord(node.additionalProperties)
+    if (extra) inner.push(`[key: string]: ${renderParamType(extra, depth + 1)}`)
+    if (inner.length === 0) return 'object'
+    return `{${inner.join(', ')}}`
+  }
+  return declared || 'any'
+}
+
+/**
+ * 把工具参数渲染成紧凑签名（0.6.0）：
+ *
+ *     read_file(file_path: string, offset?: number, limit?: number)
+ *       file_path: Path to read, resolved by the filesystem backend.
+ *
+ * 为什么值得做：原先直接贴 `JSON.stringify(parameters)`。那串文本里**结构性样板**占了大头
+ * —— 每个参数都要套一层 `{"type":"…","description":"…"}`、键名与类型值全带引号，
+ * 而模型写出 arguments 真正需要的只是**参数名、类型、必填性**。
+ *
+ * ⚠️ 返回 `null` = "这份 parameters 不敢降级"，调用方必须回退到原始 JSON：
+ * 宁可多花字符，也不能让模型看不见参数。
+ */
+export function buildToolSignature(tool: ToolSchemaLike): string | null {
+  try {
+    const node = asRecord(tool.parameters)
+    if (!node) return `${tool.name}()`
+
+    const wrapped = isWrappedSchema(node)
+    const map = wrapped ? (asRecord(node.properties) as Record<string, unknown>) : node
+    const requiredList =
+      wrapped && Array.isArray(node.required)
+        ? node.required.filter((key): key is string => typeof key === 'string')
+        : []
+
+    const args = renderParamMap(map, requiredList, 1)
+    if (args.length === 0) {
+      // 空对象 = 真的没有参数。**有键却渲染不出参数**说明形态没认出来 ⇒ 必须回退到原始 JSON：
+      // 悄悄发一个 `name()` 会让模型以为这工具不要参数，比多花字符糟得多。
+      return Object.keys(node).length === 0 ? `${tool.name}()` : null
+    }
+
+    const lines = [`${tool.name}(${args.join(', ')})`]
+    for (const [name, def] of Object.entries(map)) {
+      const description = paramDescription(def)
+      if (description) lines.push(`  ${name}: ${truncate(description, MAX_PARAM_DESC_CHARS)}`)
+    }
+    return lines.join('\n')
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 渲染工具目录。
+ *
+ * 每个工具占一段：`### 名字` / 工具描述（≤3200 字符，不轻易砍）/ **参数紧凑签名**。
+ * 签名由 `buildToolSignature` 产出；它只在 schema 不敢降级时返回 null，那时才贴原始 JSON Schema。
+ */
 export function buildToolSection(
   tools: readonly ToolSchemaLike[] | undefined,
   maxChars: number = MAX_TOOLS_SECTION_CHARS,
@@ -200,17 +374,23 @@ export function buildToolSection(
   let budget = Math.max(0, Math.min(MAX_TOOLS_SECTION_CHARS, maxChars))
   for (let index = 0; index < tools.length; index += 1) {
     const tool = tools[index]
-    let schemaText = ''
-    try {
-      schemaText = JSON.stringify(tool.parameters ?? {})
-    } catch {
-      schemaText = '{}'
+    // 优先紧凑签名；只有 schema 不敢降级时才贴原始 JSON（见 buildToolSignature 的注释）。
+    const signature = buildToolSignature(tool)
+    let parametersText = signature ?? ''
+    if (signature === null) {
+      let schemaText = ''
+      try {
+        schemaText = JSON.stringify(tool.parameters ?? {})
+      } catch {
+        schemaText = '{}'
+      }
+      parametersText = `Parameters (JSON Schema): ${schemaText}`
     }
     const block = [
       '',
       `### ${tool.name}`,
       truncate(String(tool.description ?? '').replace(/\s+/g, ' ').trim(), MAX_DESCRIPTION_CHARS),
-      `Parameters (JSON Schema): ${schemaText}`,
+      parametersText,
     ].join('\n')
     if (budget - block.length < 0) {
       // 预算用完。**必须把剩下的工具名说出来**：旧写法只有一句
