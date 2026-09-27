@@ -2,6 +2,39 @@
 
 本项目遵循大致语义化版本；日期为本地时间。
 
+## 0.6.5 — 2026-09-27
+
+> 修复 0.6.3 的重试策略**形状**错误：它会让「按本地退避重试」算出 `NaN`，把整轮打成 UNKNOWN 错误。
+
+### 修复
+
+- **`providerRetryPolicy` 的返回值改成扁平字段**（0.6.3 包了一层 `backoff`）。dsh-llm 的取法是
+  `adapter.providerRetryPolicy(p) ?? resolveRetryPolicy(…)` —— 我们一返回对象，右侧那个"会把 `backoff`
+  展开成扁平字段"的规范化就**不会执行**，而运行期的消费方读的正是扁平字段
+  （`policy.initialDelayMs / maxDelayMs / jitterRatio`）。实测 DSH 会话日志里 `llm/retry` 事件的
+
+  ```
+  "policyKey":"[\"normal\",5,[\"EMPTY_RESPONSE\",\"RATE_LIMIT\",…],null,null,null]"
+  ```
+
+  后三项是 `null` = `undefined` —— 两个后果，第二个是致命的：
+
+  1. `providerRetryAfterMs > maxDelayMs` 变成 `X > undefined` = **恒 false** ⇒「要等太久就放弃」失效
+     （连封禁一天的解除时间也会被照单等下去）；
+  2. 失败**不带** provider 延迟时（例如 `EMPTY_RESPONSE`）走本地退避 `initialDelayMs * 2**n`，
+     `undefined` ⇒ **`NaN`** ⇒ DSH 写会话事件时拒收非有限数 ⇒ 整轮以
+     `UNKNOWN: session event "llm/retry" carries non-JSON-serializable data` 结束。
+
+     实测 2026-09-27 17:33:51：一轮里第一次重试（限流，带 2s）正常成功；第二次重试
+     （`EMPTY_RESPONSE`，无 provider 延迟）触发该错误 ⇒ 现象就是"任务突然自己停了"。
+
+### 测试
+
+- `check-llm-retry.mjs` 补四条**意图级**断言：策略扁平键齐全且**无 `backoff` 嵌套**、
+  **回放 DSH 的 `retryPolicyKey` 不许出现 `null`**、**回放 `localDelay` 必须算出有限正数**、
+  超长解除时间仍须被判「等太久」而放弃。
+- 反向验证 3 步全部如期红：改回嵌套 → 6 条红；`maxDelayMs` 调小到 10s → 2 条；抽掉 `initialDelayMs` → 4 条。
+
 ## 0.6.4 — 2026-09-27
 
 > 文档版本：把「封号归因」那一节带到 npm 包页面上（纯文档，**无代码改动**）。
