@@ -134,8 +134,14 @@ const checks = {
   'client 为失败那一行提供了样式': client.includes('dsw-account-fix'),
   'client 说明了 cookie 过期时间不是登录态寿命':
     client.includes('Cookie 过期') && client.includes('不是登录态寿命'),
-  'client 关于页（检查更新 + 数据位置 + 风险说明）': client.includes('检查更新') && client.includes('数据位置') && client.includes('为什么没有「自动换号」'),
-  '源码注释写明为何不做自动换号（风险可见）': srcAccounts.includes('刻意**不做自动轮换**') && srcAccounts.includes('关联'),
+  // 断"关于页有这三块"，别绑标题原文 —— 0.5.0 把标题从「为什么没有自动换号」改成了「关于自动换号」
+  // （功能早就加了，旧标题与现实矛盾），绑原文的断言会因为一次文案纠正而假红。
+  'client 关于页（检查更新 + 数据位置 + 风险说明）':
+    client.includes('检查更新') && client.includes('数据位置') && client.includes('关于「自动换号」'),
+  // 同样断意图：注释里必须留着"关联风险"与"默认关闭"这两个设计决策，
+  // 而不是留某一句话的原文。
+  '源码注释写明自动换号的风险与默认关闭':
+    srcAccounts.includes('关联') && srcAccounts.includes('直接冲突') && srcAccounts.includes('默认关闭'),
   'client 未登录时说明可用登录路径': client.includes('调试协议，自动读取凭证'),
   'client 模块 id 正确': client.includes('id: "dsh-deepseek-web-login"'),
   'client 槽位名合法': client.includes('settings.section'),
