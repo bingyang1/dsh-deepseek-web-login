@@ -356,6 +356,31 @@ test('F21：迁移写入失败时不静默 —— 旧凭证还在磁盘上，必
   resetLibrary()
 })
 
+test('0.6.6 迁移：旧库里被写成"授权失效"的网络类失败，读出来自动归位', () => {
+  // 现场（2026-09-29）：0.6.5 及以前"探活失败就写 lastVerifyError"，于是整库 9/9 挂着
+  // `fetch failed`（真因在 cause：net::ERR_NETWORK_IO_SUSPENDED）—— 徽章说"需要重新登录"、
+  // 账号轮换不选它、点「重登」还会先清掉登录态。这里钉住"读的时候自动归位"，老库不必等自愈。
+  resetLibrary()
+  const mkdir = () => {
+    mkdirSync(accountsDir(), { recursive: true })
+  }
+  mkdir()
+
+  const tainted = { ...makeAuth('tok-tainted'), id: 'acc_tainted01', lastVerifyError: { at: '2026-09-29T14:55:20.462Z', message: 'fetch failed' } }
+  writeFileSync(join(accountsDir(), 'acc_tainted01.json'), JSON.stringify(tainted))
+  const afterTainted = listAccounts().find((item) => item.id === 'acc_tainted01')
+  assert.equal(afterTainted?.lastVerifyError, undefined, '网络类失败不能继续冒充"需要重新登录"')
+  assert.equal(afterTainted?.lastCheckError?.message, 'fetch failed', '信息不能丢：要挪到 lastCheckError')
+
+  const real = { ...makeAuth('tok-real'), id: 'acc_real00001', lastVerifyError: { at: '2026-09-29T14:00:00.000Z', message: 'Authorization Failed (invalid token)' } }
+  writeFileSync(join(accountsDir(), 'acc_real00001.json'), JSON.stringify(real))
+  const afterReal = listAccounts().find((item) => item.id === 'acc_real00001')
+  assert.equal(afterReal?.lastVerifyError?.message, 'Authorization Failed (invalid token)', '真失效必须留在 lastVerifyError')
+  assert.equal(afterReal?.lastCheckError, undefined, '不该被挪走')
+
+  resetLibrary()
+})
+
 console.log(`通过 ${passed} 项${failures.length ? `，失败 ${failures.length} 项` : '，全部通过 OK'}`)
 for (const failure of failures) console.log('  ' + failure)
 if (failures.length) process.exitCode = 1

@@ -209,6 +209,39 @@ export function isAuthFailureMessage(message: unknown): boolean {
 }
 
 /**
+ * 把错误（含 `cause` 链）串成一条**能看出原因**的说明。
+ *
+ * 为什么必须做（2026-09-29 现场）：面板上一排账号都显示「校验失败：fetch failed」，
+ * 但宿主日志里同一时刻的原文是 `net::ERR_NETWORK_IO_SUSPENDED`（机器休眠、网络被挂起）——
+ * 两条信息指向完全不同的处理方式，而我们只留了最外层的 `fetch failed`：
+ * 既看不出是 DNS / 连接被拒 / 还是网络挂起，也没法判断"该等网络恢复"还是"该重登"。
+ * WHATWG fetch 与 Electron 的 `net.fetch` 都会把真实原因塞在 `cause` 里（有时还有 `code`），
+ * 这里沿链取前 4 层拼起来，形如 `fetch failed ← net::ERR_NETWORK_IO_SUSPENDED`。
+ *
+ * ⚠️ 只在**展示 / 落盘说明**里用它，别拿它做判据 —— 判据请用 `isAuthFailureMessage`。
+ */
+export function describeError(error: unknown): string {
+  const parts: string[] = []
+  const seen = new Set<string>()
+  let current: any = error
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    const message =
+      typeof current === 'object' && typeof current.message === 'string'
+        ? current.message
+        : String(current)
+    const code =
+      typeof current === 'object' && typeof current.code === 'string' ? String(current.code) : ''
+    const text = [message, code && !message.includes(code) ? code : ''].filter(Boolean).join(' ')
+    if (text && !seen.has(text)) {
+      seen.add(text)
+      parts.push(text)
+    }
+    current = typeof current === 'object' ? (current as any).cause : undefined
+  }
+  return parts.join(' ← ') || '未知错误'
+}
+
+/**
  * 账号此刻是不是处于「已知授权失效」状态；是则返回那条失败说明。
  *
  * 判据与探活保持一致（见 probe.ts 的 lastProbeFailed）：**失败时间晚于成功时间**

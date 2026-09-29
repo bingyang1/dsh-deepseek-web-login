@@ -796,11 +796,19 @@ function Panel(): any {
       void (async () => {
         // 这里刻意不写死"会复用登录态" —— 宿主在「这条账号已被标记失效」时会走清理路径
         // （0.1.75），该说什么由它随响应返回（下面用 prep.hint），免得界面与实际行为对不上。
-        accountsMsg.textContent = `正在为「${title}」打开登录窗口……`
+        accountsMsg.textContent = `正在校验「${title}」并准备登录窗口……`
         try {
           const prep = await api('/login/relogin', { method: 'POST', body: JSON.stringify({ id }) })
+          // 0.6.6：宿主会先做一次只读探活 —— 凭证还能用的话到这里就结束了，
+          // **不会打开浏览器**（这是「一键重登」那一半：网络抖动过后的号，一点就好）。
+          if (prep?.alreadyValid) {
+            accountsMsg.textContent = String(prep.hint ?? '这条账号校验通过，不需要重新登录')
+            await loadAccounts()
+            return
+          }
           if (prep?.ok === false) {
-            accountsMsg.textContent = `准备失败：${prep?.error ?? '未知原因'}`
+            // 网络类失败走到这里：只报原因，**不清登录态、不开窗口**（重登此时必然白敲）。
+            accountsMsg.textContent = String(prep?.error ?? '未知原因')
             return
           }
           boostUntil = Date.now() + 300_000
@@ -839,8 +847,13 @@ function Panel(): any {
         title.append(el('span', 'dsw-badge off', `⏳ 受限至 ${shortTime(item.limit.untilMs)}`))
       }
       // 徽章从「校验失败」改成**明确的行动指令**：原来只写"失败"，用户不知道该干嘛，
-      // 也看不出这号还能不能用。探活失败基本只有一种可能 —— 凭证失效，要重新登录。
+      // 也看不出这号还能不能用。
+      // 🔴 两种失败要分开说（0.6.6）：只有**授权失效**才是"这个号要重新登录"；
+      // 网络类失败（断网 / 超时 / 机器休眠）凭证往往是好的。以前两者共用一个字段，
+      // 一次休眠就把整库标成"需要重新登录"，点「重登」还会清掉浏览器登录态 ⇒
+      // 用户被迫重敲手机号 + 验证码（2026-09-29 现场，9 个账号同时变红）。
       if (item.lastVerifyError) title.append(el('span', 'dsw-badge err', '❌ 需要重新登录'))
+      else if (item.lastCheckError) title.append(el('span', 'dsw-badge off', '⚠️ 未能校验（网络）'))
       main.append(title)
 
       const meta: string[] = []
@@ -862,18 +875,32 @@ function Panel(): any {
           el(
             'div',
             'dsw-account-fix',
-            `⚠️ ${relTime(item.lastVerifyError.at)}校验失败：${item.lastVerifyError.message}`,
+            `⚠️ ${relTime(item.lastVerifyError.at)}校验失败（登录态已失效）：${item.lastVerifyError.message}`,
+          ),
+        )
+      } else if (item.lastCheckError) {
+        // 网络类失败：说清"没校验成功"但**不要**暗示账号坏了 ——
+        // 否则用户会去点重登，白白清掉还能用的登录态。
+        main.append(
+          el(
+            'div',
+            'dsw-account-fix',
+            `⚠️ ${relTime(item.lastCheckError.at)}未能校验（网络问题，账号未必失效）：${item.lastCheckError.message}`,
           ),
         )
       }
       row.append(main)
 
       const actions = el('div', 'dsw-account-actions')
-      // 失效的账号：「重登」放动作列最前面 —— 它是这行最该点的按钮。
+      // 失效/未校验的账号：「重登」放动作列最前面 —— 它是这行最该点的按钮。
       // 文案从「重新登录」缩成「重登」：动作列现在要放下切换/备注/归组/移除，太长会挤成两行。
-      if (item.lastVerifyError) {
+      // 0.6.6：网络类失败也给这个按钮 —— 点它**先探活**，能用就直接恢复（不必敲密码）。
+      if (item.lastVerifyError || item.lastCheckError) {
         const reloginBtn = el('button', 'dsw-btn dsw-preset', '重登') as HTMLButtonElement
-        reloginBtn.title = '能复用浏览器里的登录态就直接复用（不必敲密码）；若这条账号已被标记失效，会先清掉登录态、让你重新登录一次。捕获后原地更新这条记录，不新增、也不切换当前账号'
+        reloginBtn.title =
+          '点一下会先做一次只读校验：凭证还能用就立刻恢复（不打开浏览器、不用敲密码）；' +
+          '只有确认授权失效（401/过期）时才会清掉登录态、让你重新登录一次。' +
+          '捕获后原地更新这条记录，不新增、也不切换当前账号'
         reloginBtn.addEventListener('click', () => reloginAccount(item.id, item.title || item.id))
         actions.append(reloginBtn)
       }
@@ -1081,10 +1108,16 @@ function Panel(): any {
           return
         }
         const failed = Number(result?.failed ?? 0)
-        accountsMsg.textContent =
-          failed > 0
-            ? `已校验 ${result?.checked ?? 0} 个账号：${result?.passed ?? 0} 个正常、${failed} 个需要重登（列表里已标出）。`
-            : `已校验 ${result?.checked ?? 0} 个账号：全部正常。`
+        // 汇总必须分开说（0.6.6）：把"网络没通"也叫"需要重登"会把人骗去重敲一遍密码。
+        const authFailed = Number(result?.authFailed ?? 0)
+        const transportFailed = Number(result?.transportFailed ?? 0)
+        const summary = [`${Number(result?.passed ?? 0)} 个正常`]
+        if (authFailed > 0) summary.push(`${authFailed} 个登录态已失效（需要重登）`)
+        if (transportFailed > 0) summary.push(`${transportFailed} 个网络没通、未能校验（账号未必失效）`)
+        if (failed === 0) summary.length = 0
+        accountsMsg.textContent = failed > 0
+          ? `已校验 ${result?.checked ?? 0} 个账号：${summary.join('、')}。`
+          : `已校验 ${result?.checked ?? 0} 个账号：全部正常。`
       } catch (error: any) {
         accountsMsg.textContent = `刷新失败：${error?.message ?? error}`
       } finally {

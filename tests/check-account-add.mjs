@@ -255,12 +255,32 @@ run('重新登录：浏览器沿用原会话（token 没变）时，旧的失败
   const target = commitCapturedAuth(makeAuth('tok-same'))
   updateAccount(target.recordId, {
     lastVerifyError: { at: new Date().toISOString(), message: 'Authorization Failed (invalid token)' },
+    // 0.6.6：两个标记一起清 —— 换的是同一份凭证，两个都只在描述"上一次校验"。
+    lastCheckError: { at: new Date().toISOString(), message: 'fetch failed' },
   })
   assert.ok(readAccount(target.recordId).lastVerifyError, '自证：先让它处于失败态')
+  assert.ok(readAccount(target.recordId).lastCheckError, '自证：网络类标记也在')
   beginRelogin(target.recordId)
   const commit = commitCapturedAuth(makeAuth('tok-same'))
   assert.equal(commit.mode, 'relogin')
   assert.equal(readAccount(target.recordId).lastVerifyError, undefined, 'token 没变也必须清掉旧的失败标记')
+  assert.equal(readAccount(target.recordId).lastCheckError, undefined, '网络类标记也要一起清（否则界面还写着"未能校验"）')
+})
+
+run('网络未能校验的标记不会被 upsert 静默丢掉（白名单漏字段＝数据凭空消失）', () => {
+  // `upsertAccount` 的字段白名单决定"同一条记录再次捕获"时保留哪些元数据；
+  // 新增字段忘了登记，表现就是界面上那条提示**莫名其妙不见了**（groupId 当年就是这么掉的）。
+  reset()
+  const first = commitCapturedAuth(makeAuth('tok-k1'))
+  updateAccount(first.recordId, {
+    serverId: 'srv-K',
+    lastCheckError: { at: new Date().toISOString(), message: 'fetch failed' },
+  })
+  assert.ok(readAccount(first.recordId).lastCheckError, '自证：先写上网络类标记')
+  // 同一账号（同 serverId）换一份凭证重捕 —— 命中同一条记录、走 carried 白名单
+  const again = commitCapturedAuth({ ...makeAuth('tok-k2'), serverId: 'srv-K' })
+  assert.equal(again.recordId, first.recordId, '自证：命中的是同一条记录')
+  assert.ok(readAccount(first.recordId).lastCheckError, 'lastCheckError 必须被 carried 带过去（漏登记就会在这里消失）')
 })
 
 run('重新登录：意图有期限（超时就不生效）', () => {

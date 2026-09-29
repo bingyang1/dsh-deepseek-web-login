@@ -18,7 +18,7 @@
  * 所以理论上探活**能**提前发现限制（目前尚未接上：限制状态仍由生成失败时的
  * `mute_until` 记入 accounts 的 limit 字段，见 webapi.ts 的 muteUntilMs）。
  */
-import { hasUsableAuth, staleAuthRecord, type WebAuth } from './auth.ts'
+import { describeError, hasUsableAuth, isAuthFailureMessage, staleAuthRecord, type WebAuth } from './auth.ts'
 import { listAccounts, updateAccount } from './accounts.ts'
 import { validateAuth } from './webapi.ts'
 
@@ -26,6 +26,17 @@ export interface ProbeOutcome {
   ok: boolean
   at: string
   error?: string
+  /**
+   * 失败属于哪一类（仅失败时有值）：
+   * - `auth`：授权失效（token 无效 / 过期 / 401 / 403）⇒ 这个号确实要重新登录；
+   * - `transport`：网络类（断网、超时、5xx、网络挂起）⇒ 凭证可能是好的，别当它死了。
+   *
+   * 🔴 分类必须在**写入点**就做完（0.6.6，2026-09-29）：以前两者都写进 `lastVerifyError`，
+   * 而徽章 / 轮换 / 重登是否清登录态都读那个字段 ⇒ 一次机器休眠（实测
+   * `net::ERR_NETWORK_IO_SUSPENDED`）就让 9 个账号同时变红，点「重登」还被清掉登录态、
+   * 被迫重敲手机号 + 验证码。
+   */
+  errorKind?: 'auth' | 'transport'
   /** 探活成功时顺带带回来的账号身份（用来补全显示名，见下面的写回）。 */
   user?: { id?: string; display?: string }
   /** F1（0.2.0）：顺带带回来的限流状态（users/current 的 chat.is_muted / mute_until）。 */
@@ -58,9 +69,18 @@ export async function probeOnce(auth: WebAuth | undefined, logger?: ProbeLogger)
           ...(result.user ? { user: result.user } : {}),
           ...(result.limit ? { limit: result.limit } : {}),
         }
-      : { ok: false, at, error: result.error ?? '校验未通过' }
+      : {
+          ok: false,
+          at,
+          error: result.error ?? '校验未通过',
+          errorKind: isAuthFailureMessage(result.error) ? 'auth' : 'transport',
+        }
   } catch (error: any) {
-    outcome = { ok: false, at, error: error?.message ?? String(error) }
+    // ⚠️ 用 describeError 而不是 error.message：只留最外层会得到一句 "fetch failed"，
+    // 把真正的原因（`net::ERR_NETWORK_IO_SUSPENDED` / `getaddrinfo ENOTFOUND` / `ECONNREFUSED`）
+    // 丢掉 —— 而这几类的处置方式完全不同（2026-09-29 现场，见 auth.ts 的 describeError 注释）。
+    const message = describeError(error)
+    outcome = { ok: false, at, error: message, errorKind: isAuthFailureMessage(message) ? 'auth' : 'transport' }
   }
 
   if (target) {
@@ -79,6 +99,8 @@ export async function probeOnce(auth: WebAuth | undefined, logger?: ProbeLogger)
       const patch: Record<string, unknown> = {
         lastVerifiedAt: at,
         lastVerifyError: undefined,
+        // 两个失败标记一起清：留着一个旧的「网络未能校验」会让人以为现在还连不上。
+        lastCheckError: undefined,
         unverified: false,
       }
       // F1（0.2.0）：探活顺手把限流状态写回 —— 「被限到 X」提前出现在账号徽章上，
@@ -99,16 +121,54 @@ export async function probeOnce(auth: WebAuth | undefined, logger?: ProbeLogger)
       }
       updateAccount(target.id, patch as any)
     } else {
-      updateAccount(target.id, { lastVerifyError: { at, message: String(outcome.error ?? '') } })
+      // 🔴 只有**授权类**失败才写 `lastVerifyError`（语义：这个号要重新登录）。
+      // 网络类写 `lastCheckError`，并且**不动** `lastVerifyError` ——
+      //  ① 一次断网不该凭空造出"需要重新登录"；
+      //  ② 也不该把先前真实的授权失效结论冲掉（否则真正的死号会被网络抖动洗白）。
+      const failure = { at, message: String(outcome.error ?? '') }
+      updateAccount(
+        target.id,
+        outcome.errorKind === 'auth'
+          ? ({ lastVerifyError: failure, lastCheckError: undefined } as any)
+          : ({ lastCheckError: failure } as any),
+      )
     }
   }
 
   if (outcome.ok) {
     logger?.info?.(`deepseek-web: 登录态探活通过（${target?.id ?? '未知账号'}）`)
   } else {
-    logger?.warn?.(`deepseek-web: 登录态探活失败 —— ${outcome.error}（可能已过期，建议重新登录）`)
+    // 文案跟着**分类**走：以前无论哪类都写"可能已过期，建议重新登录"，
+    // 而网络类失败（休眠/断网）占大多数 —— 那句话会把人骗去重登，白敲一遍密码。
+    const tail =
+      outcome.errorKind === 'auth'
+        ? '授权已失效，建议重新登录'
+        : '网络类问题（凭证未判定失效，网络恢复后再试）'
+    logger?.warn?.(`deepseek-web: 登录态探活失败 —— ${outcome.error}（${tail}）`)
   }
   return outcome
+}
+
+/** 「点重登」接下来该走哪条路。 */
+export type ReloginPlan = 'already-valid' | 'network' | 'fresh-login'
+
+/**
+ * 重登的三态判据（纯函数，便于单测）。
+ *
+ * 为什么需要它（2026-09-29 用户申诉：「不能一键重登吗？点了又让我重输账号密码」）：
+ * 旧实现一进门就 `const stale = !!target.lastVerifyError` —— 只要失败过就**先清掉
+ * profile + 登录分区**再开浏览器。而那次失败是网络类的（`ERR_NETWORK_IO_SUSPENDED`），
+ * 凭证本身完全可用，清掉之后浏览器里什么都没有 ⇒ 必然要重新登录一次。
+ * 现在的顺序是：**先只读探一次**，能用就当没事发生。
+ *
+ * - `already-valid`：探活通过 ⇒ 什么都不用做（标记已由 probeOnce 清掉），**一键结束**；
+ * - `network`：网络类失败 ⇒ 不清登录态、不开浏览器，只让用户等网络恢复（此时重登必然是白敲）；
+ * - `fresh-login`：授权类失败（或压根探不了）⇒ 走原流程：清登录态 + 手动登录一次。
+ */
+export function planRelogin(probe: ProbeOutcome | undefined): ReloginPlan {
+  if (probe?.ok) return 'already-valid'
+  if (probe?.errorKind === 'transport') return 'network'
+  return 'fresh-login'
 }
 
 export interface ProbeLoopOptions {

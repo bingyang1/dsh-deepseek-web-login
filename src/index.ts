@@ -71,7 +71,7 @@ import {
   usageExists,
   USAGE_KEEP_DAYS,
 } from './usage.ts'
-import { probeOnce, startProbeLoop } from './probe.ts'
+import { planRelogin, probeOnce, startProbeLoop } from './probe.ts'
 import { checkForUpdate, RELEASE_REPO } from './update-check.ts'
 import { pluginVersion } from './version.ts'
 import { webLoginDir } from './paths.ts'
@@ -983,6 +983,9 @@ export function apply(ctx: any, config: Config = {}): void {
                 capturedAt: record.capturedAt,
                 lastVerifiedAt: record.lastVerifiedAt ?? null,
                 lastVerifyError: record.lastVerifyError ?? null,
+                // 网络类的校验失败单传一个字段：界面据此显示"未能校验"，
+                // **不能**和 lastVerifyError 混着看（那会让"需要重新登录"变成误报）。
+                lastCheckError: record.lastCheckError ?? null,
                 limit: record.limit ?? null,
                 // cookie 的过期构成（捕获时记下）。老记录 / 手动粘 token 的账号是空数组，
                 // 界面据此区分"没记录"和"记录到全是会话级"—— 这两种含义完全不同。
@@ -1134,16 +1137,34 @@ export function apply(ctx: any, config: Config = {}): void {
               try {
                 let passed = 0
                 let failed = 0
+                // 失败还要分类计数：界面要能说清"几个真要重登、几个只是网络没通"
+                // （0.6.6，2026-09-29：以前统称"需要重登"，一次休眠就把整库说成失效）。
+                let authFailed = 0
+                let transportFailed = 0
                 for (const account of listAccounts()) {
                   const outcome = await probeOnce(account, {
                     info: (message) => logger.info?.(message),
                     warn: (message) => logger.warn?.(message),
                   })
                   if (outcome?.ok) passed += 1
-                  else if (outcome) failed += 1
+                  else if (outcome) {
+                    failed += 1
+                    if (outcome.errorKind === 'auth') authFailed += 1
+                    else transportFailed += 1
+                  }
                 }
-                logger.info?.(`deepseek-web: 手动刷新账号状态完成 —— 通过 ${passed}、失败 ${failed}`)
-                sendJson(res, 200, { ok: true, checked: passed + failed, passed, failed })
+                logger.info?.(
+                  `deepseek-web: 手动刷新账号状态完成 —— 通过 ${passed}、授权失效 ${authFailed}、` +
+                    `网络未能校验 ${transportFailed}`,
+                )
+                sendJson(res, 200, {
+                  ok: true,
+                  checked: passed + failed,
+                  passed,
+                  failed,
+                  authFailed,
+                  transportFailed,
+                })
               } finally {
                 accountsRefreshInFlight = false
               }
@@ -1435,33 +1456,67 @@ export function apply(ctx: any, config: Config = {}): void {
                 sendJson(res, 404, { ok: false, error: '账号不存在（可能已被移除），请刷新后重试' })
                 return
               }
-              // 0.1.75：账号**已经被标记失效**时，复用浏览器登录态是无解的 ——
-              // 那份登录态正是让它失效的那一份，复用只会把同一个坏 token 再抓一遍
-              // （2026-09-17 实测：连点两次重登，两次都在 1 秒内"已捕获 token"、又在 5 秒内
-              //  校验失败 invalid token；用户看到的是一个点不出来的死循环）。
-              // 这种情况直接按"全新登录"走：清掉 profile + 登录分区，让用户在浏览器里真正登一次。
-              // 账号健康时的复用行为**完全不变** —— 那才是"一个密码都不用敲"的便利所在。
-              const stale = !!target.lastVerifyError
-              if (stale) {
-                const cleared = await clearLoginState()
+              // 0.6.6：**先只读探一次，再决定怎么走**。
+              //
+              // 为什么（2026-09-29 用户申诉「不能一键重登吗？点了又让我重输账号密码」）：
+              // 旧实现一进门就 `const stale = !!target.lastVerifyError`，只要标记还在就
+              // **先清掉 profile + 登录分区**再开窗口。而那个标记多半来自**网络类失败**
+              // （实测 9 个账号同时被写成 `fetch failed`，宿主日志里是
+              //  `net::ERR_NETWORK_IO_SUSPENDED` —— 机器休眠、网络被挂起），凭证本身是好的；
+              // 清完之后浏览器里空空的，于是必然要重新登录一遍 —— 用户被迫重敲手机号 + 验证码。
+              //
+              // 现在的顺序（判据是纯函数 `planRelogin`，有用例守）：
+              //   already-valid ⇒ 探活了，账号本来就是好的：清掉标记，**什么都不打开**，一键结束；
+              //   network       ⇒ 网络不通：不清登录态、不开窗口（这时候重登必然白敲），让网络恢复后重试；
+              //   fresh-login   ⇒ 授权真的失效：走原流程，清登录态 + 手动登录一次。
+              const probe = await probeOnce(target, {
+                info: (message) => logger.info?.(message),
+                warn: (message) => logger.warn?.(message),
+              }).catch(() => undefined)
+              const plan = planRelogin(probe)
+              if (plan === 'already-valid') {
                 logger.info?.(
-                  `deepseek-web: 账号「${target.label || target.id}」已被标记失效，重登不再复用登录态，` +
-                    `先清掉（profile=${cleared.profileCleared} partition=${cleared.partitionCleared}）`,
+                  `deepseek-web: 重登前探活通过（${target.id}）—— 凭证本来就可用，不打开登录窗口、不清任何东西`,
                 )
+                sendJson(res, 200, {
+                  ok: true,
+                  targetId: id,
+                  alreadyValid: true,
+                  hint: '这条账号校验通过 —— 它本来就是好的（失败的标记已清掉），不需要重新登录',
+                })
+                return
               }
+              if (plan === 'network') {
+                logger.warn?.(
+                  `deepseek-web: 重登前探活失败（网络类）—— ${probe?.error}（不清登录态、不打开窗口）`,
+                )
+                sendJson(res, 200, {
+                  ok: false,
+                  network: true,
+                  error:
+                    `网络暂时不通，没能校验这条账号：${probe?.error ?? '未知原因'}。` +
+                    '它的凭证没有被改动过 —— 网络恢复后再点一次即可，不需要重新登录',
+                })
+                return
+              }
+              // fresh-login：授权类失败（或压根探不了）⇒ 复用浏览器登录态无解，
+              // 那份登录态正是让它失效的那一份（见上面的 0.1.75 说明）。
+              const cleared = await clearLoginState()
+              logger.info?.(
+                `deepseek-web: 账号「${target.label || target.id}」授权已失效，重登不再复用登录态，` +
+                  `先清掉（profile=${cleared.profileCleared} partition=${cleared.partitionCleared}）`,
+              )
               beginRelogin(id)
               logger.info?.(
-                `deepseek-web: 准备重新登录「${target.label || target.id}」` +
-                  `（${stale ? '登录态已失效，本次不复用' : '不清理浏览器登录态，能复用就直接复用'}）` +
+                `deepseek-web: 准备重新登录「${target.label || target.id}」（登录态已失效，本次不复用）` +
                   '—— 捕获后原地更新这条记录，不新增、也不切换当前账号',
               )
               sendJson(res, 200, {
                 ok: true,
                 targetId: id,
-                keptBrowserSession: !stale,
-                hint: stale
-                  ? '这条账号已被标记失效，浏览器里剩下的登录态也已经不可用 —— 已帮你清掉，请在打开的窗口里重新登录一次'
-                  : '登录窗口会打开：如果浏览器里还留着这个账号的登录态会立刻复用，否则在里面重新登录一次',
+                keptBrowserSession: false,
+                hint:
+                  '这条账号的授权确实失效了（登录态已清掉），请在打开的窗口里重新登录一次',
               })
               return
             }

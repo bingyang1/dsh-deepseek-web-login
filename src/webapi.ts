@@ -23,7 +23,7 @@ import { appendFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { WebAuth } from './auth.ts'
-import { AdapterLlmError, httpErrorCode, parseRetryAfterMs } from './auth.ts'
+import { AdapterLlmError, describeError, httpErrorCode, parseRetryAfterMs } from './auth.ts'
 // 默认区间来自 gate.ts —— 设置页的滑块边界与这里的默认值必须是**同一份**，否则界面显示的和实际跑的不是一回事。
 import {
   DEFAULT_CLEANUP_BATCH,
@@ -1218,7 +1218,11 @@ export async function validateAuth(
     }
     return { ok: false, error: `users/current HTTP ${resp.status}` }
   } catch (error: any) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    // ⚠️ 必须走 describeError（沿 cause 链）而不是 `error.message`：fetch 失败时
+    // 外层只有一句 `fetch failed`，真正的原因（`net::ERR_NETWORK_IO_SUSPENDED` /
+    // `getaddrinfo ENOTFOUND` / `ECONNREFUSED`）在 `cause` 里。
+    // 2026-09-29 现场：面板上一排账号写着「校验失败：fetch failed」，无从判断是休眠还是断网。
+    return { ok: false, error: describeError(error) }
   }
 }
 

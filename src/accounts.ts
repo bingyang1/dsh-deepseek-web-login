@@ -40,7 +40,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, s
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { legacyAuthFilePath, webLoginDir } from './paths.ts'
-import type { WebAuth } from './auth.ts'
+import { isAuthFailureMessage, type WebAuth } from './auth.ts'
 
 /** 账号库索引。 */
 interface AccountsIndex {
@@ -75,8 +75,23 @@ export interface AccountRecord extends WebAuth {
   serverId?: string
   /** 最近一次主动探活成功的时间（ISO）。见 `src/probe.ts`。 */
   lastVerifiedAt?: string
-  /** 最近一次主动探活失败（保留原因，便于一眼看出是过期还是网络问题）。 */
+  /**
+   * 最近一次主动探活**授权类**失败（token 无效 / 过期 / 401 / 403）。
+   *
+   * 🔴 只有授权类才写这里（0.6.6，2026-09-29）：这个字段的语义是「这个号必须重新登录」——
+   * 徽章、`isUsable`、重登要不要清登录态全都读它。旧写入点是"探活失败就写"，
+   * 于是**一次休眠/断网就把整库标成"需要重新登录"**（实测 9 个账号同时变红），
+   * 而那时点「重登」还会先清掉浏览器登录态 ⇒ 用户被迫重敲手机号 + 验证码。
+   * 网络类失败现在写 `lastCheckError`。
+   */
   lastVerifyError?: { at: string; message: string }
+  /**
+   * 最近一次主动探活的**非授权类**失败（断网、超时、上游 5xx、网络挂起…）。
+   *
+   * 单独立字段是为了让「凭证还能不能用」只有一个判据来源：读 `lastVerifyError` 的人
+   * （徽章 / 轮换 / 重登路径）不必各自分类，也就不会各自漏一类。成功时两个字段一起清。
+   */
+  lastCheckError?: { at: string; message: string }
   /**
    * 观测到的账号级限制（来自**生成请求被拒**，不是探活）。
    *
@@ -177,6 +192,29 @@ function writeIndex(index: Pick<AccountsIndex, 'activeId'>): void {
   writeJsonAtomic(accountsIndexPath(), { version: INDEX_VERSION, ...(index.activeId ? { activeId: index.activeId } : {}) })
 }
 
+/**
+ * 规整两个"校验失败"标记，并把**旧版本写错位置**的值迁过来（0.6.6）。
+ *
+ * 为什么需要迁移：0.6.5 及以前"探活失败就写 `lastVerifyError`"，而网络类失败占多数 ——
+ * 2026-09-29 实测整库 9/9 都是 `fetch failed`（真因在 cause 里：`net::ERR_NETWORK_IO_SUSPENDED`，
+ * 机器休眠网络挂起），可读它的三处（徽章 / 账号轮换 / 重登是否清登录态）都当"这个号要重登"。
+ * 读的时候就把非授权类的值挪到 `lastCheckError`：老库不用等下一次探活自愈，也不丢信息。
+ */
+function migrateFailMarkers(raw: any): Pick<AccountRecord, 'lastVerifyError' | 'lastCheckError'> {
+  const marker = (value: any): { at: string; message: string } | undefined =>
+    value && typeof value.at === 'string'
+      ? { at: value.at, message: String(value.message ?? '') }
+      : undefined
+  const verify = marker(raw?.lastVerifyError)
+  const check = marker(raw?.lastCheckError)
+  const verifyIsAuth = verify ? isAuthFailureMessage(verify.message) : false
+  const out: Pick<AccountRecord, 'lastVerifyError' | 'lastCheckError'> = {}
+  if (verify && verifyIsAuth) out.lastVerifyError = verify
+  if (check) out.lastCheckError = check
+  else if (verify && !verifyIsAuth) out.lastCheckError = verify
+  return out
+}
+
 /** 把任意对象规整成 AccountRecord（缺字段补默认值；凭证无效返回 undefined）。 */
 function normalizeRecord(raw: any, fallbackId?: string): AccountRecord | undefined {
   if (!raw || typeof raw !== 'object') return undefined
@@ -203,9 +241,8 @@ function normalizeRecord(raw: any, fallbackId?: string): AccountRecord | undefin
     ...(typeof raw.groupId === 'string' && raw.groupId ? { groupId: raw.groupId } : {}),
     ...(typeof raw.serverId === 'string' && raw.serverId ? { serverId: raw.serverId } : {}),
     ...(typeof raw.lastVerifiedAt === 'string' ? { lastVerifiedAt: raw.lastVerifiedAt } : {}),
-    ...(raw.lastVerifyError && typeof raw.lastVerifyError?.at === 'string'
-      ? { lastVerifyError: { at: raw.lastVerifyError.at, message: String(raw.lastVerifyError.message ?? '') } }
-      : {}),
+    // 两个失败标记：授权类留在 lastVerifyError，非授权类迁到 lastCheckError（见上面的迁移说明）
+    ...migrateFailMarkers(raw),
     ...(raw.limit && Number.isFinite(raw.limit?.untilMs)
       ? { limit: { untilMs: Number(raw.limit.untilMs), observedAt: String(raw.limit.observedAt ?? '') } }
       : {}),
@@ -340,7 +377,16 @@ export function upsertAccount(auth: WebAuth, patch: Partial<AccountRecord> = {})
   const carried: Partial<AccountRecord> = {}
   // ⚠️ 这个白名单决定「重新登录 / 导入」时哪些**用户附加的元数据**会被带过去。
   // 少了 groupId 就会出现"重登一次，账号从组里掉出来"这种很难查的 bug。
-  for (const key of ['label', 'groupId', 'serverId', 'lastVerifiedAt', 'lastVerifyError', 'limit'] as const) {
+  // ⚠️ 新增字段必须同步加进来，否则重登/导入时会被**静默丢掉**（0.6.6 加了 lastCheckError）。
+  for (const key of [
+    'label',
+    'groupId',
+    'serverId',
+    'lastVerifiedAt',
+    'lastVerifyError',
+    'lastCheckError',
+    'limit',
+  ] as const) {
     const value = (patch as any)[key] ?? (incoming as any)[key] ?? (existing as any)?.[key]
     if (value !== undefined) (carried as any)[key] = value
   }

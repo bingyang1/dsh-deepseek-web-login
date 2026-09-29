@@ -166,6 +166,51 @@ const checks = {
     })(),
   'host 启动闸门时 min/max 成对传入（漏传 max 会让随机区间变成固定间隔）':
     /maxIntervalMs:\s*\w+\?\.maxRequestIntervalMs/.test(host),
+  // ── 0.6.6：网络类失败 ≠ 账号失效（一次休眠曾把 9 个账号标成"需要重新登录"，
+  //    点「重登」还被清掉登录态 ⇒ 被迫重敲手机号 + 验证码）────────────────────
+  // 值断言：把产物里的 planRelogin 抽出来**真跑三态**（文本断言守不住"分支写反"）。
+  'host 的重登三态判据正确（探活通过⇒一键恢复；网络类⇒不清；授权失效⇒才清）':
+    (() => {
+      const m = /function planRelogin\(probe\) \{[\s\S]*?\n\}/.exec(host)
+      if (!m) return false
+      let plan
+      try {
+        plan = new Function(`${m[0]}\nreturn planRelogin;`)()
+      } catch {
+        return false
+      }
+      return (
+        plan({ ok: true }) === 'already-valid' &&
+        plan({ ok: false, errorKind: 'transport' }) === 'network' &&
+        plan({ ok: false, errorKind: 'auth' }) === 'fresh-login' &&
+        // 探不了（凭证不可用 / 抛错）⇒ 按原语义走全新登录
+        plan(undefined) === 'fresh-login'
+      )
+    })(),
+  // 值断言：错误串必须沿 cause 链 —— 只留最外层就是一句没用的 "fetch failed"
+  'host 的错误说明会带上 cause（否则只剩一句 fetch failed，分不清休眠还是断网）':
+    (() => {
+      const m = /function describeError\(error\) \{[\s\S]*?\n\}/.exec(host)
+      if (!m) return false
+      let describe
+      try {
+        describe = new Function(`${m[0]}\nreturn describeError;`)()
+      } catch {
+        return false
+      }
+      const cause = Object.assign(new Error('net::ERR_NETWORK_IO_SUSPENDED'), {
+        code: 'net::ERR_NETWORK_IO_SUSPENDED',
+      })
+      const text = describe(Object.assign(new TypeError('fetch failed'), { cause }))
+      return text.includes('fetch failed') && text.includes('ERR_NETWORK_IO_SUSPENDED')
+    })(),
+  'host 只把授权类失败写进 lastVerifyError（网络类写 lastCheckError，且不覆盖授权结论）':
+    /lastVerifyError: failure,\s*lastCheckError: void 0/.test(host) &&
+    /\{ lastCheckError: failure \}/.test(host),
+  'host 重登前先探活（能用就直接恢复，不打开登录窗口）':
+    /const plan = planRelogin\(probe\)/.test(host) && host.includes('alreadyValid: true'),
+  'host 面板能拿到网络类失败字段（否则界面无从区分"需要重登"与"未能校验"）':
+    host.includes('lastCheckError: record.lastCheckError'),
   'host 适配器配置也带上 maxRequestIntervalMs': host.includes('maxRequestIntervalMs: gate.settings().maxRequestIntervalMs'),
   'host 状态回传也带上 maxRequestIntervalMs': /maxRequestIntervalMs:\s*adapterConfig\.maxRequestIntervalMs/.test(host),
   'host 会剥掉孤立的工具调用标记残片（`</|DSML|calls>` 那类漏上屏过）': host.includes('stripStrayToolMarkup'),
@@ -519,7 +564,7 @@ const checks = {
     /beginRelogin\(id\)/.test(host) &&
     /relogin:\s*commit\.mode\s*===\s*["']relogin["']/.test(host) &&
     /upsertAccount\(auth,\s*\{\s*id:\s*target\s*\}\)/.test(host) &&
-    /updateAccount\(target,\s*\{\s*lastVerifyError:\s*void 0\s*\}\)/.test(host) &&
+    /updateAccount\(target,\s*\{\s*lastVerifyError:\s*void 0,\s*lastCheckError:\s*void 0\s*\}\)/.test(host) &&
     /sameAccount\(existing, auth\)/.test(host) &&
     client.includes('凭证已原地更新') &&
     // ⚠️ 这里原来写的是 `/dsw-account-actions[\s\S]{0,320}?"重新登录"/` —— 一个脆弱的巧合：
@@ -573,12 +618,14 @@ const checks = {
   // 而不是数总次数 —— 否则每加一个入口都要改一次，等于把"当时有几处"当成期望值。
   'host 三个登录入口的清理都收口到 clearLoginState()':
     /beginAddAccount\(\);[\s\S]{0,90}?clearLoginState\(\)/.test(host) &&
-    /if \(stale\)[\s\S]{0,220}?clearLoginState\(\)/.test(host) &&
+    // 重登：清理必须落在「网络类」早退**之后**（0.6.6 起网络类不再清登录态）
+    /plan === ["']network["'][\s\S]{0,700}?clearLoginState\(\)/.test(host) &&
     /fresh === true[\s\S]{0,140}?clearLoginState\(\)/.test(host),
-  'host 重登的失效判定只看 lastVerifyError（不被"刚捕获还没校验"干扰）':
-    /const stale = !!target\.lastVerifyError/.test(host) &&
-    // 负向：别把 unverified 也算进"已失效" —— 捕获后短暂 unverified 是正常中间态，
-    // 把它当失效会让健康账号每次重登都被清一遍登录态。
+  'host 重登的走哪条路由**探活结果**决定（不再只看记录上的标记）':
+    /const plan = planRelogin\(probe\)/.test(host) &&
+    // 负向（限定代码行，排除注释）：真的删掉旧判据 —— 注释里引用旧写法是允许的
+    // （这条差点变成"注释让它永久为真"的空断言，2026-09-29 踩）
+    !/^\s*const stale = !!/m.test(host) &&
     !/const stale = [^\n]*unverified/.test(host),
   'host 清理函数两件事都做（清 profile + 清登录分区）':
     /async function clearLoginState[\s\S]{0,300}?clearBrowserLoginProfile\(/.test(host) &&
@@ -631,21 +678,29 @@ const checks = {
     // 负向：别有人又把它加回那个 `??` 链（那会退化成"新值整体覆盖"）
     !/\["label",\s*"groupId",[\s\S]{0,120}?"user"/.test(host),
   // ② 重登死循环：账号已失效时仍去复用浏览器里那份坏登录态。
-  'host 重登：账号已标记失效时先清登录态，健康账号照旧复用':
-    /const stale = !!target\.lastVerifyError/.test(host) &&
-    /if \(stale\)[\s\S]{0,220}?clearLoginState\(\)/.test(host) &&
-    /keptBrowserSession: !stale/.test(host),
-  'host 重登的两条日志/提示都按 stale 分流（不误导用户）':
-    host.includes('重登不再复用登录态') &&
-    /hint:\s*stale\s*\?/.test(host) &&
+  // 0.6.6：重登不再一进门就清登录态 —— 先探活，只有**授权真的失效**才清。
+  // （旧断言守的是"有 lastVerifyError 就清"，那正是"点重登还要我输密码"的成因。）
+  'host 重登：先探活，三条分支都在（只有授权失效那条清登录态）':
+    /const plan = planRelogin\(probe\)/.test(host) &&
+    /plan === ["']already-valid["']/.test(host) &&
+    /plan === ["']network["']/.test(host) &&
+    // 结构断言：清理发生在两条早退**之后**（网络类 / 已恢复都到不了这里）
+    /plan === ["']network["'][\s\S]{0,700}?clearLoginState\(\)/.test(host),
+  'host 重登的三条提示各自说清走的是哪条路（不误导用户）':
+    host.includes('不需要重新登录') &&
+    host.includes('网络暂时不通') &&
+    host.includes('请在打开的窗口里重新登录一次') &&
     // 旧形态：无条件宣称"能复用就直接复用"必须消失
     !/（不清理浏览器登录态，能复用就直接复用）—— 捕获后原地更新/.test(host),
   // 界面文案必须跟着行为走：老文案把"不清理登录态"写死在了按钮 title 与提示里，
   // 而 0.1.75 起"账号已失效"时会先清 ⇒ 那两句会误导用户（0.1.71 的"文案与行为脱节"同类）。
-  'client 重登提示跟随宿主的 hint（不再写死"不清理登录态"）':
+  // 0.6.6：按钮文案改成"先只读校验、能用就恢复"，且要处理 alreadyValid / network 两条新响应。
+  'client 重登提示跟随宿主（一键恢复 / 网络问题 / 真失效三条路都要认）':
+    /prep\?\.alreadyValid/.test(client) &&
     /prep\?\.hint/.test(client) &&
     !client.includes('不清理浏览器登录态') &&
-    client.includes('若这条账号已被标记失效'),
+    client.includes('先做一次只读校验') &&
+    client.includes('凭证还能用就立刻恢复'),
   // 0.1.76：prompt 上限默认值不再顶格（它同时是风控阀门，直接决定每轮重发的请求体量）。
   // ⚠️ 打包器会把 400000 写成 `4e5`、1500000 写成 `15e5` —— 断言必须容忍这两种形态。
   'host prompt 上限默认值已降到 40 万、且不再等于上限值':

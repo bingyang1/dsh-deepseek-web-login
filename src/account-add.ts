@@ -144,7 +144,9 @@ export function commitCapturedAuth(auth: WebAuth, now: number = Date.now()): Com
         //    留着它那条记录会一直显示「需要重新登录」（用户实测："重登了怎么还报错"）。
         //    这里用 updateAccount 而不是 upsertAccount —— 后者的 carried 逻辑用 `??`，传 undefined 清不掉。
         //    真有问题的话，30 分钟内的探活会重新把它标红。
-        updateAccount(target, { lastVerifyError: undefined })
+        //    0.6.6：网络类的 lastCheckError 也一起清 —— 换的是同一份凭证，
+        //    两个标记都只在描述"上一次校验"，重登后都过期了。
+        updateAccount(target, { lastVerifyError: undefined, lastCheckError: undefined })
         return { mode: 'relogin', created: false, recordId: record.id }
       }
       // 认得出"这是另一个号"（或那条记录已被移除）→ 放行成普通捕获，别覆盖别人的记录
