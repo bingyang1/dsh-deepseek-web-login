@@ -1360,14 +1360,16 @@ export function apply(ctx: any, config: Config = {}): void {
             // 手动清理（0.6.11）：退掉当前在用的会话 + 立刻把待删队列清干净。
             // 链式模式下自动清理是关的，用户想"现在就把网页端弄干净"就点面板那颗按钮。
             if (req.method === 'POST' && route === '/cleanup') {
+              // 手动清理 = 把**所有**窗口的网页端会话都退掉（按会话分槽之后就是多个），
+              // 然后立刻把待删队列清空。链式模式下这是唯一的清理出口。
               const live = clearLiveSession()
               const auth = getAuth()
-              if (live && auth) sessionCleaner.schedule(auth as WebAuth, live)
+              if (auth) for (const id of live) sessionCleaner.schedule(auth as WebAuth, id)
               await sessionCleaner.flush()
-              logger.info?.(`deepseek-web: 手动清理完成（live=${live ?? '无'}，队列已清空）`)
+              logger.info?.(`deepseek-web: 手动清理完成（退出 ${live.length} 个会话，队列已清空）`)
               sendJson(res, 200, {
                 ok: true,
-                cleared: live ?? null,
+                cleared: live.length,
                 pending: sessionCleaner.pendingCount(),
                 mode: contextMode,
               })

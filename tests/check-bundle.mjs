@@ -451,7 +451,9 @@ const checks = {
     /mode:\s*currentContextMode\(\)/.test(host) &&
     /promptParts:\s*\{[\s\S]{0,160}?entries:\s*promptParts\.entries/.test(host) &&
     /typeof d\.response_message_id === ["']number["'][\s\S]{0,80}?onResponseMessageId/.test(host) &&
-    /sentFeed\?\.next && complete && !poisoned[\s\S]{0,160}?contextChain = \{[\s\S]{0,80}?parentId: responseMessageId/.test(host) &&
+    // 0.6.12：链改成按 DSH 会话分槽的 Map（`contextChains.set(slotKey, {...})`），
+    // 断言的**意图**不变：跑完且拿到 response id 才把那一条链接上。
+    /sentFeed\?\.next && complete && !poisoned[\s\S]{0,200}?contextChains\.set\([\s\S]{0,80}?parentId: responseMessageId/.test(host) &&
     host.includes('context-feed.json'),
 
   // ── 0.2.0 ────────────────────────────────────────────────

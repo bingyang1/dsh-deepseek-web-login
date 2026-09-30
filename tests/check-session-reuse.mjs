@@ -17,6 +17,7 @@ const {
   streamWebCompletion,
   setFetchImpl,
   resetSessionReuse,
+  disposeSessionReuse,
   DEFAULT_SESSION_REUSE_TURNS,
 } = await import('../src/webapi.ts')
 
@@ -236,7 +237,55 @@ await test('换账号不复用，旧会话交还原账号的回调', async () =>
     for await (const _ of streamWebCompletion(auth, params, transport)) void _
   }
   assert.equal(created.length, 2, '换账号必须建新会话')
-  assert.deepEqual(deleted, [['A', 'sess-1']], '不得用 B 的回调回收 A，也不得静默丢弃旧槽')
+  // ⚠️ 0.6.12 改按 DSH 会话分槽之后，这里断言的**意图没变、时机变了**：
+  //    A 的槽不再被 B"覆盖"（保留下来，切回 A 还能接着用自己那条会话），
+  //    所以此刻谁都不该被删；"归属"这件事要改成**退役时看**——
+  //    每个会话必须由**它自己那个账号**的回调回收（不能用 B 的回调删 A）。
+  assert.deepEqual(deleted, [], '两个账号各自的槽都还在，此刻不该有人被删')
+  disposeSessionReuse()
+  const pairs = deleted.map(([owner, id]) => `${owner}:${id}`).sort()
+  assert.deepEqual(pairs, ['A:sess-1', 'B:sess-2'].sort(), '每个会话必须由它自己那个账号的回调回收')
+})
+
+// ── 0.6.12：按 DSH 会话（窗口）分槽 ────────────────────────────────────────
+// 用户要求："每个窗口各用自己那个网页端会话"。宿主在 `GenerateOptions.sessionId` 里给了身份，
+// 于是这里守三件事：换窗口建新会话、回到旧窗口**复用回自己那条**、两个窗口互不干扰。
+await test('按 DSH 会话分槽：换窗口各用各的会话，切回去复用回自己那条', async () => {
+  resetSessionReuse()
+  const { created, transport } = mkTransport()
+  setFetchImpl(okFetch)
+  const once = async (dshSessionId) => {
+    const params = {
+      prompt: 'P',
+      thinkingEnabled: false,
+      modelType: 'default',
+      idleTimeoutMs: 5_000,
+      dshSessionId,
+      onDeleteSession: () => {},
+    }
+    for await (const _ of streamWebCompletion(authA, params, transport)) void _
+  }
+  await once('win-A')
+  const afterA = created.length
+  await once('win-B')
+  assert.equal(created.length, afterA + 1, '换窗口必须建自己的会话（不能占用上一个窗口的）')
+  await once('win-A')
+  assert.equal(created.length, afterA + 1, '切回旧窗口时必须复用回它自己那条会话，不再新建')
+  await once('win-B')
+  assert.equal(created.length, afterA + 1, '两个窗口各自稳定复用，互不新建')
+})
+
+await test('没给 dshSessionId（老宿主）⇒ 退化成共用一个槽，行为与以前一致', async () => {
+  resetSessionReuse()
+  const { created, transport } = mkTransport()
+  setFetchImpl(okFetch)
+  const once = async () => {
+    const params = { prompt: 'P', thinkingEnabled: false, modelType: 'default', idleTimeoutMs: 5_000 }
+    for await (const _ of streamWebCompletion(authA, params, transport)) void _
+  }
+  await once()
+  await once()
+  assert.equal(created.length, 1, '没有身份信息时可复用同一个会话（老行为）')
 })
 
 // 复位，别把注入层留给别的测试

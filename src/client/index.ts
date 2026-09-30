@@ -1969,8 +1969,9 @@ function Panel(): any {
       cleanupNowHint.textContent = '清理中…'
       void api('/cleanup', { method: 'POST', body: '{}' })
         .then((result: any) => {
-          cleanupNowHint.textContent = result?.cleared
-            ? `已退出会话 ${String(result.cleared).slice(0, 8)}…，队列剩 ${result?.pending ?? 0} 个；下一轮会重新当链首（全量发一次）`
+          const n = Number(result?.cleared ?? 0)
+          cleanupNowHint.textContent = n
+            ? `已退出 ${n} 个网页端会话，队列剩 ${result?.pending ?? 0} 个；下一轮会重新当链首（全量发一次）`
             : `没有在用会话；队列剩 ${result?.pending ?? 0} 个`
         })
         .catch((error: any) => {

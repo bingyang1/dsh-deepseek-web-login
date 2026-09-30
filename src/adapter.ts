@@ -1341,6 +1341,13 @@ export function createAdapter(deps: AdapterDeps) {
         idleTimeoutMs: deps.config.idleTimeoutMs ?? 120_000,
         // 会话复用：同一账号连续多个回合共用一个网页端会话（见 webapi.ts 的实测判定）
         ...(deps.config.sessionReuseTurns !== undefined ? { sessionReuseTurns: deps.config.sessionReuseTurns } : {}),
+        // 🔴 宿主给的 DSH 会话身份（`GenerateOptions.sessionId`，宿主内核类型定义原话是
+        // "Session identity stamped by the loop for listener routing"，适配器本该忽略）。
+        // 我们借它把"网页端会话 + 投喂链"**按窗口分开** —— 不然换窗口的请求会落进上一个
+        // 窗口的会话里（用户报"换窗口就把上下文清一次、网页端还长出 n/n 分支"）。
+        ...(typeof (options as any)?.sessionId === 'string' && (options as any).sessionId
+          ? { dshSessionId: String((options as any).sessionId) }
+          : {}),
         onDeleteSession:
           deps.config.deleteWebSessions === false
             ? undefined

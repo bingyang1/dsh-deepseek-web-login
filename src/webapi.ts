@@ -1141,11 +1141,10 @@ export function scheduleDeleteSession(auth: WebAuth, sessionId: string): void {
  * 只**退**不**删**：删除交给清理器（`flush()`）去做，这样"删"这条路仍然只有一个出口，
  * 也便于失败重试与落盘台账。
  */
-export function clearLiveSession(): string | undefined {
-  const id = reuseSlot?.sessionId ?? contextChain?.sessionId
-  if (!id) return undefined
-  retireSession(id)
-  return id
+export function clearLiveSession(): string[] {
+  const ids = [...reuseSlots.values()].map((slot) => slot.sessionId)
+  for (const id of ids) retireSession(id)
+  return ids
 }
 
 /** 验证登录态：优先 users/current，端点不存在时退回 PoW challenge 探活。 */
@@ -1915,15 +1914,47 @@ export const DEFAULT_SESSION_REUSE_TURNS = 20
 /**
  * 复用槽。`cleanup` 记录**这个会话归谁回收**（2026-09-13 审计 N04）：
  * 切号时旧槽要交回**原账号**的清理回调，不能用当前账号的去删别人的会话。
+ *
+ * 🔴 0.6.12：**按 DSH 会话来分**（不再是全局单槽）。宿主给适配器的 `GenerateOptions`
+ * 里有 `sessionId`（宿主内核类型定义原话："Session identity stamped by the loop for
+ * listener routing"）—— 一个 DSH 窗口/对话一个值。以前不区分 ⇒ 换窗口的请求会落进上一个
+ * 窗口的网页端会话（用户报"换个窗口就把上下文清一次、网页端还长出一堆 n/n 分支"）。
+ * 现在：**一个 DSH 会话 = 一个网页端会话 + 一条链**，切回来还能接着用自己那条。
+ * 拿不到 sessionId 时（老版本宿主 / 手工构造的请求）退化成共用一个 `(unknown)` 槽。
  */
-let reuseSlot: { key: string; sessionId: string; turns: number; cleanup?: (id: string) => void } | undefined
+interface SessionSlot {
+  /** 归属键（账号 + DSH 会话），换账号或换窗口都不会串。 */
+  key: string
+  sessionId: string
+  turns: number
+  /** 最近一次使用的时刻，用来淘汰最久没用的那条。 */
+  at: number
+  cleanup?: (id: string) => void
+}
+const reuseSlots = new Map<string, SessionSlot>()
 
 /**
- * 链式投喂的链状态（2026-09-14）。只跟随**正在复用的那个会话**：
- * 会话轮换、切号、请求失败/取消、流被污染，都会让它作废 —— 下一轮自动退回全量重发。
+ * 同时最多养几条会话（＝几个 DSH 窗口）。
+ * 超了淘汰**最久没用**的那条并连带删掉它的网页端会话 —— 否则开过的窗口越多、
+ * 网页端残留的会话越多（每条都占着服务端的上下文）。
+ */
+export const MAX_CONVERSATION_SLOTS = 6
+
+/** 槽/链的归属键：账号 + DSH 会话 id。 */
+function slotKeyFor(auth: WebAuth, dshSessionId?: string): string {
+  const sid = typeof dshSessionId === 'string' && dshSessionId.trim() ? dshSessionId.trim() : '(unknown)'
+  return `${accountKey(auth)}|${sid}`
+}
+
+/**
+ * 链式投喂的链状态（2026-09-14）。0.6.12 起**按 DSH 会话分开**（与复用槽同一把键）：
+ * 每条链只跟随它自己那个网页端会话的复用；会话轮换、切号、请求失败/取消、流被污染，
+ * 都会让**那一条**作废 —— 下一轮自动退回全量重发。
  * 判定逻辑在 context-feed.ts（纯函数），这里只负责"喂进去 + 按结果记下来"。
  */
-let contextChain: ChainState | undefined
+const contextChains = new Map<string, ChainState>()
+/** 最近用过的链归属键 —— 面板只展示"当前那条"，用它定位。 */
+let lastChainKey: string | undefined
 
 /**
  * 服务端**已知**的图片 file_id（0.1.83）：本会话内已经随请求发出去过的那批。
@@ -1946,17 +1977,25 @@ let lastFeedReason: FeedReason | undefined
 
 /** 丢弃当前的链（会话退役/测试隔离用）。 */
 export function resetContextChain(): void {
-  contextChain = undefined
+  contextChains.clear()
+  lastChainKey = undefined
   lastFeedReason = undefined
 }
 
 /** 给状态页看：当前链式投喂是否真的在跑（没用链式就返回 undefined）。 */
-export function contextChainInfo(): { sessionId: string; turns: number; parentId: number } | undefined {
-  if (!contextChain) return undefined
+export function contextChainInfo():
+  | { sessionId: string; turns: number; parentId: number; slots: number }
+  | undefined {
+  const chain =
+    (lastChainKey !== undefined ? contextChains.get(lastChainKey) : undefined) ??
+    [...contextChains.values()].pop()
+  if (!chain) return undefined
   return {
-    sessionId: contextChain.sessionId,
-    turns: contextChain.entries.length,
-    parentId: contextChain.parentId,
+    sessionId: chain.sessionId,
+    turns: chain.entries.length,
+    parentId: chain.parentId,
+    // 同时养着几条会话（＝几个 DSH 窗口各一条）
+    slots: reuseSlots.size,
   }
 }
 
@@ -1988,22 +2027,26 @@ async function leaseSession(
    * 建新会话 + 把它放进复用槽 + 把旧槽交回给它自己的 cleanup。
    */
   forceNew = false,
+  /** 归属键（账号 + DSH 会话）。见 `slotKeyFor`。 */
+  slotKey = '',
 ): Promise<SessionLease> {
   signal.throwIfAborted()
-  const key = accountKey(auth)
+  const key = slotKey || accountKey(auth)
   const configured = Number.isFinite(maxTurns) ? Math.max(0, Math.floor(maxTurns)) : DEFAULT_SESSION_REUSE_TURNS
   // 链式模式下不轮换（会话就是链的载体，轮换＝定期清上下文）—— 判据是纯函数，有用例。
   const limit = effectiveReuseLimit(configured, currentContextMode())
   // 关闭复用：每次都要新会话（调用方会自己回收）
   if (limit === 0) return { sessionId: await transport.createSession(auth, signal), reused: false }
-  if (!forceNew && reuseSlot && reuseSlot.key === key && reuseSlot.turns < limit) {
-    reuseSlot.turns += 1
-    return { sessionId: reuseSlot.sessionId, reused: true }
+  const slot = reuseSlots.get(key)
+  if (!forceNew && slot && slot.turns < limit) {
+    slot.turns += 1
+    slot.at = Date.now()
+    return { sessionId: slot.sessionId, reused: true }
   }
   // ⚠️ N04：轮换/切号时，旧槽必须交给**它自己的** cleanup 归还。
   // 旧实现只在"同账号轮换"时返回 retired、切号时直接覆盖旧槽 ——
   // 后者等于把旧会话的清理归属丢掉了（永远不会有人删它）。
-  const previous = reuseSlot
+  const previous = slot
   const sessionId = await transport.createSession(auth, signal)
   if (signal.aborted) {
     // 建会话期间被取消：这个会话还没人认领，就地回收，别留垃圾
@@ -2012,7 +2055,9 @@ async function leaseSession(
     } catch {}
     signal.throwIfAborted()
   }
-  reuseSlot = { key, sessionId, turns: 1, ...(cleanup ? { cleanup } : {}) }
+  reuseSlots.set(key, { key, sessionId, turns: 1, at: Date.now(), ...(cleanup ? { cleanup } : {}) })
+  // 淘汰最久没用的那些窗口（连同它们的网页端会话一起删）—— 见 MAX_CONVERSATION_SLOTS。
+  evictIdleSlots()
   // 落账：这个会话进了复用槽，此刻**还没删**。宿主据此落盘 —— 否则进程被强杀时
   // 槽里的会话（每次退出必留一个）永远没人回收。
   emitSessionLifecycle({ kind: 'leased', auth, sessionId })
@@ -2024,11 +2069,35 @@ async function leaseSession(
   return { sessionId, reused: false }
 }
 
+/** 槽数超过上限时，把**最久没用**的那些连同它们的网页端会话一起淘汰掉。 */
+function evictIdleSlots(): void {
+  if (reuseSlots.size <= MAX_CONVERSATION_SLOTS) return
+  const idle = [...reuseSlots.values()].sort((a, b) => a.at - b.at)
+  for (const slot of idle.slice(0, reuseSlots.size - MAX_CONVERSATION_SLOTS)) {
+    reuseSlots.delete(slot.key)
+    retireSession(slot.sessionId)
+    try {
+      slot.cleanup?.(slot.sessionId)
+    } catch {}
+  }
+}
+
 /** 把某个会话从复用槽里摘掉（会话失效 / 请求失败时调用，下次会新建）。 */
 export function retireSession(sessionId?: string): void {
-  if (!sessionId || (reuseSlot && reuseSlot.sessionId === sessionId)) reuseSlot = undefined
+  if (!sessionId) {
+    reuseSlots.clear()
+    contextChains.clear()
+    lastChainKey = undefined
+    return
+  }
+  for (const [key, slot] of [...reuseSlots]) {
+    if (slot.sessionId === sessionId) reuseSlots.delete(key)
+  }
   // 会话被退役 ⇒ 它的链也失效（留着会让下一轮"续"到一个已经不存在的父消息上）。
-  if (!sessionId || contextChain?.sessionId === sessionId) contextChain = undefined
+  for (const [key, chain] of [...contextChains]) {
+    if (chain.sessionId === sessionId) contextChains.delete(key)
+  }
+  if (lastChainKey !== undefined && !contextChains.has(lastChainKey)) lastChainKey = undefined
 }
 
 /**
@@ -2043,25 +2112,29 @@ export function retireSession(sessionId?: string): void {
  * 记录只在"确认删掉"时才被摘掉，所以强杀也能在下次启动补删。
  */
 export function disposeSessionReuse(): string | undefined {
-  const slot = reuseSlot
-  contextChain = undefined
+  const slots = [...reuseSlots.values()]
+  reuseSlots.clear()
+  contextChains.clear()
+  lastChainKey = undefined
   // 0.1.83：图片的"服务端已知"集合同样归会话所有，会话退役就作废
   sentRefIds = new Set()
   sentRefIdsSession = undefined
-  if (!slot) return undefined
-  reuseSlot = undefined
-  try {
-    slot.cleanup?.(slot.sessionId)
-  } catch {
-    /* 排队失败不影响卸载 */
+  if (slots.length === 0) return undefined
+  for (const slot of slots) {
+    try {
+      slot.cleanup?.(slot.sessionId)
+    } catch {
+      /* 排队失败不影响卸载 */
+    }
   }
-  return slot.sessionId
+  return slots[slots.length - 1]?.sessionId
 }
 
 /** 只给测试用：清空复用槽。 */
 export function resetSessionReuse(): void {
-  reuseSlot = undefined
-  contextChain = undefined
+  reuseSlots.clear()
+  contextChains.clear()
+  lastChainKey = undefined
   // 决策回执的状态也是模块级的（见 lastFeedReason），一并清掉，测试之间才互不干扰
   lastFeedReason = undefined
   // 0.1.83：图片的"服务端已知"集合也是模块级的，一并清掉
@@ -2112,6 +2185,11 @@ export interface CompletionParams {
   connectTimeoutMs?: number
   /** 同一会话复用的轮次上限（0 = 每请求一个会话，用完即删）。 */
   sessionReuseTurns?: number
+  /**
+   * 宿主给的 **DSH 会话身份**（`GenerateOptions.sessionId`，见宿主内核类型定义）。
+   * 一个窗口/对话一个值；适配器本该忽略它，我们借它把"网页端会话 + 投喂链"按窗口分开。
+   */
+  dshSessionId?: string
   onDeleteSession?: (sessionId: string) => void
   /**
    * 当前账号被限时问宿主：「换个账号还能不能接着干」。
@@ -2176,6 +2254,8 @@ async function openCompletion(
 ): Promise<{ sessionId: string; resp: Response; feed: FeedDecision }> {
   let lastFailure: AdapterLlmError | undefined
   const canFailover = makeCanFailover(params)
+  // 归属键：这个窗口（DSH 会话）自己的网页端会话与链。见 slotKeyFor 的说明。
+  const slotKey = slotKeyFor(auth, params.dshSessionId)
   for (let attempt = 0; attempt < 2; attempt++) {
     let lease = await leaseSession(
       auth,
@@ -2183,6 +2263,8 @@ async function openCompletion(
       transport,
       params.sessionReuseTurns ?? DEFAULT_SESSION_REUSE_TURNS,
       params.onDeleteSession,
+      false,
+      slotKey,
     )
     // 链式投喂：决定本轮发全量还是增量、parent 指向谁。判据在 context-feed.ts（纯函数）：
     // 模式=chained 且「复用了同一会话 + 条目严格追加 + 头部/账号都没变」才发增量，
@@ -2201,7 +2283,7 @@ async function openCompletion(
         sessionId,
         accountKey: accountKey(auth),
         reused,
-        ...(contextChain ? { chain: contextChain } : {}),
+        ...(contextChains.get(slotKey) ? { chain: contextChains.get(slotKey)! } : {}),
       })
     let feed = planFeed(lease.sessionId, lease.reused)
     // 0.6.10：**重开链（parent=null）不能在"复用来的"会话里发根消息** —— 那会在同一个网页端
@@ -2219,6 +2301,7 @@ async function openCompletion(
         params.sessionReuseTurns ?? DEFAULT_SESSION_REUSE_TURNS,
         params.onDeleteSession,
         true,
+        slotKey,
       )
       feed = { ...planFeed(lease.sessionId, lease.reused), reason }
     }
@@ -2435,6 +2518,10 @@ export async function* streamWebCompletion(
 ): AsyncGenerator<WebStreamEvent> {
   const controller = new AbortController()
   const signal = params.signal ? AbortSignal.any([params.signal, controller.signal]) : controller.signal
+  // 归属键：账号 + DSH 会话（窗口）。这条请求要用的网页端会话与投喂链都挂在它下面。
+  const slotKey = slotKeyFor(auth, params.dshSessionId)
+  /** 本轮真的按某条链发过吗（收尾时按它决定是"接上"还是"作废"）。 */
+  let sentChainKey: string | undefined
   // SSE 路径也要问「还能不能换号」（与 openCompletion 同一个判据）：节流的退避长短由它决定。
   const canFailover = makeCanFailover(params)
   const rawLimit = params.sessionReuseTurns ?? DEFAULT_SESSION_REUSE_TURNS
@@ -2553,6 +2640,7 @@ export async function* streamWebCompletion(
     )
     sessionId = opened.sessionId
     sentFeed = opened.feed
+    sentChainKey = slotKey
     body = opened.resp.body
     if (timer) clearTimeout(timer)
     iterator = parseWebSse(body, {
@@ -2612,9 +2700,11 @@ export async function* streamWebCompletion(
     // 注意这里按**每一次请求**记账（一轮里可能有首轮 + 续写轮多次调用），不是按 DSH 回合：
     // 续写轮的增量与 parent 正是靠这次记账才对得上。
     if (sentFeed?.next && complete && !poisoned && typeof responseMessageId === 'number') {
-      contextChain = { ...sentFeed.next, parentId: responseMessageId }
-    } else if (contextChain && (!sessionId || contextChain.sessionId === sessionId)) {
-      contextChain = undefined
+      contextChains.set(slotKey, { ...sentFeed.next, parentId: responseMessageId })
+      lastChainKey = slotKey
+    } else if (sentChainKey !== undefined) {
+      contextChains.delete(sentChainKey)
+      if (lastChainKey === sentChainKey) lastChainKey = undefined
     }
     release?.()
   }

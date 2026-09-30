@@ -2,6 +2,36 @@
 
 本项目遵循大致语义化版本；日期为本地时间。
 
+## 0.6.12 — 2026-09-30
+
+**按 DSH 会话（窗口）分槽：一个窗口一个网页端会话 + 一条链。**
+
+用户要求「每个窗口各用自己那个网页端会话，而不是占用之前的窗口」。上一版我判断"做不到"是
+**查错了地方** —— 我看的是宿主日志里的 `request/header` 事件（那里只有 config / adapterDefaults / tools），
+而适配器实际收到的 `GenerateOptions` 里**有 `sessionId`**。宿主内核
+（`@deepseek-ai/dsh-llm` 的 `types.d.ts`，npm 上公开）原文：
+
+```ts
+/** Session identity stamped by the loop for listener routing. Adapters ignore
+ *  it; replay uses it to keep concurrent parent and child cursors independent. */
+sessionId?: Branded<'SessionId'>;
+```
+
+改动：
+
+1. `adapter.ts` 把 `options.sessionId` 透传成 `dshSessionId`。
+2. `webapi.ts` 的复用槽与投喂链从**全局单槽**改成**按 `账号 + DSH 会话` 分槽的 Map**
+   （`slotKeyFor`）：窗口 A 与窗口 B 各拿一个网页端会话、各挂一条链，**切回来还复用自己那条**。
+3. 上限 `MAX_CONVERSATION_SLOTS = 6`：超过就淘汰**最久没用**的那条（连同它的网页端会话一起删），
+   免得开过的窗口越多、服务端残留的会话越多。
+4. 拿不到 `sessionId` 时（老宿主 / 手工构造的请求）退化成共用一个 `(unknown)` 槽，行为与以前一致。
+5. 面板「立即清理」相应改成清**所有**窗口的会话（`clearLiveSession` 返回列表）；
+   `GET /context-mode` 的 `chain` 多回一个 `slots`（当前养着几条会话）。
+
+用例：`check-session-reuse` 新增两条（换窗口各用各的 / 切回复用自己那条 / 无身份时退化）；
+原有"换账号"那条按新设计改了断言 —— **意图不变、时机变了**（槽不再被覆盖，于是改成
+"退役时每个会话必须由它自己那个账号的回调回收"）。`check-bundle` 的链式接线守卫同步到新写法。
+
 ## 0.6.11 — 2026-09-30
 
 **清理策略按投喂模式分开：链式模式不自动清理、改为手动；链式下也不再按轮数轮换会话。**
