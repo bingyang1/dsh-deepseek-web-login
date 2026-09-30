@@ -12,7 +12,7 @@
  *   node tools/inspect-session.mjs --search "关键词"     # 按关键词找会话（可多个关键词，逗号分隔）
  *   node tools/inspect-session.mjs <ID前缀> --blocks    # 额外打印内容块的真实事件（原始 JSON 片段）
  *
- * 会话目录：`${DSH_HOME:-~/.dsh}/sessions/<workspace>/session-<id>/session.jsonl.zstd`
+ * 会话目录：`${DSH_HOME:-~/.dsh}/sessions/<workspace>/session-<id>/session.v<N>.jsonl.zstd（0.2.x 起是 v4；别写死版本号）`
  *
  * ⚠️ 实现要点（踩坑）：该日志是**逐条追加的独立 zstd 帧**拼接而成（一个几 MB 的文件里可能有上万个帧头），
  * `zlib.zstdDecompressSync` 与流式解压都只返回第一帧（约 200 字节的会话头）。
@@ -63,7 +63,10 @@ function* sessionLogs(dir = SESSION_ROOT) {
   for (const entry of entries) {
     const full = join(dir, entry.name)
     if (entry.isDirectory()) yield* sessionLogs(full)
-    else if (entry.name === 'session.jsonl.zstd' || entry.name === 'session.jsonl') yield full
+    // ⚠️ 别写死版本号：DSH 桌面端 0.2.x 会把它升到 `session.v4.jsonl.zstd`（实测 2026-09-30），
+    // 写死 `v3` 的后果是**整个工具静默返回空**（列表、--search 全都没结果），
+    // 让人以为"会话日志没了"。按前缀 `session.v<数字>.` 认，新旧都覆盖。
+    else if (/^session\.v\d+\.jsonl(\.zstd)?$/.test(entry.name) || entry.name === 'session.jsonl') yield full
   }
 }
 
