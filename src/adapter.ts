@@ -16,6 +16,8 @@ import { staleAuthMessage } from './probe.ts'
 import { createRequestGate, DEFAULT_MAX_PROMPT_CHARS, DEFAULT_MAX_REF_IMAGES, DEFAULT_MIN_REQUEST_INTERVAL_MS, type RequestGate } from './gate.ts'
 import { summarizeCookieLife, type CookieLifeSummary } from './cookies.ts'
 import {
+  AUTH_FAILOVER_RETRY_MS,
+  AUTH_GIVEUP_RETRY_MS,
   FAILOVER_RETRY_MS,
   MAX_THROTTLE_RETRY_MS,
   scheduleDeleteSession,
@@ -502,7 +504,7 @@ export interface AdapterDeps {
    * `kind` 是**这次失败的成因**（'muted' 封禁 / 'throttled' 限流）—— 两条路径"能不能换"的
    * 判据不一样（限流那条还受窗口与冷却约束），所以要把成因传下去，不能只用一个布尔概括。
    */
-  canFailover?: (kind?: 'muted' | 'throttled') => boolean
+  canFailover?: (kind?: 'muted' | 'throttled' | 'auth') => boolean
 }
 
 function modelInfoFor(provider: string, spec: ModelSpec, requestedId?: string) {
@@ -720,7 +722,12 @@ function allowsAutoContinue(purpose: unknown): boolean {
 export const RETRY_POLICY = Object.freeze({
   mode: 'normal' as const,
   maxRetries: 5,
-  retryableCodes: Object.freeze(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']),
+  // ⚠️ 'AUTH' 是 0.6.8 加进来的，但它**不是**无条件可重试 —— 见下面两档 AUTH 退避：
+  // 能换号（自动换号开着 + 账号库里还有可用候选）⇒ 5s 后重发，重发进入适配器时换号检查点
+  // 会换上可用账号，整轮任务自己接下去；不能换号 ⇒ 600s > maxDelayMs ⇒ 重试策略直接放弃
+  // （重试一个已失效的凭证只会白打请求）。所以"包不包含 AUTH"这个问题的答案由退避值决定，
+  // 不由这个数组决定 —— 数组里没有 AUTH 的话，那条 5s 永远没机会被用上。
+  retryableCodes: Object.freeze(['EMPTY_RESPONSE', 'AUTH', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']),
   initialDelayMs: FAILOVER_RETRY_MS,
   maxDelayMs: MAX_THROTTLE_RETRY_MS,
   jitterRatio: 0.2,
@@ -1157,12 +1164,24 @@ export function createAdapter(deps: AdapterDeps) {
     // 「校验全部」（只读探活，成功即清掉标记）—— 所以错误里要把两句都写上。
     const stale = staleAuthMessage(auth)
     if (stale) {
-      logger?.warn?.(`deepseek-web: 跳过请求 —— 该账号登录态已被判定失效（${stale}）`)
+      // 0.6.8：能自动换号时这里**不是终点** —— 给 5s 短退避让 dsh-llm-retry 立刻重发，
+      // 重发进入适配器时会先跑 `maybeAutoSwitch`（就在上面几行），判据是同一个
+      // "当前账号不可用"（标记就是靠 `stale` 读出来的）⇒ 死号被换掉、任务自己接下去。
+      // 所以文案和退避都要跟着分流，别让用户以为必须手点「继续」或手输密码。
+      const canSwap = deps.canFailover?.('auth') === true
+      logger?.warn?.(
+        `deepseek-web: 跳过请求 —— 该账号登录态已被判定失效（${stale}）` +
+          (canSwap ? '；将自动换到另一个可用账号重试' : '；没有可换的账号，需手动切换或重新登录'),
+      )
       throw new AdapterLlmError(
-        `这个账号的登录态已失效（${stale}），本次请求没有发出。` +
-          '请在「设置 → DeepSeek 网页登录」用浏览器窗口重新登录该账号；' +
-          '若确认它其实还能用，点账号行上的「校验全部」重新确认一次即可（只读探活，不消耗额度）。',
+        canSwap
+          ? `这个账号的登录态已失效（${stale}），本次请求没有发出 —— 正在自动换到另一个可用账号重试……`
+          : `这个账号的登录态已失效（${stale}），本次请求没有发出。` +
+            '请在「设置 → DeepSeek 网页登录」用浏览器窗口重新登录该账号，' +
+            '或点该账号行上的「切换」换一个能用的号；' +
+            '若确认它其实还能用，点「校验全部」重新确认一次即可（只读探活，不消耗额度）。',
         'AUTH',
+        { providerRetryAfterMs: canSwap ? AUTH_FAILOVER_RETRY_MS : AUTH_GIVEUP_RETRY_MS },
       )
     }
     const spec = resolveSpec(String(options?.model ?? ''))

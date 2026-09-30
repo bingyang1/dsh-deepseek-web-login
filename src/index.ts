@@ -44,7 +44,7 @@ import {
   DEFAULT_AUTO_SWITCH_MINUTES,
   type GateSettings,
 } from './gate.ts'
-import { decideAutoSwitch, freshThrottledIds, isThrottleSwitchAllowed, pickNextAccount, type SwitchableAccount } from './auto-switch.ts'
+import { decideAutoSwitch, freshThrottledIds, hasFailoverCandidate, isThrottleSwitchAllowed, type SwitchableAccount } from './auto-switch.ts'
 import { browserLogin, clearBrowserLoginProfile, findSystemBrowser } from './browser-login.ts'
 import { canOpenElectronWindow, clearLoginPartition, clearLoginState, closeLoginWindow, captureFromPartition, getFingerprintReport, getLastLoginResult, getLoginProgress, isLoginWindowOpen, loginWithToken, logout, openExternalLogin, openLoginWindow } from './login.ts'
 import { beginAddAccount, beginRelogin, commitCapturedAuth, endAddAccount, endRelogin } from './account-add.ts'
@@ -490,10 +490,8 @@ export function apply(ctx: any, config: Config = {}): void {
    * `kind` 区分成因：封禁（'muted'）是"这个号暂时废了"，换了就走；限流（'throttled'）
    * 则要过窗口与冷却（见 `isThrottleSwitchAllowed`）—— 否则"每个号都被限流"时会一路换下去。
    */
-  const canFailover = (kind?: 'muted' | 'throttled'): boolean => {
+  const canFailover = (kind?: 'muted' | 'throttled' | 'auth'): boolean => {
     const minutes = gate.settings().autoSwitchMinutes ?? DEFAULT_AUTO_SWITCH_MINUTES
-    if (!Number.isFinite(minutes) || minutes <= 0) return false
-    if (autoSwitching) return false // 正在切，别叠加
     const now = Date.now()
     // 限流这条路径要过**窗口 + 冷却**（与 decideAutoSwitch 共用同一个判据）。
     // ⚠️ 这里拿 `now` 当"被限流的时刻"：调用方传 `'throttled'` 就等于告诉我们这次失败就是限流，
@@ -503,9 +501,26 @@ export function apply(ctx: any, config: Config = {}): void {
     if (kind === 'throttled' && !isThrottleSwitchAllowed({ throttledAt: now, lastSwitchAt: lastSwitchedAt, now })) {
       return false
     }
-    const fresh = freshThrottledIds(throttleAt, now)
-    const accounts = listAccounts().filter((account) => !autoSwitchSkip.has(account.id))
-    return pickNextAccount(accounts as SwitchableAccount[], activeAccountId(), now, fresh) !== undefined
+    // 'auth'（凭证被服务端作废）**刻意不过**窗口 / 冷却：那是永久性坏状态，等多久都不会自己好，
+    // 与"限流"（等一下会好）语义正好相反。死号越早换掉越好。
+    const candidate = hasFailoverCandidate({
+      minutes,
+      switching: autoSwitching,
+      accounts: listAccounts().filter((account) => !autoSwitchSkip.has(account.id)) as SwitchableAccount[],
+      currentId: activeAccountId(),
+      now,
+      excludeIds: freshThrottledIds(throttleAt, now),
+    })
+    if (!candidate) {
+      // 把"为什么没换"写清楚 —— 用户报的正是"这个报错不会自动切换账号"，
+      // 而原因有三种（关着 / 正在切 / 没有别的可用号），日志里必须能分开，别让人再猜一次。
+      logger.info?.(
+        `deepseek-web: 本次 ${kind ?? '未知'} 失败无法换号（自动换号=${
+          Number.isFinite(minutes) && minutes > 0 ? `${minutes} 分钟` : '关闭'
+        }${autoSwitching ? '，正在切换中' : ''}）—— 不重试，交给用户处理`,
+      )
+    }
+    return candidate
   }
 
   // 上下文投喂方式（2026-09-14）：设置页保存的值优先于 cordis config，即时生效无需重启。

@@ -247,6 +247,30 @@ const THROTTLE_JITTER_RATIO = 0.3
 export const MAX_THROTTLE_RETRY_MS = Math.round(THROTTLE_MAX_MS * (1 + THROTTLE_JITTER_RATIO))
 
 /**
+ * AUTH 失败、**能换号**时给的重试间隔。
+ *
+ * 为什么要等（而不用 `FAILOVER_RETRY_MS` 的 2 秒）：宿主对"被服务端判 AUTH"的账号会先做一次
+ * **只读复核探活**，复核确认失效才写 `lastVerifyError`（判据见 `index.ts` 的 AUTH 分支）。实测
+ * 那一次探活 0.9~3.5 秒。重发太早 ⇒ 换号检查点还没看见标记 ⇒ 又拿同一个死号发一次，白跑一轮。
+ *
+ * ⚠️ 必须 ≤ 适配器声明的 `maxDelayMs`（`MAX_THROTTLE_RETRY_MS`，117s），否则重试直接被放弃。
+ */
+export const AUTH_FAILOVER_RETRY_MS = 5_000
+
+/**
+ * AUTH 失败、**没得换号**时给的退避 —— 故意给到 `maxDelayMs` 之上。
+ *
+ * 🔴 这是"条件式可重试"的实现方式：把 AUTH 放进 `retryableCodes` 之后，
+ * **没有别的号可用时重试一个已失效的凭证只会白打请求**（还多暴露在风控下），
+ * 所以不靠"码"来区分，而是靠这条**判据**：
+ * "要的延迟 (600s) > maxDelayMs (117s) 且 normal ⇒ dsh-llm-retry 直接放弃重试"。
+ * ⇒ 默认没开自动换号的用户，行为与加这个功能之前**完全一致**。
+ *
+ * 实测来源：这条判据第一次被踩到是 2026-09-27（限流退避 49208 > 10000 ⇒ 一次都没重试）。
+ */
+export const AUTH_GIVEUP_RETRY_MS = 600_000
+
+/**
  * 取下一次节流退避（ms）。
  *
  * ⚠️ 实际的**首档是 40s，不是 20s**：`noteThrottled` 先把 `throttleStreak` 加一，
@@ -1355,7 +1379,7 @@ export interface SseStateOptions {
    * 上限是 10 秒 ⇒ **一次都不重试**、整轮以 error 结束 ⇒ 用户得手点「继续」；
    * 而"能换号"的那套逻辑当时只挂在 HTTP 路径上，SSE（节流最常见的形态）根本走不到。
    */
-  canFailover?: (kind?: 'muted' | 'throttled') => boolean
+  canFailover?: (kind?: 'muted' | 'throttled' | 'auth') => boolean
 }
 
 /** F28：思考的标准包装标签。孤儿兜底用（见 finish 里的判据）。 */
@@ -2049,8 +2073,11 @@ export interface CompletionParams {
    *  - false ⇒ 保持 0.4.0 之前的行为：把解除时间当退避（几小时）⇒ 重试策略直接放弃，不做无用的空转。
    *
    * ⚠️ 不注入 ⇒ 行为与以前完全一致。宿主返回异常时按 false 处理（保守）。
+   *
+   * 三种 `kind`：`'muted'`（封禁）／`'throttled'`（限流）／`'auth'`（凭证被服务端作废）。
+   * `'auth'` 是 0.6.8 加的：死号比限流更该换 —— 限流等一下会自己好，死号等多久都没用。
    */
-  canFailover?: (kind?: 'muted' | 'throttled') => boolean
+  canFailover?: (kind?: 'muted' | 'throttled' | 'auth') => boolean
 }
 
 /**
@@ -2082,7 +2109,7 @@ const defaultTransport: CompletionTransport = { createSession: createChatSession
  * 问不出来（没注入 / 抛错）时按**不能**处理 —— 保守方向：宁可让用户多点一次「继续」，
  * 也不要给一个它其实接不上的短退避（那只会更快地撞同一个限流）。
  */
-function makeCanFailover(params: CompletionParams): (kind?: 'muted' | 'throttled') => boolean {
+function makeCanFailover(params: CompletionParams): (kind?: 'muted' | 'throttled' | 'auth') => boolean {
   return (kind) => {
     try {
       return params.canFailover?.(kind) === true
@@ -2206,10 +2233,24 @@ async function openCompletion(
             : ''
       retireSession(sessionId) // 失败即弃，下次换新会话
       params.onDeleteSession?.(sessionId)
+      // 0.6.8：AUTH（HTTP 401/403）也走"能不能换号"这条判据 ——
+      // 能换号 ⇒ 5s 后重发，由重发前的检查点换上可用账号，整轮自己接下去（用户不用手点「继续」）；
+      // 不能 ⇒ 10 分钟（> maxDelayMs）⇒ 重试策略直接放弃，行为与加这个功能之前一致。
+      const authRetryAfterMs =
+        code === 'AUTH' ? (canFailover('auth') ? AUTH_FAILOVER_RETRY_MS : AUTH_GIVEUP_RETRY_MS) : undefined
       throw new AdapterLlmError(
         `DeepSeek web completion failed (HTTP ${resp.status})${text ? `: ${text.slice(0, 200)}` : ''}${hint}`,
         code,
-        { status: resp.status, ...(retryAfter !== undefined ? { providerRetryAfterMs: retryAfter } : {}), cause: new Error(text) },
+        {
+          status: resp.status,
+          // 服务端给了 Retry-After 就以它为准（那是它自己说的解除时间）；没给才用我们的两档。
+          ...(retryAfter !== undefined
+            ? { providerRetryAfterMs: retryAfter }
+            : authRetryAfterMs !== undefined
+              ? { providerRetryAfterMs: authRetryAfterMs }
+              : {}),
+          cause: new Error(text),
+        },
       )
     }
     if (!resp.body) {
@@ -2242,6 +2283,17 @@ async function openCompletion(
     // 结果认了码却没带 providerRetryAfterMs（用例当场抓住）。两条来源的后续处理完全一样。
     const throttled = !muted && !busy && !!biz && (biz.code === 40029 || isThrottled(biz.msg))
     const untilMs = muteUntilMs(parsed)
+    // 失败码先算出来 —— 下面 AUTH 那一档要用它判断"这次到底是不是授权失效"
+    // （信封里的 40003/40001，HTTP 可能仍是 200）。0.6.8：AUTH 的退避改为条件式。
+    const failureCode = !biz
+      ? 'MALFORMED_RESPONSE'
+      : muted || busy || throttled
+        ? 'RATE_LIMIT'
+        : isInvalidSessionError(biz)
+          ? 'TRANSPORT'
+          : isInvalidRefFileError(biz)
+            ? 'INVALID_REF_FILE'
+            : bizErrorCode(biz.code)
     const failure = biz
       ? new AdapterLlmError(
           muted
@@ -2251,13 +2303,7 @@ async function openCompletion(
               : throttled
                 ? '网页版限流：发得太频繁，稍后自动重试'
                 : bizErrorMessage(biz.code, biz.msg),
-          muted || busy || throttled
-            ? 'RATE_LIMIT'
-            : isInvalidSessionError(biz)
-              ? 'TRANSPORT'
-              : isInvalidRefFileError(biz)
-                ? 'INVALID_REF_FILE'
-                : bizErrorCode(biz.code),
+          failureCode,
           {
             status: resp.status,
             // 解除时间远大于重试策略的上限 → dsh-llm-retry 会直接放弃重试（而不是空转打请求）
@@ -2270,6 +2316,11 @@ async function openCompletion(
               : {}),
             // 绝对值单独带一份：宿主会把它记到账号上，在设置页显示倒计时
             ...(muted && untilMs !== undefined ? { mutedUntilMs: untilMs } : {}),
+            // 0.6.8 授权失效（信封里的 40003/40001）：与 HTTP 401 那条同样处理 ——
+            // 能换号 ⇒ 5s 后重发（检查点换号接上）；不能 ⇒ 600s > maxDelayMs ⇒ 直接放弃重试。
+            ...(failureCode === 'AUTH'
+              ? { providerRetryAfterMs: canFailover('auth') ? AUTH_FAILOVER_RETRY_MS : AUTH_GIVEUP_RETRY_MS }
+              : {}),
             ...(busy ? { providerRetryAfterMs: 5_000 } : {}),
             // 节流：能换号给 2s（让重试立刻发生），否则 20s（HTTP 路径的定值；
             // SSE 路径走渐长的 throttleRetryAfterMs，首档 40s —— 两条路都受同一个

@@ -150,6 +150,31 @@ export function pickNextAccount(
   return usable[(index + 1) % usable.length]?.id
 }
 
+/**
+ * 「这次失败能不能靠**换个号**接着干」—— `canFailover` 的纯判据（宿主三种 kind 共用同一条）。
+ *
+ * 抽出来是为了能单测：`canFailover` 本身是 `apply()` 里的闭包，拿不到；而这条判据正是
+ * 「自动换号没生效」类故障最该被守住的地方（0.6.8 的实测现场：凭证被服务端作废，
+ * 报 AUTH 之后一直不换号）。
+ *
+ * 三条边界都实测踩过：
+ *  - 自动换号关着（`minutes <= 0`）⇒ **不是**能换号（默认关闭的语义就是"别偷偷把我换到别的号上"）。
+ *  - 正在切换 ⇒ 不是（别叠加）。
+ *  - 候选里没有**别的**可用账号 ⇒ 不是（切了还是自己，白等一轮）。
+ */
+export function hasFailoverCandidate(params: {
+  minutes: number
+  switching: boolean
+  accounts: readonly SwitchableAccount[]
+  currentId: string | undefined
+  now: number
+  excludeIds?: ReadonlySet<string>
+}): boolean {
+  if (!Number.isFinite(params.minutes) || params.minutes <= 0) return false
+  if (params.switching) return false
+  return pickNextAccount(params.accounts, params.currentId, params.now, params.excludeIds) !== undefined
+}
+
 /** 决策结果 —— 带 reason 是为了让日志能说清"这次为什么没切/为什么切"。 */
 export type AutoSwitchDecision =
   | {

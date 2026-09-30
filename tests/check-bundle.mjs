@@ -120,6 +120,24 @@ const checks = {
     /providerRetryPolicy\([^)]*\)\s*\{\s*return RETRY_POLICY/.test(host),
   'host 的重试策略上限覆盖了我们的最大限流退避（只改一边就会又"放弃重试"）':
     /maxDelayMs:\s*MAX_THROTTLE_RETRY_MS/.test(host),
+  // 0.6.8：凭证被服务端作废（AUTH）之后"自己换号接下去"依赖这三处接线。
+  // 少任何一处 ⇒ 那一条路径上 AUTH 只会报错停住（现场：只能手动切号）。
+  // ⚠️ 数量断言而不是"存在即可"：三条路径各在一处，只接一条正是最容易犯的漏（见记忆里的
+  //    "新增分类判据后每个消费点都要跟着改"）。
+  'host 的三处 AUTH 抛出点都接了 canFailover("auth")（HTTP 401 / 信封 40003 / 已知失效拦截）':
+    // ⚠️ 两种调用形态都要认：webapi 里是本地闭包 `canFailover("auth")`，
+    //    adapter 里是可选注入 `canFailover?.("auth")`。只写 `?.` 会把前两处漏掉。
+    (host.match(/canFailover\??\.?\("auth"\)/g) ?? []).length >= 3,
+  'host 里两档 AUTH 退避的语义没写反（换号那档比放弃那档小）':
+    (() => {
+      const num = (name) => {
+        const m = new RegExp('const ' + name + ' = ([\\d_]+)').exec(host)
+        return m ? Number(m[1].replace(/_/g, '')) : NaN
+      }
+      const swap = num('AUTH_FAILOVER_RETRY_MS')
+      const giveup = num('AUTH_GIVEUP_RETRY_MS')
+      return Number.isFinite(swap) && Number.isFinite(giveup) && swap > 0 && giveup > swap
+    })(),
   // 0.6.5：策略字段必须是**扁平**的。0.6.3 写成了 `backoff: {…}` 嵌套，而 adapter 返回的对象
   // **不经 dsh-llm 的 resolveRetryPolicy 规范化** ⇒ 三个延迟字段在运行期全是 undefined
   // ⇒ 本地退避算出 NaN ⇒ 事件写不进会话日志（DSH 拒收非有限数）⇒ **整轮 UNKNOWN 报错死掉**。
@@ -158,6 +176,9 @@ const checks = {
         policy.maxRetries === 5 &&
         Array.isArray(policy.retryableCodes) &&
         policy.retryableCodes.includes('RATE_LIMIT') &&
+        // 0.6.8：AUTH 也要在列。少了它 ⇒ 那条"能换号就 5s 重发"的短退避永远走不到
+        // ⇒ 死号上只会报错停住（现场：凭证被服务端作废后只能手动切号）。
+        policy.retryableCodes.includes('AUTH') &&
         // 上限必须比 dsh-llm 的默认 10s 更宽，且覆盖现场实测的 49208（否则又会"放弃重试"）
         policy.maxDelayMs > 10_000 &&
         policy.maxDelayMs >= 49_208 &&
