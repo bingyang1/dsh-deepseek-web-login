@@ -31,6 +31,7 @@ const {
   resetContextMode,
   writeContextModeSetting,
   needsFreshSession,
+  effectiveReuseLimit,
 } = await import('../src/context-feed.ts')
 
 let failed = 0
@@ -380,6 +381,14 @@ test('续链（有父消息）⇒ 不能换会话，换了父链就断了', () =
 })
 test('父消息 id 为 0 也算"有父"（别用 truthy 判）', () => {
   assert.equal(needsFreshSession({ parentMessageId: 0 }, true, 'chained'), false)
+})
+test('链式模式下不按轮数轮换会话（轮换＝定期清上下文）', () => {
+  assert.equal(effectiveReuseLimit(20, 'chained'), Number.POSITIVE_INFINITY)
+  assert.equal(effectiveReuseLimit(20, 'full'), 20)
+})
+test('用户显式关掉复用（0）时不改写他 —— 链式下也一样', () => {
+  assert.equal(effectiveReuseLimit(0, 'chained'), 0)
+  assert.equal(effectiveReuseLimit(0, 'full'), 0)
 })
 test('全量模式：即使要发根消息也不换会话（否则每轮多建+多删一个会话）', () => {
   assert.equal(needsFreshSession({ parentMessageId: null }, true, 'full'), false)

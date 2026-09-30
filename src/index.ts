@@ -51,6 +51,7 @@ import { beginAddAccount, beginRelogin, commitCapturedAuth, endAddAccount, endRe
 import {
   validateAuth,
   createSessionCleaner,
+  clearLiveSession,
   currentFetch,
   contextChainInfo,
   resetContextChain,
@@ -554,6 +555,9 @@ export function apply(ctx: any, config: Config = {}): void {
 
   // 清理参数在上面（闸门之前）已经算好并传进闸门了，这里直接用。
   const sessionCleaner = createSessionCleaner({
+    // 链式投喂下**只手动清理**（0.6.11）：会话是链的载体，自动删就等于替用户清上下文。
+    // 全量模式保持原来的自动清理（每轮都是根消息，会话只是壳）。
+    manualOnly: contextMode === 'chained',
     policy: {
       mode: cleanupMode,
       delayMs: cleanupMode === 'immediate' ? 1_500 : (config.sessionCleanupDelayMs ?? DEFAULT_SESSION_CLEANUP.delayMs),
@@ -1339,6 +1343,8 @@ export function apply(ctx: any, config: Config = {}): void {
                 persisted = false
               }
               logger.info?.(`deepseek-web: 上下文投喂切换为 ${contextMode}`)
+              // 清理策略跟着模式走：链式 ⇒ 只手动清（自动删会顺手清掉链的上下文）。
+              sessionCleaner.setManualOnly(contextMode === 'chained')
               sendJson(res, 200, {
                 ok: true,
                 mode: contextMode,
@@ -1346,6 +1352,24 @@ export function apply(ctx: any, config: Config = {}): void {
                 hint: CONTEXT_MODE_HINT,
                 settingsPath: contextModeSettingsPath(),
                 chain: contextMode === 'chained' ? (contextChainInfo() ?? null) : null,
+                pendingCleanup: sessionCleaner.pendingCount(),
+              })
+              return
+            }
+
+            // 手动清理（0.6.11）：退掉当前在用的会话 + 立刻把待删队列清干净。
+            // 链式模式下自动清理是关的，用户想"现在就把网页端弄干净"就点面板那颗按钮。
+            if (req.method === 'POST' && route === '/cleanup') {
+              const live = clearLiveSession()
+              const auth = getAuth()
+              if (live && auth) sessionCleaner.schedule(auth as WebAuth, live)
+              await sessionCleaner.flush()
+              logger.info?.(`deepseek-web: 手动清理完成（live=${live ?? '无'}，队列已清空）`)
+              sendJson(res, 200, {
+                ok: true,
+                cleared: live ?? null,
+                pending: sessionCleaner.pendingCount(),
+                mode: contextMode,
               })
               return
             }

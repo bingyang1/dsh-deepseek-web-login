@@ -32,7 +32,7 @@ import {
   type CleanupRange,
 } from './gate.ts'
 // 上下文投喂方式（全量 / 链式增量）——决策是纯函数，见 context-feed.ts 的模块注释。
-import { currentContextMode, decideFeed, needsFreshSession, type ChainState, type FeedDecision, type FeedReason } from './context-feed.ts'
+import { currentContextMode, decideFeed, effectiveReuseLimit, needsFreshSession, type ChainState, type FeedDecision, type FeedReason } from './context-feed.ts'
 
 export const DS_BASE = 'https://chat.deepseek.com'
 
@@ -791,6 +791,8 @@ function emitSessionLifecycle(event: SessionLifecycleEvent): void {
 
 export interface SessionCleanerOptions {
   policy?: Partial<SessionCleanupPolicy>
+  /** 一开始就只手动清理（宿主在链式模式下启动时传 true）。 */
+  manualOnly?: boolean
   logger?: { info?: (msg: string) => void; debug?: (msg: string) => void }
   /** 单测注入。 */
   fetchImpl?: typeof fetch
@@ -802,12 +804,20 @@ export interface SessionCleanerOptions {
 
 export interface SessionCleaner {
   schedule(auth: WebAuth, sessionId: string): void
-  /** 立即清理队列（测试 / 卸载时用）。 */
+  /** 立即清理队列（测试 / 面板「立即清理」/ 卸载时用）。**手动调用不受 manualOnly 限制**。 */
   flush(): Promise<void>
   pendingCount(): number
   policy(): SessionCleanupPolicy
   /** 运行时改策略（设置页保存后调用），返回改完后的值。 */
   configure(next: Partial<SessionCleanupPolicy>): SessionCleanupPolicy
+  /**
+   * 只手动清理：不再自动到点删队列（0.6.11）。
+   *
+   * 链式投喂下必须打开 —— 会话是链的载体，自动删就等于替用户清上下文。
+   * 关掉它（全量模式）时回到原来的"延迟/立即"自动清理。
+   * ⚠️ 它只拦**自动**那一路：`flush()` 是显式动作，任何时候照样执行。
+   */
+  setManualOnly(value: boolean): void
 }
 
 export function createSessionCleaner(options: SessionCleanerOptions = {}): SessionCleaner {
@@ -849,6 +859,8 @@ export function createSessionCleaner(options: SessionCleanerOptions = {}): Sessi
 
   let queue: { auth: WebAuth; sessionId: string }[] = []
   let timer: any
+  /** 只手动清理（链式投喂下由宿主打开）：见 `setManualOnly` 的说明。 */
+  let manualOnly = options.manualOnly === true
   /** 探测到服务端不接受批量删除后置位 —— 之后一律逐个删，不再浪费请求。 */
   let batchUnsupported = false
 
@@ -894,6 +906,8 @@ export function createSessionCleaner(options: SessionCleanerOptions = {}): Sessi
   function armTimer(): void {
     if (timer !== undefined) return
     if (policy.mode === 'keep') return
+    // 手动模式（链式投喂）：只攒着，等面板上那一下「立即清理」。
+    if (manualOnly) return
     timer = setT(() => {
       void flush()
     }, Math.max(0, policy.delayMs))
@@ -1095,6 +1109,16 @@ export function createSessionCleaner(options: SessionCleanerOptions = {}): Sessi
     pendingCount: () => queue.length,
     policy: () => ({ ...policy }),
     configure,
+    setManualOnly: (value: boolean) => {
+      manualOnly = value === true
+      // 从"自动"切到"手动"时把已经装好的定时器撤掉，否则它到点仍会删一轮。
+      if (manualOnly && timer !== undefined) {
+        clearT(timer)
+        timer = undefined
+      }
+      // 从"手动"切回"自动"时把表重新装上（队列里可能已经攒着东西了）。
+      if (!manualOnly) armTimer()
+    },
   }
 }
 
@@ -1105,6 +1129,23 @@ const defaultCleaner = createSessionCleaner({
 
 export function scheduleDeleteSession(auth: WebAuth, sessionId: string): void {
   defaultCleaner.schedule(auth, sessionId)
+}
+
+/**
+ * 「立即清理」用：把**当前在用的**网页端会话连同投喂链一起退掉，返回被退的会话 id。
+ *
+ * 为什么要有它：链式模式下不自动清理（会话就是链的载体），但用户总得有个"我现在就要
+ * 把网页端清干净"的动作 —— 那就是面板上那颗按钮。退掉之后下一轮会新建一个干净会话、
+ * 重新当链首（全量发一次），从用户视角就是"上下文从这里重新开始"。
+ *
+ * 只**退**不**删**：删除交给清理器（`flush()`）去做，这样"删"这条路仍然只有一个出口，
+ * 也便于失败重试与落盘台账。
+ */
+export function clearLiveSession(): string | undefined {
+  const id = reuseSlot?.sessionId ?? contextChain?.sessionId
+  if (!id) return undefined
+  retireSession(id)
+  return id
 }
 
 /** 验证登录态：优先 users/current，端点不存在时退回 PoW challenge 探活。 */
@@ -1950,7 +1991,9 @@ async function leaseSession(
 ): Promise<SessionLease> {
   signal.throwIfAborted()
   const key = accountKey(auth)
-  const limit = Number.isFinite(maxTurns) ? Math.max(0, Math.floor(maxTurns)) : DEFAULT_SESSION_REUSE_TURNS
+  const configured = Number.isFinite(maxTurns) ? Math.max(0, Math.floor(maxTurns)) : DEFAULT_SESSION_REUSE_TURNS
+  // 链式模式下不轮换（会话就是链的载体，轮换＝定期清上下文）—— 判据是纯函数，有用例。
+  const limit = effectiveReuseLimit(configured, currentContextMode())
   // 关闭复用：每次都要新会话（调用方会自己回收）
   if (limit === 0) return { sessionId: await transport.createSession(auth, signal), reused: false }
   if (!forceNew && reuseSlot && reuseSlot.key === key && reuseSlot.turns < limit) {
@@ -2395,7 +2438,12 @@ export async function* streamWebCompletion(
   // SSE 路径也要问「还能不能换号」（与 openCompletion 同一个判据）：节流的退避长短由它决定。
   const canFailover = makeCanFailover(params)
   const rawLimit = params.sessionReuseTurns ?? DEFAULT_SESSION_REUSE_TURNS
-  const limit = Number.isFinite(rawLimit) ? Math.max(0, Math.floor(rawLimit)) : DEFAULT_SESSION_REUSE_TURNS
+  // 与 leaseSession 同一判据（链式不轮换）：这里决定"跑完的那一轮要不要放过承载链的会话"，
+  // 两边算法不一致的话会出现"租用说不轮换、收尾却把它删了"。
+  const limit = effectiveReuseLimit(
+    Number.isFinite(rawLimit) ? Math.max(0, Math.floor(rawLimit)) : DEFAULT_SESSION_REUSE_TURNS,
+    currentContextMode(),
+  )
 
   let release: (() => void) | undefined
   let sessionId: string | undefined

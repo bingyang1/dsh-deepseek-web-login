@@ -1958,6 +1958,30 @@ function Panel(): any {
       cleanupRow.append(btn)
     }
     gateCard.append(cleanupRow)
+    // 手动清理（0.6.11）：链式投喂下自动清理是关的（会话就是链的载体，自动删等于替你清上下文），
+    // 所以必须给一个"现在就把网页端弄干净"的动作。
+    const cleanupNowRow = el('div', 'dsw-gate-row')
+    cleanupNowRow.append(el('span', 'dsw-gate-label', '立即清理'))
+    const cleanupNowBtn = el('button', 'dsw-btn ghost', '清掉当前网页端会话') as HTMLButtonElement
+    const cleanupNowHint = el('span', 'dsw-hint', '')
+    cleanupNowBtn.addEventListener('click', () => {
+      cleanupNowBtn.disabled = true
+      cleanupNowHint.textContent = '清理中…'
+      void api('/cleanup', { method: 'POST', body: '{}' })
+        .then((result: any) => {
+          cleanupNowHint.textContent = result?.cleared
+            ? `已退出会话 ${String(result.cleared).slice(0, 8)}…，队列剩 ${result?.pending ?? 0} 个；下一轮会重新当链首（全量发一次）`
+            : `没有在用会话；队列剩 ${result?.pending ?? 0} 个`
+        })
+        .catch((error: any) => {
+          cleanupNowHint.textContent = `清理失败：${error?.message ?? error}`
+        })
+        .finally(() => {
+          cleanupNowBtn.disabled = false
+        })
+    })
+    cleanupNowRow.append(cleanupNowBtn, cleanupNowHint)
+    gateCard.append(cleanupNowRow)
     const cleanupHint = el('p', 'dsw-hint', '')
     gateCard.append(cleanupHint)
 

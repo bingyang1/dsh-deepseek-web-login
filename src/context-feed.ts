@@ -131,6 +131,22 @@ export function needsFreshSession(
   return feed.parentMessageId === null && reused
 }
 
+/**
+ * 会话复用上限：链式模式下**不按轮数轮换**。
+ *
+ * 🔴 2026-09-30 用户报"链式还没结束就已经清理了，当然网页版上面不会有上下文"：
+ * 全量模式下按 `sessionReuseTurns`（默认 20）轮换是对的 —— 每轮都是根消息，会话只是"壳"，
+ * 换一个不丢任何东西。但**链式模式下会话就是链的载体**：轮换 = 定期把上下文清掉，
+ * 模型那边真的会断。所以链式模式下上限取 ∞，要清只有两条明路：
+ * 面板的「立即清理」，或者链断了（换窗口/head 变了/失败退役）时自动换新。
+ *
+ * ⚠️ `maxTurns <= 0` 是用户**显式**关掉复用（每次新会话）⇒ 不改写他，链式下自然也用不上。
+ */
+export function effectiveReuseLimit(maxTurns: number, mode: ContextMode): number {
+  if (!(maxTurns > 0)) return maxTurns
+  return mode === 'chained' ? Number.POSITIVE_INFINITY : maxTurns
+}
+
 /** 严格前缀：prev 是 next 的前缀（含相等时不算"追加"）。 */
 function isStrictPrefix(prev: readonly string[], next: readonly string[]): boolean {
   if (next.length <= prev.length) return false

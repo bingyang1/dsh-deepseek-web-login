@@ -331,6 +331,57 @@ await test('F07：同一账号的一批仍然走批量（1 个请求删多个）
   assert.equal(batched[0].body.chat_session_ids.length, 3)
 })
 
+// ── 0.6.11：链式投喂下"只手动清理" ─────────────────────────────────────────
+// 现场：用户报"链式还没结束就已经清理了，当然网页版上面不会有上下文"。
+// 链式模式下会话就是链的载体 ⇒ 自动删＝替用户清上下文。所以那条路必须只手动。
+await test('manualOnly：到点也**不**自动删（队列攒着等人来点）', async () => {
+  const fetchImpl = fakeFetch()
+  const cleaner = createSessionCleaner({
+    policy: { mode: 'deferred', delayMs: 0, batchSize: 5, gapMs: 0 },
+    manualOnly: true,
+    fetchImpl,
+  })
+  cleaner.schedule(AUTH, 'sess-1')
+  await tick()
+  await tick()
+  assert.equal(fetchImpl.calls.length, 0, '自动路径不许发删除请求')
+  assert.equal(cleaner.pendingCount(), 1, '队列应攒着')
+  // 显式动作用户点的按钮：照样要能清掉（manualOnly 只拦自动那一路）
+  await cleaner.flush()
+  assert.equal(cleaner.pendingCount(), 0, '手动 flush 必须真的清空')
+  assert.ok(fetchImpl.calls.length > 0, '手动清理必须真的发删除请求')
+})
+
+await test('setManualOnly(false)：切回自动后，攒着的队列会被到点清理', async () => {
+  const fetchImpl = fakeFetch()
+  const cleaner = createSessionCleaner({
+    policy: { mode: 'deferred', delayMs: 0, batchSize: 5, gapMs: 0 },
+    manualOnly: true,
+    fetchImpl,
+  })
+  cleaner.schedule(AUTH, 'sess-2')
+  await tick()
+  assert.equal(fetchImpl.calls.length, 0)
+  cleaner.setManualOnly(false)
+  await tick()
+  await tick()
+  assert.ok(fetchImpl.calls.length > 0, '切回自动后应把攒着的清掉')
+})
+
+await test('setManualOnly(true)：已装好的定时器要被撤掉（否则到点仍会删一轮）', async () => {
+  const fetchImpl = fakeFetch()
+  const cleaner = createSessionCleaner({
+    policy: { mode: 'deferred', delayMs: 5_000, batchSize: 5, gapMs: 0 },
+    fetchImpl,
+  })
+  cleaner.schedule(AUTH, 'sess-3')
+  cleaner.setManualOnly(true)
+  await tick()
+  await tick()
+  assert.equal(fetchImpl.calls.length, 0, '撤表之后不许再自动删')
+  assert.equal(cleaner.pendingCount(), 1, '东西还在队列里，等手动清')
+})
+
 console.log()
 console.log(`通过 ${passed} 项${failures.length ? `，失败 ${failures.length} 项` : '，全部通过 OK'}`)
 for (const f of failures) console.log('  ' + f)
