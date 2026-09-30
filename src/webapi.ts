@@ -32,7 +32,7 @@ import {
   type CleanupRange,
 } from './gate.ts'
 // 上下文投喂方式（全量 / 链式增量）——决策是纯函数，见 context-feed.ts 的模块注释。
-import { currentContextMode, decideFeed, type ChainState, type FeedDecision, type FeedReason } from './context-feed.ts'
+import { currentContextMode, decideFeed, needsFreshSession, type ChainState, type FeedDecision, type FeedReason } from './context-feed.ts'
 
 export const DS_BASE = 'https://chat.deepseek.com'
 
@@ -1941,13 +1941,19 @@ async function leaseSession(
   transport: CompletionTransport,
   maxTurns: number,
   cleanup?: (id: string) => void,
+  /**
+   * 强制换一个新会话（0.6.10）。给"重开链"用：那时要发根消息，必须在一个干净会话里发
+   * （见 `context-feed.ts` 的 `needsFreshSession`）。走的是与"轮换"同一条路 ——
+   * 建新会话 + 把它放进复用槽 + 把旧槽交回给它自己的 cleanup。
+   */
+  forceNew = false,
 ): Promise<SessionLease> {
   signal.throwIfAborted()
   const key = accountKey(auth)
   const limit = Number.isFinite(maxTurns) ? Math.max(0, Math.floor(maxTurns)) : DEFAULT_SESSION_REUSE_TURNS
   // 关闭复用：每次都要新会话（调用方会自己回收）
   if (limit === 0) return { sessionId: await transport.createSession(auth, signal), reused: false }
-  if (reuseSlot && reuseSlot.key === key && reuseSlot.turns < limit) {
+  if (!forceNew && reuseSlot && reuseSlot.key === key && reuseSlot.turns < limit) {
     reuseSlot.turns += 1
     return { sessionId: reuseSlot.sessionId, reused: true }
   }
@@ -2128,32 +2134,52 @@ async function openCompletion(
   let lastFailure: AdapterLlmError | undefined
   const canFailover = makeCanFailover(params)
   for (let attempt = 0; attempt < 2; attempt++) {
-    const lease = await leaseSession(
+    let lease = await leaseSession(
       auth,
       signal,
       transport,
       params.sessionReuseTurns ?? DEFAULT_SESSION_REUSE_TURNS,
       params.onDeleteSession,
     )
-    const sessionId = lease.sessionId
     // 链式投喂：决定本轮发全量还是增量、parent 指向谁。判据在 context-feed.ts（纯函数）：
     // 模式=chained 且「复用了同一会话 + 条目严格追加 + 头部/账号都没变」才发增量，
     // 任何一条不满足都退回全量 + parent=null（= 0.1.61 及以前的行为）。
-    const feed = decideFeed({
-      mode: currentContextMode(),
-      ...(params.promptParts
-        ? {
-            head: params.promptParts.head,
-            entries: params.promptParts.entries,
-            ...(params.promptParts.maxChars !== undefined ? { maxChars: params.promptParts.maxChars } : {}),
-          }
-        : {}),
-      full: params.prompt,
-      sessionId,
-      accountKey: accountKey(auth),
-      reused: lease.reused,
-      ...(contextChain ? { chain: contextChain } : {}),
-    })
+    const planFeed = (sessionId: string, reused: boolean) =>
+      decideFeed({
+        mode: currentContextMode(),
+        ...(params.promptParts
+          ? {
+              head: params.promptParts.head,
+              entries: params.promptParts.entries,
+              ...(params.promptParts.maxChars !== undefined ? { maxChars: params.promptParts.maxChars } : {}),
+            }
+          : {}),
+        full: params.prompt,
+        sessionId,
+        accountKey: accountKey(auth),
+        reused,
+        ...(contextChain ? { chain: contextChain } : {}),
+      })
+    let feed = planFeed(lease.sessionId, lease.reused)
+    // 0.6.10：**重开链（parent=null）不能在"复用来的"会话里发根消息** —— 那会在同一个网页端
+    // 会话里造出同一条消息的兄弟分支（网页端显示成「修改 / 重新生成」+ `n / n`），
+    // 用户看到的就是"换个窗口聊天又把上下文清了一遍"。判据是纯函数，有用例守。
+    if (needsFreshSession(feed, lease.reused, currentContextMode())) {
+      // ⚠️ 保留**原来那个** reason 再重算：重算时 `reused` 已是 false，会得到 'new-session'，
+      // 那会把真正的原因（not-appended / head-changed / session-changed…）从日志里抹掉 ——
+      // 而"这一轮为什么没走增量"正是这个回执存在的唯一理由。
+      const reason = feed.reason
+      lease = await leaseSession(
+        auth,
+        signal,
+        transport,
+        params.sessionReuseTurns ?? DEFAULT_SESSION_REUSE_TURNS,
+        params.onDeleteSession,
+        true,
+      )
+      feed = { ...planFeed(lease.sessionId, lease.reused), reason }
+    }
+    const sessionId = lease.sessionId
     // 决策回执（0.1.63）：只在原因变化时上报一次，让日志能回答"这一轮为什么没走增量"。
     if (feed.reason !== lastFeedReason) {
       lastFeedReason = feed.reason

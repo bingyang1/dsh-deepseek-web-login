@@ -103,6 +103,34 @@ export interface FeedDecision {
   reason: FeedReason
 }
 
+/**
+ * 这一轮要不要**换一个干净会话**。
+ *
+ * 🔴 2026-09-30 实测的坑（用户报"换个窗口聊天就把上下文清理一次"）：
+ * 重开链时发的是 `parent_message_id: null`（根消息）；如果那时用的还是**复用来的**会话，
+ * 就等于往一个**已经有内容**的网页端会话里又塞了一个根 —— 网页端把它渲染成同一条消息的
+ * 多个兄弟版本（带「修改 / 重新生成」入口和 `n / n` 翻页），而那条消息恰好是我们那份巨大的
+ * 提示词 ⇒ 界面上看起来就是"同一段提示词被改了好几遍、上下文被清了一次"。
+ * 触发重开链的原因很多（`FeedReason` 那几种：换窗口导致历史不是严格追加、head 变了、
+ * 会话轮换、同一步重试……），日常使用里**经常**走到。
+ *
+ * 判据：**要发根消息 + 当前会话是复用来的 ⇒ 换新会话**。重开链的语义本来就是"从干净上下文
+ * 重新开始"，那就该配一个干净会话（旧会话交回给它自己的清理）。
+ * 本来就是新会话（`reused === false`）时**不重复换**，否则每轮都白建一个。
+ */
+export function needsFreshSession(
+  feed: Pick<FeedDecision, 'parentMessageId'>,
+  reused: boolean,
+  mode: ContextMode,
+): boolean {
+  // ⚠️ **只在链式模式下生效**。全量模式里"每轮都是根消息"本来就是常态，
+  // 若也一律换新会话，就变成**每轮多建 + 多删一个会话**（+2 个请求/轮）——
+  // 请求密度本身就是风控关注点，不能为了一个只有链式模式才有的问题付这个代价。
+  // 链式模式下重开链是**异常路径**（换窗口/head 变了/会话轮换），代价可以接受。
+  if (mode !== 'chained') return false
+  return feed.parentMessageId === null && reused
+}
+
 /** 严格前缀：prev 是 next 的前缀（含相等时不算"追加"）。 */
 function isStrictPrefix(prev: readonly string[], next: readonly string[]): boolean {
   if (next.length <= prev.length) return false

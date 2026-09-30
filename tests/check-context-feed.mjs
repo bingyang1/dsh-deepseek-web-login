@@ -30,6 +30,7 @@ const {
   readContextModeSetting,
   resetContextMode,
   writeContextModeSetting,
+  needsFreshSession,
 } = await import('../src/context-feed.ts')
 
 let failed = 0
@@ -361,6 +362,39 @@ test('超预算被截断时：entries 仍是**未截断**的那份，full 才是
   assert.equal(parts.full, serializePrompt(huge))
   // 链式投喂要的就是这份未截断的条目（截断点在中间，切字符串会把位置算错）
   assert.ok(parts.entries.join('\n\n').length > parts.full.length)
+})
+
+// ── 0.6.10：重开链要不要换新会话 ──────────────────────────────────────────
+// 现场（2026-09-30，用户报"换个窗口聊天就把上下文清理一次"）：重开链发的是根消息
+// （parent=null），而那时用的还是**复用来的**会话 ⇒ 往一个有内容的会话里又塞一个根，
+// 网页端渲染成同一条消息的多个兄弟版本（「修改 / 重新生成」+ n/n 翻页）。
+test('要发根消息 + 会话是复用来的 ⇒ 必须换新会话', () => {
+  assert.equal(needsFreshSession({ parentMessageId: null }, true, 'chained'), true)
+})
+test('要发根消息但本来就是新会话 ⇒ 不重复换（否则每轮白建一个）', () => {
+  assert.equal(needsFreshSession({ parentMessageId: null }, false, 'chained'), false)
+})
+test('续链（有父消息）⇒ 不能换会话，换了父链就断了', () => {
+  assert.equal(needsFreshSession({ parentMessageId: 42 }, true, 'chained'), false)
+  assert.equal(needsFreshSession({ parentMessageId: 42 }, false, 'chained'), false)
+})
+test('父消息 id 为 0 也算"有父"（别用 truthy 判）', () => {
+  assert.equal(needsFreshSession({ parentMessageId: 0 }, true, 'chained'), false)
+})
+test('全量模式：即使要发根消息也不换会话（否则每轮多建+多删一个会话）', () => {
+  assert.equal(needsFreshSession({ parentMessageId: null }, true, 'full'), false)
+})
+// 「宿主真的调用了它」——判据写好了没人调，这个项目已经犯过两次。
+test('webapi 真的把这条判据接在重开链路径上（且用的是强制新会话那条租用）', () => {
+  const src = readFileSync(new URL('../src/webapi.ts', import.meta.url), 'utf8')
+  assert.ok(
+    /needsFreshSession\(\s*feed,\s*lease\.reused,\s*currentContextMode\(\)\s*\)/.test(src),
+    'webapi 必须调用 needsFreshSession（并把当前模式传进去）',
+  )
+  assert.ok(
+    /needsFreshSession\([\s\S]{0,300}?leaseSession\([\s\S]{0,300}?true,/.test(src),
+    '判定要换会话后，必须用 forceNew=true 重新租一个（否则只是原地打转）',
+  )
 })
 
 console.log(failed === 0 ? `\n通过 ${passed} 项，全部通过 ✅` : `\n通过 ${passed} 项，失败 ${failed} 项 ❌`)
