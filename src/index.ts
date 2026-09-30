@@ -48,6 +48,8 @@ import { decideAutoSwitch, freshThrottledIds, hasFailoverCandidate, isThrottleSw
 import { browserLogin, clearBrowserLoginProfile, findSystemBrowser } from './browser-login.ts'
 import { canOpenElectronWindow, clearLoginPartition, clearLoginState, closeLoginWindow, captureFromPartition, getFingerprintReport, getLastLoginResult, getLoginProgress, isLoginWindowOpen, loginWithToken, logout, openExternalLogin, openLoginWindow } from './login.ts'
 import { beginAddAccount, beginRelogin, commitCapturedAuth, endAddAccount, endRelogin } from './account-add.ts'
+// 自动重登（0.6.14）：凭证库 + "哪些号该重登"的判据都在 relogin.ts（纯逻辑，有离线用例）
+import { credentialForDisplay, readCredentialEntries, saveCredential, selectReloginTargets } from './relogin.ts'
 import {
   validateAuth,
   createSessionCleaner,
@@ -334,6 +336,9 @@ export function apply(ctx: any, config: Config = {}): void {
     autoSwitchMinutes: savedGate?.autoSwitchMinutes ?? DEFAULT_AUTO_SWITCH_MINUTES,
     // 工具调用是否允批量（**缺省＝串行**）。adapter 每轮序列化 prompt 时现读 ⇒ 改完即时生效。
     serialToolCalls: savedGate?.serialToolCalls !== false,
+    // 到期前自动重登（0.6.14）：**缺省关闭**（`=== true` 而不是 `!== false`）——
+    // 打开它会每约 2 小时静默起一次无头浏览器，这种事必须是用户明确点开的。
+    autoRelogin: savedGate?.autoRelogin === true,
     longRunBreakMs: savedGate?.longRunBreakMs,
     // ⚠️ 会话清理这几个字段必须**一起传**（2026-09-14 修）：设置页保存时写的是
     // `gate.settings()` 的返回值 —— 没存进闸门的字段会被**静默抹掉**，
@@ -569,6 +574,123 @@ export function apply(ctx: any, config: Config = {}): void {
     },
     logger,
   })
+
+  // ── 自动重登（0.6.14）：把"浏览器登录捕获到的凭证"校验并落库 ────────────────
+  //
+  // 与 `/login/browser` 那条路走**同一套**序列（0.1.82 的顺序不能颠倒）：
+  // 先 validate 拿身份 → 再 commit；校验通过才摘掉 unverified、才写 serverId（去重键）。
+  // 抽成函数是因为现在有三个入口要用它：浏览器登录、单条重登、批量重登。
+  async function commitBrowserAuth(
+    auth: WebAuth,
+    log: { info?: (m: string) => void; warn?: (m: string) => void },
+  ): Promise<{ recordId?: string; display?: string; verified: boolean; error?: string }> {
+    const check = await validateAuth(auth).catch(() => undefined)
+    const verified = !!check?.ok
+    const commitAuth = verified ? withVerifiedIdentity(auth, check?.user) : auth
+    const commit = commitCapturedAuth(commitAuth)
+    if (verified && check?.user && commit.recordId) {
+      const record = listAccounts().find((item) => item.id === commit.recordId)
+      const verifiedId =
+        typeof (check.user as { id?: unknown }).id === 'string' ? String((check.user as { id?: unknown }).id) : ''
+      updateAccount(commit.recordId, {
+        user: { ...(record?.user ?? {}), ...check.user },
+        ...(verifiedId ? { serverId: verifiedId } : {}),
+      })
+    }
+    if (!verified) log.warn?.(`deepseek-web: 捕获到的凭证未通过校验（${check?.error ?? '未知'}）`)
+    return {
+      ...(commit.recordId ? { recordId: commit.recordId } : {}),
+      ...(check?.user?.display ? { display: check.user.display } : {}),
+      verified,
+    }
+  }
+
+  /**
+   * 用存的邮箱密码自动重登**一条**账号（0.6.14）。
+   *
+   * 返回结构化结果而不是抛异常；失败时把原因写清楚，交给调用方决定话术
+   * （面板上"密码不对"和"被风控"要能区分开）。
+   */
+  async function autoReloginOne(
+    targetId: string,
+    log: { info?: (m: string) => void; warn?: (m: string) => void },
+  ): Promise<{ ok: boolean; message: string; display?: string; verified?: boolean; error?: string }> {
+    const target = readAccount(targetId)
+    if (!target) return { ok: false, message: '账号不存在（可能已被移除）', error: 'missing-account' }
+    const entry = credentialForDisplay(target.user?.display)
+    if (!entry) {
+      return {
+        ok: false,
+        message: `没有这条账号的邮箱密码凭证（${maskIdentifier(target.user?.display ?? target.id)}）——请用「登录新账号」补一次，或把密码加进凭证库`,
+        error: 'no-credential',
+      }
+    }
+    log.info?.(`deepseek-web: 自动重登 ${maskIdentifier(target.user?.display ?? target.id)} …`)
+    // 重登：先登记目标，捕获成功后由 commitCapturedAuth 写回**这一条**（不新增、不切换）
+    beginRelogin(targetId)
+    try {
+      const outcome = await browserLogin({
+        credentials: entry,
+        timeoutMs: 120_000,
+        onProgress: (message) => log.info?.(`deepseek-web auto-relogin: ${message}`),
+      })
+      if (!outcome.ok || !outcome.auth) {
+        endRelogin()
+        return {
+          ok: false,
+          message: outcome.message,
+          error: outcome.autoLoginError ?? outcome.reason ?? 'login-failed',
+        }
+      }
+      const committed = await commitBrowserAuth(outcome.auth, log)
+      return {
+        ok: true,
+        verified: committed.verified,
+        ...(committed.display ? { display: maskIdentifier(committed.display) } : {}),
+        message: committed.verified
+          ? `已自动重登${committed.display ? `（${maskIdentifier(committed.display)}）` : ''}`
+          : '已自动重登，但服务端校验未通过（可用「发送测试」再确认）',
+      }
+    } finally {
+      endRelogin()
+    }
+  }
+
+  // ── 到期前自动重登的定时检查（0.6.14，默认关闭）─────────────────────────────
+  //
+  // 每 10 分钟看一眼：设置里 autoRelogin 是否为 true（**每轮重读文件** ⇒ 面板一改就生效，
+  // 不用重启）；是的话挑出"已失效或快到期"的账号，串行自动重登一遍。
+  // ⚠️ 用 `.unref()`：这个定时器不该拖着进程不退出。
+  // ⚠️ 串行 + 忙标记：并行开多个浏览器只会让风控看着更像机器。
+  let autoRenewBusy = false
+  const autoRenewTimer = setInterval(() => {
+    void (async () => {
+      if (autoRenewBusy) return
+      if (readGateSettings()?.autoRelogin !== true) return
+      const targets = selectReloginTargets({
+        accounts: listAccounts().map((record) => ({
+          id: record.id,
+          ...(record.capturedAt ? { capturedAt: record.capturedAt } : {}),
+          lastVerifyError: record.lastVerifyError ?? null,
+          ...(record.user ? { user: record.user } : {}),
+        })),
+        entries: readCredentialEntries(),
+        onlyStale: true,
+      })
+      if (targets.length === 0) return
+      autoRenewBusy = true
+      logger.info?.(`deepseek-web: 自动重登开始（${targets.length} 个账号到期/将到期）`)
+      try {
+        for (const item of targets) {
+          const auto = await autoReloginOne(item.accountId, logger)
+          logger.info?.(`deepseek-web: 自动重登 ${item.display} → ${auto.ok ? '成功' : `失败（${auto.message}）`}`)
+        }
+      } finally {
+        autoRenewBusy = false
+      }
+    })()
+  }, 10 * 60_000)
+  autoRenewTimer.unref?.()
 
   // ── 「欠删除的会话」落盘 + 启动补删（2026-09-14）────────────────────────────
   //
@@ -921,6 +1043,15 @@ export function apply(ctx: any, config: Config = {}): void {
                   return
                 }
                 patch.serialToolCalls = body.serialToolCalls
+              }
+              // 到期前自动重登（0.6.14）：只收布尔值，缺省关闭。
+              // 定时检查每轮都重读设置文件 ⇒ 存下去就即时生效，不用重启。
+              if (body.autoRelogin !== undefined) {
+                if (typeof body.autoRelogin !== 'boolean') {
+                  sendJson(res, 400, { ok: false, error: 'autoRelogin 必须是布尔值' })
+                  return
+                }
+                patch.autoRelogin = body.autoRelogin
               }
               if (Object.keys(patch).length === 0) {
                 sendJson(res, 400, { ok: false, error: '没有可更新的字段' })
@@ -1574,6 +1705,21 @@ export function apply(ctx: any, config: Config = {}): void {
                 `deepseek-web: 准备重新登录「${target.label || target.id}」（登录态已失效，本次不复用）` +
                   '—— 捕获后原地更新这条记录，不新增、也不切换当前账号',
               )
+              // ── 0.6.14：有邮箱密码凭证就**直接自动重登**，不再要求用户手敲 ──────────
+              // 用户原话："我点击重登之后又是让我重新输入账号密码，就不能直接点个重登按钮
+              // 就登录上去不就行了？" —— 现在这条路是：无头真实浏览器 + 页面内登录（过数美指纹）。
+              if (credentialForDisplay(target.user?.display)) {
+                const auto = await autoReloginOne(id, logger)
+                sendJson(res, 200, {
+                  ok: auto.ok,
+                  targetId: id,
+                  autoRelogin: true,
+                  verified: auto.verified ?? false,
+                  ...(auto.display ? { display: auto.display } : {}),
+                  ...(auto.ok ? { hint: auto.message } : { error: auto.message, code: auto.error }),
+                })
+                return
+              }
               sendJson(res, 200, {
                 ok: true,
                 targetId: id,
@@ -1581,6 +1727,48 @@ export function apply(ctx: any, config: Config = {}): void {
                 hint:
                   '这条账号的授权确实失效了（登录态已清掉），请在打开的窗口里重新登录一次',
               })
+              return
+            }
+
+            // 一键重登：把所有"能匹配到邮箱密码凭证"的账号依次自动重登（0.6.14）。
+            // 体量上就是"每个号跑一次无头浏览器"，所以是**串行**执行、逐个回报结果 ——
+            // 并行开 6 个浏览器只会让风控看着更像机器。
+            if (req.method === 'POST' && route === '/login/relogin-all') {
+              const entries = readCredentialEntries()
+              const targets = selectReloginTargets({
+                accounts: listAccounts().map((record) => ({
+                  id: record.id,
+                  ...(record.capturedAt ? { capturedAt: record.capturedAt } : {}),
+                  lastVerifyError: record.lastVerifyError ?? null,
+                  ...(record.user ? { user: record.user } : {}),
+                })),
+                entries,
+              })
+              if (targets.length === 0) {
+                sendJson(res, 200, {
+                  ok: false,
+                  results: [],
+                  error:
+                    entries.length === 0
+                      ? '本机还没有邮箱密码凭证，无法自动重登'
+                      : '现有账号都匹配不到邮箱密码凭证（脱敏名对不上）——可以用「登录新账号」手动补一条',
+                })
+                return
+              }
+              const results: { targetId: string; display: string; reason: string; ok: boolean; message: string }[] = []
+              for (const item of targets) {
+                const auto = await autoReloginOne(item.accountId, logger)
+                results.push({
+                  targetId: item.accountId,
+                  display: item.display,
+                  reason: item.reason,
+                  ok: auto.ok,
+                  message: auto.message,
+                })
+              }
+              const okCount = results.filter((r) => r.ok).length
+              logger.info?.(`deepseek-web: 一键重登完成 ${okCount}/${results.length}`)
+              sendJson(res, 200, { ok: okCount > 0, results, okCount, total: results.length })
               return
             }
 

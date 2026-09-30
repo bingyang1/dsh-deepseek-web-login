@@ -269,6 +269,8 @@ export interface BrowserLoginOutcome {
     | 'browser-closed'
   /** 浏览器窗口是否仍然开着（超时时保留，用户可继续登录后重试）。 */
   browserLeftOpen?: boolean
+  /** 自动登录没成功时的原因（此时已退回等待手动登录，流程本身没坏）。 */
+  autoLoginError?: string
 }
 
 export interface BrowserLoginOptions {
@@ -282,6 +284,17 @@ export interface BrowserLoginOptions {
   signal?: AbortSignal
   /** 轮询间隔（测试用）。 */
   pollIntervalMs?: number
+  /**
+   * 邮箱密码（0.6.14）：给了就**自动登录**，不再等用户手动操作。
+   *
+   * 为什么必须在页面里做：密码登录接口 `POST /api/v0/users/login` 直连会被风控判
+   * `RISK_DEVICE_DETECTED` —— `device_id` 只由数美设备指纹 SDK（`window.SMSdk.getDeviceId()`）
+   * 产出。页面上下文里发请求则指纹/WAF cookie 全是真的（2026-09-30 实测 `biz_code: 0`）。
+   *
+   * ⚠️ 自动登录失败**不会**终止整个流程：退回"等用户手动登录"，并把原因写进
+   * `autoLoginError`（自动化不该让原本可用的手动路径失效）。
+   */
+  credentials?: { email: string; password: string }
 }
 
 const DEFAULT_TIMEOUT_MS = 5 * 60_000
@@ -368,6 +381,88 @@ async function findPageTarget(port: number, timeoutMs: number, signal?: AbortSig
  * 完整流程：拉起真实浏览器 → CDP 抓凭证。
  * 成功时返回可直接落盘的 WebAuth；失败时给出分类原因。
  */
+/**
+ * 页面里执行的自动登录脚本（0.6.14）。
+ *
+ * 它是**字符串**：要在页面上下文里跑，不能引用本文件的任何符号。
+ * 必须等数美 SDK 就绪再取 `deviceId`（拿不到就明说），拿到后直接 POST 登录接口。
+ * 成功后顺手把 token 按网页端的格式写回 `localStorage.userToken` ——
+ * 这样主流程原有的"轮询 localStorage → 抓 cookie/指纹头"那段**一行都不用改**。
+ */
+export function buildAutoLoginExpression(email: string, password: string): string {
+  return `(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    let deviceId = null;
+    try {
+      if (window.SMSdk && window.SMSdk.ready) {
+        deviceId = await Promise.race([
+          new Promise((res) => window.SMSdk.ready(() => res(window.SMSdk.getDeviceId ? window.SMSdk.getDeviceId() : null))),
+          wait(15000).then(() => null),
+        ]);
+      }
+    } catch (e) { deviceId = null; }
+    if (!deviceId) return { ok: false, stage: 'sdk', error: '数美设备指纹 SDK 没就绪，拿不到 device_id' };
+    let resp, text;
+    try {
+      resp = await fetch('/api/v0/users/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          email: ${JSON.stringify(email)},
+          mobile: '',
+          password: ${JSON.stringify(password)},
+          area_code: '',
+          device_id: deviceId,
+          os: 'web',
+        }),
+      });
+      text = await resp.text();
+    } catch (e) {
+      return { ok: false, stage: 'request', error: '登录请求发不出去：' + String(e) };
+    }
+    let json = null;
+    try { json = JSON.parse(text); } catch (e) {}
+    const data = (json && json.data) || {};
+    const user = (data.biz_data && data.biz_data.user) || null;
+    if (!user || !user.token) {
+      const code = data.biz_code;
+      const msg = data.biz_msg || '';
+      const why = code === 11 || msg === 'RISK_DEVICE_DETECTED' ? '被风控判定为可疑设备' : msg || '服务端没返回 token';
+      return { ok: false, stage: 'login', bizCode: code, bizMsg: msg, error: '登录没成功：' + why };
+    }
+    try {
+      localStorage.setItem('userToken', JSON.stringify({ value: user.token, __version: '0' }));
+    } catch (e) {}
+    return { ok: true, stage: 'ok', bizCode: data.biz_code, bizMsg: data.biz_msg || '' };
+  })()`
+}
+
+/**
+ * 自动登录一步（在页面里跑脚本，成功与否都返回结果，不抛）。
+ * 失败时**只记录原因**，调用方退回"等用户手动登录"。
+ */
+async function tryAutoLogin(
+  cdp: CdpClient,
+  credentials: { email: string; password: string },
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const value = await cdp.send('Runtime.evaluate', {
+      expression: buildAutoLoginExpression(credentials.email, credentials.password),
+      awaitPromise: true,
+      returnByValue: true,
+      userGesture: true,
+    })
+    if (value?.exceptionDetails) {
+      return { ok: false, error: `页面里报错：${value.exceptionDetails.text ?? ''}` }
+    }
+    const result = value?.result?.value as { ok?: boolean; error?: string } | undefined
+    if (!result) return { ok: false, error: '页面没有返回结果' }
+    return result.ok ? { ok: true } : { ok: false, error: result.error ?? '登录没成功' }
+  } catch (error: any) {
+    return { ok: false, error: `自动登录调用失败：${error?.message ?? error}` }
+  }
+}
+
 export async function browserLogin(options: BrowserLoginOptions = {}): Promise<BrowserLoginOutcome> {
   const browser = findSystemBrowser()
   if (!browser) {
@@ -468,6 +563,21 @@ export async function browserLogin(options: BrowserLoginOptions = {}): Promise<B
     if (Object.keys(extraHeaders).length === 0) extraHeaders = pickExtraHeaders(lower)
   })
   await cdp.send('Runtime.enable').catch(() => {})
+
+  // ── 自动重登（0.6.14）：给了邮箱密码就不再等用户手动操作 ─────────────────────
+  // 在**页面上下文**里发登录请求（指纹/WAF cookie 都是真的），成功后脚本会把 token
+  // 按网页端格式写回 localStorage —— 于是下面原有的轮询与 cookie/指纹捕获**一行都不用改**。
+  // 失败**不终止**：退回等待手动登录，只把原因带出去。
+  let autoLoginError: string | undefined
+  if (options.credentials) {
+    progress('正在用已保存的邮箱密码自动登录…')
+    const auto = await tryAutoLogin(cdp, options.credentials)
+    if (auto.ok) progress('自动登录成功，正在读取 cookie 与指纹头……')
+    else {
+      autoLoginError = auto.error
+      progress(`自动登录没成功（${auto.error}），请在窗口里手动登录…`)
+    }
+  }
   await cdp.send('Network.enable').catch(() => {})
 
   progress('浏览器已打开：请在其中登录 DeepSeek（手机号/邮箱/扫码均可）。登录成功后会自动捕获，无需复制粘贴。')
@@ -527,7 +637,12 @@ export async function browserLogin(options: BrowserLoginOptions = {}): Promise<B
         }
         cdp.close()
         cleanupBrowser()
-        return { ok: true, auth, message: `已从 ${browser.name} 捕获登录态（token + ${cookie ? 'cookie + ' : ''}指纹头）` }
+        return {
+          ok: true,
+          auth,
+          message: `已从 ${browser.name} 捕获登录态（token + ${cookie ? 'cookie + ' : ''}指纹头）`,
+          ...(autoLoginError ? { autoLoginError } : {}),
+        }
       }
 
       if (Date.now() - lastNotice > 30_000) {
@@ -543,6 +658,7 @@ export async function browserLogin(options: BrowserLoginOptions = {}): Promise<B
       ok: false,
       reason: 'timeout',
       browserLeftOpen: true,
+      ...(autoLoginError ? { autoLoginError } : {}),
       message: `等了 ${Math.round(timeoutMs / 60_000)} 分钟没读到登录态。浏览器窗口保留着，登录完成后可以再点一次「浏览器窗口登录」（profile 复用，不用重新登录）。`,
     }
   } finally {

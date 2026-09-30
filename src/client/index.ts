@@ -1991,6 +1991,51 @@ function Panel(): any {
     })
     cleanupNowRow.append(cleanupNowBtn, cleanupNowHint)
     gateCard.append(cleanupNowRow)
+
+    // 一键重登（0.6.14）：用本机存的邮箱密码，把匹配得到的账号依次自动重登。
+    // 每个号要起一次**无头**真实浏览器（无窗口、一次性 profile、跑完即杀），所以明确写出来。
+    const reloginAllRow = el('div', 'dsw-gate-row')
+    reloginAllRow.append(el('span', 'dsw-gate-label', '一键重登'))
+    const reloginAllBtn = el('button', 'dsw-btn ghost', '用存的密码重登全部') as HTMLButtonElement
+    const reloginAllHint = el('span', 'dsw-hint', '')
+    reloginAllBtn.addEventListener('click', () => {
+      reloginAllBtn.disabled = true
+      reloginAllHint.textContent = '正在自动重登（每个号起一次无头浏览器，请稍候）…'
+      void api('/login/relogin-all', { method: 'POST', body: '{}' })
+        .then((result: any) => {
+          const rows = Array.isArray(result?.results) ? result.results : []
+          reloginAllHint.textContent = rows.length
+            ? `完成 ${result?.okCount ?? 0}/${rows.length}：` +
+              rows.map((r: any) => `${r.ok ? '✅' : '❌'}${String(r.display ?? '').slice(0, 20)}`).join('　')
+            : (result?.error ?? '没有可重登的账号')
+        })
+        .catch((error: any) => {
+          reloginAllHint.textContent = `重登失败：${error?.message ?? error}`
+        })
+        .finally(() => {
+          reloginAllBtn.disabled = false
+        })
+    })
+    reloginAllRow.append(reloginAllBtn, reloginAllHint)
+    gateCard.append(reloginAllRow)
+
+    // 到期前自动重登（0.6.14）：**默认关闭**。打开后每 10 分钟检查一次，凭证失效或
+    // 捕获超过 100 分钟（实测寿命 ≈2 小时）就静默跑一次无头浏览器把凭证换新。
+    const autoReloginRow = el('div', 'dsw-gate-row')
+    const autoReloginLabel = el('label', 'dsw-switch')
+    const autoReloginInput = el('input') as HTMLInputElement
+    autoReloginInput.type = 'checkbox'
+    const autoReloginTrack = el('span', 'dsw-switch-track')
+    autoReloginLabel.append(
+      autoReloginInput,
+      autoReloginTrack,
+      el('span', undefined, '到期前自动重登（后台每约 2 小时静默跑一次无头浏览器）'),
+    )
+    autoReloginInput.addEventListener('change', () => void saveGate({ autoRelogin: autoReloginInput.checked }))
+    autoReloginRow.append(autoReloginLabel)
+    gateCard.append(autoReloginRow)
+    const autoReloginHint = el('p', 'dsw-hint', '缓存凭证实测寿命约 2 小时；关掉它就用上面的「一键重登」手动刷。')
+    gateCard.append(autoReloginHint)
     const cleanupHint = el('p', 'dsw-hint', '')
     gateCard.append(cleanupHint)
 
@@ -2895,6 +2940,8 @@ function Panel(): any {
       // 工具调用方式：后端给的是**当前值**（布尔，true = 一次一个）。缺省/旧宿主没这个字段 ⇒ 当串行。
       serialInput.checked = g.serialToolCalls === false
       paintSerialTools()
+      // 到期前自动重登：后端给的是当前值（缺省 false ⇒ 未勾选）
+      autoReloginInput.checked = g.autoRelogin === true
 
       const mode = g.cleanup?.mode ?? 'deferred'
       for (const key of Object.keys(cleanupBtns)) {
@@ -2932,6 +2979,8 @@ function Panel(): any {
       autoSwitchMinutes?: number
       /** true = 一次只发一个工具调用（界面上的开关未勾选）。 */
       serialToolCalls?: boolean
+      /** 到期前自动重登（缺省关闭）。 */
+      autoRelogin?: boolean
       cleanupBatch?: { min: number; max: number }
       cleanupDelayMs?: { min: number; max: number }
       cleanupGapMs?: { min: number; max: number }

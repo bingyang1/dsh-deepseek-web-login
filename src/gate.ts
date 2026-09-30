@@ -267,6 +267,18 @@ export interface GateSettings {
    * 真正的执行方是 `protocol.ts` 的指令选择（见 `toolProtocolInstructions`）。
    */
   serialToolCalls?: boolean
+  /**
+   * 到期前自动重登（0.6.14）。**默认关闭**。
+   *
+   * 打开后：后台每 10 分钟检查一次，凭证已失效或捕获超过 100 分钟（实测寿命 ≈2 小时）就
+   * 自动跑一次"无头真实浏览器登录"把凭证换新 —— 用户不必每 2 小时手动点一次重登。
+   * 代价：约每 2 小时静默启动一次浏览器（无窗口、一次性 profile、跑完即杀）+ 一次真实登录请求。
+   * 不想被后台打扰就保持关闭，用面板的「一键重登」手动刷。
+   *
+   * 同 sessionCleanup：**不参与节流逻辑**，只是搭同一份设置文件与同一个设置页存储；
+   * 真正的执行方是 `index.ts` 里的定时检查（`autoReloginOne`）。
+   */
+  autoRelogin?: boolean
 }
 
 /** 节流设置文件：`${DSH_HOME || ~/.dsh}/web-login/gate.json`（插件自治，与凭证同目录）。 */
@@ -330,6 +342,9 @@ export function readGateSettings(): Partial<GateSettings> | undefined {
     }
     // boolean 走 typeof，别套 Number.isFinite 那套（`Number(true)` 是 1，会被当成合法数字收下）
     if (typeof parsed?.serialToolCalls === 'boolean') out.serialToolCalls = parsed.serialToolCalls
+    // 自动重登（0.6.14）：与 sessionCleanup 同一种"搭同一份设置文件存储"的字段，
+    // 不参与节流逻辑，执行方是 index.ts 里的定时检查。**缺省 false**（要用户明确打开）。
+    if (typeof parsed?.autoRelogin === 'boolean') out.autoRelogin = parsed.autoRelogin
     return Object.keys(out).length > 0 ? out : undefined
   } catch {
     return undefined
@@ -377,6 +392,8 @@ export interface RequestGateOptions {
   autoSwitchMinutes?: number
   /** 关掉批量工具调用＝用「一次一个」版协议指令（同上，本模块不执行，只是存下来以便落盘与回显）。 */
   serialToolCalls?: boolean
+  /** 到期前自动重登（同上，本模块不执行，只是存下来以便落盘与回显；执行方见 GateSettings 的说明）。 */
+  autoRelogin?: boolean
   /**
    * 会话清理策略（本模块不执行，同样只是存下来以便落盘与回显）。
    *
