@@ -142,6 +142,19 @@ await test('★ sections 里的账号也带 isActive（否则「✅ 当前」徽
   assert.equal(actives[0].id, activeAccountId(), '当前账号标记与 activeAccountId() 不一致')
 })
 
+await test('★ 账号条目带 identifierKind（否则「邮箱 / 手机号」标志不显示）', () => {
+  const byDisplay = new Map(flat.map((a) => [a.display, a.identifierKind]))
+  // 夹具就是真实形态：一个脱敏手机号、一个邮箱
+  assert.equal(byDisplay.get('183******78'), 'mobile', '脱敏手机号应判成 mobile')
+  assert.equal(byDisplay.get('lidi*********+mn1@gmail.com'), 'email', '邮箱应判成 email')
+  for (const a of flat) {
+    assert.ok(
+      ['email', 'mobile', 'unknown'].includes(a.identifierKind),
+      `${a.id} 的 identifierKind 非法：${JSON.stringify(a.identifierKind)}`,
+    )
+  }
+})
+
 await test('sections 里的账号保留 display / label / cookieMeta 等渲染字段', () => {
   for (const a of flat) {
     assert.equal(typeof a.display, 'string', `${a.id} 缺 display`)

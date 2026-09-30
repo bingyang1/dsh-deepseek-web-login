@@ -105,6 +105,49 @@ export interface AccountRecord extends WebAuth {
 
 const INDEX_VERSION = 1
 
+/** 账号的登录标识类型，只用来在面板上打个标志。 */
+export type IdentifierKind = 'email' | 'mobile' | 'unknown'
+
+/**
+ * 判断账号是用**邮箱**还是**手机号**注册/登录的（只用于展示）。
+ *
+ * 为什么要这个：多号并存时列表里只有一串脱敏标识（`davi***+w4@gmail.com` / `183******78`），
+ * 用户要求标出来是邮箱号还是手机号。
+ *
+ * 判据顺序（**先看显式字段，再退到形态**）：
+ *  1. 记录里若带了 `email` / `mobile_number`（新版本捕获会写），直接用 —— 最准。
+ *  2. 老记录只有服务端给的 `display` 一个字符串 ⇒ 按形态判：含 `@` = 邮箱；
+ *     数字形态 = 手机号。⚠️ 门槛不能按"至少 6 位数字"来 —— 服务端给的是**脱敏**串，
+ *     `183******78` 去掉星号只剩 **5 位**数字（实测踩到，用例抓出来的）。所以判据是
+ *     「**带掩码星号**且 ≥5 位数字」或「纯数字且 ≥7 位」。
+ *  3. 都不像 ⇒ `unknown`（界面不显示标志，别瞎猜）。
+ *
+ * ⚠️ 已知边界：服务端**只给一个 display**（`pickUserDisplay` 优先邮箱），所以"邮箱和手机都绑了"
+ * 的账号会被标成邮箱 —— 我们手上没有足够信息区分，与其编一个不如如实只标能确定的那个。
+ */
+export function identifierKindOf(
+  user:
+    | { display?: unknown; email?: unknown; mobile?: unknown; mobile_number?: unknown }
+    | undefined,
+): IdentifierKind {
+  const text = (v: unknown): string => (typeof v === 'string' ? v.trim() : '')
+  if (text(user?.email)) return 'email'
+  if (text(user?.mobile_number) || text(user?.mobile)) return 'mobile'
+  const display = text(user?.display)
+  if (!display) return 'unknown'
+  if (display.includes('@')) return 'email'
+  // 服务端给的是脱敏串：`183******78` 去掉星号只剩 5 位数字，所以不能用一个"位数门槛"了事。
+  const digits = display.replace(/[^0-9]/g, '')
+  const masked = display.includes('*')
+  if (digits.length >= 5 && (masked || digits.length >= 7)) return 'mobile'
+  return 'unknown'
+}
+
+/** 面板上那枚小标志的文字。`unknown` 返回空串（不显示）。 */
+export function identifierBadgeText(kind: IdentifierKind): string {
+  return kind === 'email' ? '邮箱' : kind === 'mobile' ? '手机号' : ''
+}
+
 export function accountsDir(): string {
   return join(webLoginDir(), 'accounts')
 }

@@ -41,6 +41,8 @@ interface StatusPayload {
     hasFingerprint: boolean
     wasmHost?: string
     unverified?: boolean
+    /** 登录标识类型（主机侧算好）：email / mobile / unknown。只用于打标志。 */
+    identifierKind?: 'email' | 'mobile' | 'unknown'
     tokenLength?: number
     /** 观测到的账号级限制解除时间（毫秒时间戳）。只在**生成请求被拒**时才学到。 */
     limitUntilMs?: number | null
@@ -165,6 +167,8 @@ font-size:13px;line-height:1.6;color:var(--fg);max-width:760px;padding:2px 0 12p
 .dsw-badge.on{color:var(--ok);background:rgba(26,159,90,.15);background:var(--ok-weak)}
 .dsw-badge.off{color:var(--warn);background:rgba(200,140,20,.16);background:var(--warn-weak)}
 .dsw-badge.err{color:var(--err);background:rgba(217,48,37,.15);background:var(--err-weak)}
+/* 中性信息标志（邮箱 / 手机号）：不属于状态，别用红黄绿去干扰状态色 */
+.dsw-badge.kind{color:var(--fg);background:var(--code-bg);opacity:.85}
 /* 按钮：hover 不再整体调 opacity —— 那会把文字一起变淡，看着像被禁用了。
    改成背景微调 + 按下时 1px 位移（物理感）；focus-visible 补上键盘可达性。 */
 .dsw-btn{font:inherit;font-size:12px;font-weight:500;line-height:1.5;padding:6px 13px;
@@ -870,6 +874,10 @@ function Panel(): any {
       const main = el('div', 'dsw-account-main')
       const title = el('div', 'dsw-account-title')
       title.append(el('span', undefined, item.title || item.id))
+      // 「邮箱 / 手机号」标志（0.6.13）：多号并存时一眼看出这号是哪种标识
+      // （判据在主机侧 `identifierKindOf`，判不出来就不显示 —— 不瞎猜）。
+      if (item.identifierKind === 'email') title.append(el('span', 'dsw-badge kind', '邮箱'))
+      else if (item.identifierKind === 'mobile') title.append(el('span', 'dsw-badge kind', '手机号'))
       if (item.isActive) title.append(el('span', 'dsw-badge on', '✅ 当前'))
       if (item.unverified) title.append(el('span', 'dsw-badge off', '❔ 未校验'))
       const limited = item.limit && Number.isFinite(item.limit.untilMs) && item.limit.untilMs > Date.now()

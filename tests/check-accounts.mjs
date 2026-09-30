@@ -30,6 +30,8 @@ const {
   importAccounts,
   legacyMigrationError,
   listAccounts,
+  identifierKindOf,
+  identifierBadgeText,
   migrateLegacyAuthIfNeeded,
   newAccountId,
   removeAccount,
@@ -379,6 +381,36 @@ test('0.6.6 迁移：旧库里被写成"授权失效"的网络类失败，读出
   assert.equal(afterReal?.lastCheckError, undefined, '不该被挪走')
 
   resetLibrary()
+})
+
+// ── 登录标识类型（邮箱 / 手机号）标志 ──────────────────────────────────────
+// 用户要求："给每个账号后面加个（邮箱）（手机号）等这样的标志"。
+// 判据要**先看显式字段、再退到形态**：显式字段最准；老记录只有脱敏 display 也能判。
+test('显式字段优先：有 email 就是邮箱号', () => {
+  assert.equal(identifierKindOf({ email: 'a@b.com', display: '183******78' }), 'email')
+})
+test('只有 mobile_number 时是手机号', () => {
+  assert.equal(identifierKindOf({ mobile_number: '183******78' }), 'mobile')
+  assert.equal(identifierKindOf({ mobile: '183******78' }), 'mobile')
+})
+test('老记录只看 display：含 @ ⇒ 邮箱', () => {
+  assert.equal(identifierKindOf({ display: 'davi*******+w4@gmail.com' }), 'email')
+})
+test('老记录只看 display：纯数字/星号 ⇒ 手机号', () => {
+  assert.equal(identifierKindOf({ display: '183******78' }), 'mobile')
+  assert.equal(identifierKindOf({ display: '+86 183******78' }), 'mobile')
+})
+test('判不出来就 unknown，别瞎猜（界面据此不显示标志）', () => {
+  assert.equal(identifierKindOf({ display: '某个昵称' }), 'unknown')
+  assert.equal(identifierKindOf({ display: '' }), 'unknown')
+  assert.equal(identifierKindOf(undefined), 'unknown')
+  // 位数不够的短数字串不算手机号（避免把内部 id 误判成手机号）
+  assert.equal(identifierKindOf({ display: '12345' }), 'unknown')
+})
+test('标志文字：unknown 给空串（不显示），不会漏出 undefined', () => {
+  assert.equal(identifierBadgeText('email'), '邮箱')
+  assert.equal(identifierBadgeText('mobile'), '手机号')
+  assert.equal(identifierBadgeText('unknown'), '')
 })
 
 console.log(`通过 ${passed} 项${failures.length ? `，失败 ${failures.length} 项` : '，全部通过 OK'}`)

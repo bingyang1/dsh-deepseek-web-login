@@ -94,6 +94,7 @@ import {
   legacyMigrationError,
   listAccounts,
   migrateLegacyAuthIfNeeded,
+  identifierKindOf,
   readAccount,
   removeAccount,
   setActiveAccount,
@@ -1005,6 +1006,9 @@ export function apply(ctx: any, config: Config = {}): void {
                 label: record.label ?? '',
                 groupId: record.groupId ?? '',
                 unverified: record.unverified === true,
+                // 「邮箱 / 手机号」标志（0.6.13）。判据是纯函数（`identifierKindOf`），
+                // 老记录只有脱敏 display 也能判；判不出来就是 unknown，界面不显示。
+                identifierKind: identifierKindOf(record.user),
                 capturedAt: record.capturedAt,
                 lastVerifiedAt: record.lastVerifiedAt ?? null,
                 lastVerifyError: record.lastVerifyError ?? null,
