@@ -197,6 +197,17 @@ border:1px solid var(--bd);border-left:3px solid var(--fg3);white-space:pre-wrap
 overflow:auto;font-size:12px;line-height:1.6;color:var(--fg)}
 .dsw-msg.err{border-left-color:var(--err);color:color-mix(in srgb,var(--err) 78%,var(--fg))}
 .dsw-msg.ok{border-left-color:var(--ok)}
+.dsw-msg.warn{border-left-color:var(--warn);color:color-mix(in srgb,var(--warn) 80%,var(--fg))}
+/* 行内结果条：由**某一行上的按钮**触发的操作（切换 / 重登），结果必须留在那一行。
+   为什么（2026-09-30 用户反馈「点切换没反应，报错在下面显示，一点也不明显」）：
+   反馈原先只写卡片底部那条消息，用户点完按钮视线还在原处 —— 列表一长，等于没反馈。 */
+.dsw-rowmsg{margin-top:6px;padding:6px 10px;border-radius:var(--r-sm);background:var(--bg2);
+border-left:3px solid var(--fg3);color:var(--fg2);font-size:12px;line-height:1.55;
+white-space:pre-wrap;word-break:break-word}
+.dsw-rowmsg:empty{display:none}
+.dsw-rowmsg.err{border-left-color:var(--err);color:color-mix(in srgb,var(--err) 78%,var(--fg))}
+.dsw-rowmsg.ok{border-left-color:var(--ok)}
+.dsw-rowmsg.warn{border-left-color:var(--warn);color:color-mix(in srgb,var(--warn) 80%,var(--fg))}
 .dsw-models{list-style:none;margin:0;padding:0}
 .dsw-models li{padding:10px 0;border-top:1px solid var(--bd)}
 .dsw-models li:first-child{border-top:none;padding-top:2px}
@@ -797,38 +808,52 @@ function Panel(): any {
         // 这里刻意不写死"会复用登录态" —— 宿主在「这条账号已被标记失效」时会走清理路径
         // （0.1.75），该说什么由它随响应返回（下面用 prep.hint），免得界面与实际行为对不上。
         accountsMsg.textContent = `正在校验「${title}」并准备登录窗口……`
+        paintRowMsg(id, '正在校验登录态并准备登录窗口……', 'info')
         try {
           const prep = await api('/login/relogin', { method: 'POST', body: JSON.stringify({ id }) })
           // 0.6.6：宿主会先做一次只读探活 —— 凭证还能用的话到这里就结束了，
           // **不会打开浏览器**（这是「一键重登」那一半：网络抖动过后的号，一点就好）。
           if (prep?.alreadyValid) {
-            accountsMsg.textContent = String(prep.hint ?? '这条账号校验通过，不需要重新登录')
+            const text = String(prep.hint ?? '这条账号校验通过，不需要重新登录')
+            accountsMsg.textContent = text
+            paintRowMsg(id, `✅ ${text}`, 'ok')
             await loadAccounts()
             return
           }
           if (prep?.ok === false) {
             // 网络类失败走到这里：只报原因，**不清登录态、不开窗口**（重登此时必然白敲）。
-            accountsMsg.textContent = String(prep?.error ?? '未知原因')
+            const text = String(prep?.error ?? '未知原因')
+            accountsMsg.textContent = text
+            paintRowMsg(id, `⚠️ ${text}`, 'warn')
             return
           }
           boostUntil = Date.now() + 300_000
-          accountsMsg.textContent = String(
+          const opened = String(
             prep?.hint ??
               '登录窗口已打开：如果浏览器里还留着这个账号的登录态会立刻复用，否则在里面重新登录一次……',
           )
+          accountsMsg.textContent = opened
+          paintRowMsg(id, opened, 'info')
           const result = await api('/login/browser', { method: 'POST', body: '{}' })
           if (result?.started === false) {
-            accountsMsg.textContent = `打开登录窗口失败：${result?.reason ?? '未知原因'}（可改用「手动粘贴 Token」）`
+            const text = `打开登录窗口失败：${result?.reason ?? '未知原因'}（可改用「手动粘贴 Token」）`
+            accountsMsg.textContent = text
+            paintRowMsg(id, `❌ ${text}`, 'err')
             return
           }
-          accountsMsg.textContent = result?.relogin
+          const done = result?.relogin
             ? `「${title}」的凭证已原地更新（同一条记录、当前账号未变），旧的失败标记也清掉了。`
             : result?.added
               ? `「${title}」已加入账号库 —— 当前使用的账号没有改变。`
               : '已捕获并保存凭证。'
+          accountsMsg.textContent = done
           await loadAccounts()
+          // 重建列表后在**新的那一行**写结果（顺序反了会被冲掉）。
+          paintRowMsg(id, `✅ ${done}`, 'ok')
         } catch (error: any) {
-          accountsMsg.textContent = `重新登录失败：${error?.message ?? error}`
+          const message = `重新登录失败：${error?.message ?? error}`
+          accountsMsg.textContent = message
+          paintRowMsg(id, `❌ ${message}`, 'err')
         } finally {
           await refresh(false).catch(() => undefined)
         }
@@ -889,6 +914,11 @@ function Panel(): any {
           ),
         )
       }
+      // 行内结果条：**这一行上按钮**触发的操作（切换 / 重登），结果留在这张行里。
+      // 空的时候被 CSS 的 `:empty{display:none}` 收掉，不占位。
+      const rowMsg = el('div', 'dsw-rowmsg') as HTMLElement
+      rowMsg.dataset.rowMsg = String(item.id)
+      main.append(rowMsg)
       row.append(main)
 
       const actions = el('div', 'dsw-account-actions')
@@ -908,7 +938,7 @@ function Panel(): any {
         actions.append(el('span', 'dsw-hint', '使用中'))
       } else {
         const useBtn = el('button', 'dsw-btn ghost dsw-preset', '切换') as HTMLButtonElement
-        useBtn.addEventListener('click', () => void switchToAccount(item.id))
+        useBtn.addEventListener('click', () => void switchToAccount(item.id, useBtn))
         actions.append(useBtn)
       }
 
@@ -1131,20 +1161,64 @@ function Panel(): any {
     refreshAccountsBtn.addEventListener('click', () => void refreshAccountStates())
     newGroupBtn.addEventListener('click', () => promptNewGroup())
 
-    const switchToAccount = async (id: string): Promise<void> => {
+    /**
+     * 把结果写进**某一行的行内提示条**（按账号 id 找回节点 —— 列表重建过也能写回新的那条）。
+     *
+     * 为什么要有它（2026-09-30 用户反馈「点切换没反应，报错在下面显示，一点也不明显」）：
+     * 切换的反馈原先只写卡片底部那一条，而用户的视线还停在他点的那颗按钮上 ——
+     * 列表一长，那条消息在屏幕外，体感就是"点了没反应"。所以结果必须在**那一行**里出现。
+     */
+    const paintRowMsg = (
+      id: string,
+      text: string,
+      kind: 'info' | 'ok' | 'warn' | 'err',
+    ): void => {
+      const node = accountsList.querySelector(
+        `.dsw-rowmsg[data-row-msg="${id}"]`,
+      ) as HTMLElement | null
+      if (!node) return
+      node.className = kind === 'info' ? 'dsw-rowmsg' : `dsw-rowmsg ${kind}`
+      node.textContent = text
+    }
+
+    const switchToAccount = async (id: string, btn?: HTMLButtonElement): Promise<void> => {
+      // 按钮自己先"动"起来：探活最长 10 秒，这段时间里必须让用户看到点到了。
+      const originalLabel = btn?.textContent ?? ''
+      if (btn) {
+        btn.disabled = true
+        btn.textContent = '切换中…'
+      }
+      paintRowMsg(id, '正在校验登录态并切换……', 'info')
       accountsMsg.textContent = '切换中……'
       try {
         const result = await api('/accounts/switch', { method: 'POST', body: JSON.stringify({ id }) })
         if (!result?.ok) {
-          accountsMsg.textContent = `切换失败：${result?.error ?? '未知原因'}`
+          const message = `切换失败：${result?.error ?? '未知原因'}`
+          paintRowMsg(id, `❌ ${message}`, 'err')
+          accountsMsg.textContent = message
           return
         }
-        accountsMsg.textContent = '已切换（下一次请求生效）。正在刷新登录状态……'
+        // 先重建列表（切号会改状态区），再把结果写回**新**的那一行 —— 顺序反了会被冲掉。
         await loadAccounts()
         await refresh(false)
-        accountsMsg.textContent = '已切换（下一次请求生效）'
+        if (result?.warning) {
+          // 网络类失败是「放行 + 提示」：已切换，但没能校验（见宿主 /accounts/switch 的分类处置）。
+          const text = `⚠️ ${String(result.warning)}`
+          paintRowMsg(id, text, 'warn')
+          accountsMsg.textContent = text
+        } else {
+          paintRowMsg(id, '✅ 已切换（下一次请求生效）', 'ok')
+          accountsMsg.textContent = '已切换（下一次请求生效）'
+        }
       } catch (error: any) {
-        accountsMsg.textContent = `切换失败：${error?.message ?? error}`
+        const message = `切换失败：${error?.message ?? error}`
+        paintRowMsg(id, `❌ ${message}`, 'err')
+        accountsMsg.textContent = message
+      } finally {
+        if (btn) {
+          btn.disabled = false
+          btn.textContent = originalLabel
+        }
       }
     }
 

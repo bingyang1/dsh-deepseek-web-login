@@ -187,6 +187,10 @@ const demo = `
             <input class="dsw-labelinput" placeholder="备注名（如：备用号）">
             <button class="dsw-btn ghost">保存备注</button>
           </div>
+          <div class="dsw-rowmsg">正在校验登录态并切换……</div>
+          <div class="dsw-rowmsg ok">✅ 已切换（下一次请求生效）</div>
+          <div class="dsw-rowmsg warn">⚠️ 已切换，但没能校验这个号（网络问题：The operation was aborted due to timeout）—— 登录态未必失效，网络恢复后可再点「校验全部」确认</div>
+          <div class="dsw-rowmsg err">❌ 切换失败：这个号的登录态已失效（Authorization Failed (invalid token)），需要重新登录一次才能切换</div>
         </div>
       </div>
     </div>

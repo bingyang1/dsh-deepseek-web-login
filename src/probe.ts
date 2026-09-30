@@ -49,19 +49,32 @@ interface ProbeLogger {
 }
 
 /**
+ * 「切换」这条路上探活的超时：**10 秒**而不是默认的 20 秒。
+ *
+ * 为什么单独给一个（2026-09-30 用户反馈「点了切换没反应」）：切换是**交互式点击**，
+ * 用户盯着按钮等 20 秒只能看到底部一行小字，然后才蹦出一句英文超时 —— 体感就是"点了没反应"。
+ * 探活实测中位 ~400ms，10 秒已经极度宽松；真超了也不该再拖。
+ */
+export const SWITCH_PROBE_TIMEOUT_MS = 10_000
+
+/**
  * 探一次。返回 `undefined` 表示"没什么可探的"（未登录）。
  *
  * 结果写回**发起探活时那个账号**（按 token 匹配）——
  * 探活期间用户可能已经切号，绝不能把结果写到新账号头上。
  */
-export async function probeOnce(auth: WebAuth | undefined, logger?: ProbeLogger): Promise<ProbeOutcome | undefined> {
+export async function probeOnce(
+  auth: WebAuth | undefined,
+  logger?: ProbeLogger,
+  options?: { timeoutMs?: number },
+): Promise<ProbeOutcome | undefined> {
   if (!hasUsableAuth(auth)) return undefined
   const at = new Date().toISOString()
   const target = listAccounts().find((item) => item.token === auth.token)
 
   let outcome: ProbeOutcome
   try {
-    const result = await validateAuth(auth, AbortSignal.timeout(20_000))
+    const result = await validateAuth(auth, AbortSignal.timeout(options?.timeoutMs ?? 20_000))
     outcome = result.ok
       ? {
           ok: true,
@@ -169,6 +182,27 @@ export function planRelogin(probe: ProbeOutcome | undefined): ReloginPlan {
   if (probe?.ok) return 'already-valid'
   if (probe?.errorKind === 'transport') return 'network'
   return 'fresh-login'
+}
+
+/** 「切换」按钮要不要被这次探活拦住。 */
+export type SwitchGate = 'ok' | 'relogin' | 'warn'
+
+/**
+ * 切换前那次探活的结论该怎么用（纯函数，便于单测）。
+ *
+ * - `ok`：探活通过（或压根没探）⇒ 直接切。
+ * - `relogin`：**授权**类失败 ⇒ 拦下。这个号服务端已经不认了，切过去只会白跑一轮，
+ *   当场说清"需要重新登录一次"比让用户撞 AUTH 强。
+ * - `warn`：**网络**类失败 ⇒ **放行**，只提示"没能校验"。
+ *
+ * 🔴 为什么网络类必须放行（2026-09-30 现场）：以前两者共用一条分支，于是网络超时
+ * （`The operation was aborted due to timeout`）被写成"该账号登录态校验未通过，请重新登录后再切换"
+ * —— 用户点一次切换被挡回来，还以为号死了。而当时的网络其实只是抖了一下，凭证完全可用。
+ * 这与 `staleAuthRecord` 的取舍同源：**网络问题不该冒充授权结论**。
+ */
+export function switchGateFromProbe(probe: ProbeOutcome | undefined): SwitchGate {
+  if (!probe || probe.ok) return 'ok'
+  return probe.errorKind === 'auth' ? 'relogin' : 'warn'
 }
 
 export interface ProbeLoopOptions {

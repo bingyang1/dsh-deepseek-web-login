@@ -71,7 +71,13 @@ import {
   usageExists,
   USAGE_KEEP_DAYS,
 } from './usage.ts'
-import { planRelogin, probeOnce, startProbeLoop } from './probe.ts'
+import {
+  planRelogin,
+  probeOnce,
+  startProbeLoop,
+  SWITCH_PROBE_TIMEOUT_MS,
+  switchGateFromProbe,
+} from './probe.ts'
 import { checkForUpdate, RELEASE_REPO } from './update-check.ts'
 import { pluginVersion } from './version.ts'
 import { webLoginDir } from './paths.ts'
@@ -1022,18 +1028,30 @@ export function apply(ctx: any, config: Config = {}): void {
                 sendJson(res, 404, { ok: false, error: '账号不存在（可能已被移除）' })
                 return
               }
-              const probed = await probeOnce(target, {
-                info: (message) => logger.info?.(message),
-                warn: (message) => logger.warn?.(message),
-              })
-              if (probed && !probed.ok) {
+              const probed = await probeOnce(
+                target,
+                {
+                  info: (message) => logger.info?.(message),
+                  warn: (message) => logger.warn?.(message),
+                },
+                // 交互式点击：10 秒而不是 20 秒。超了也只当"没能校验"，不拦（见下面的分类）。
+                { timeoutMs: SWITCH_PROBE_TIMEOUT_MS },
+              )
+              // 🔴 探活结论**按失败类型分别处置**（2026-09-30）：只有授权失效才拦下来；
+              // 网络类失败（超时/断网）放行 —— 凭证未必坏，把用户挡在门外什么也解决不了。
+              const gate = switchGateFromProbe(probed)
+              if (gate === 'relogin') {
                 sendJson(res, 200, {
                   ok: false,
                   needsRelogin: true,
-                  error: `该账号登录态校验未通过（${probed.error ?? '未知原因'}），请重新登录后再切换`,
+                  error: `这个号的登录态已失效（${probed?.error ?? '未知原因'}），需要重新登录一次才能切换`,
                 })
                 return
               }
+              const warning =
+                gate === 'warn'
+                  ? `已切换，但没能校验这个号（网络问题：${probed?.error ?? '未知原因'}）—— 登录态未必失效，网络恢复后可再点「校验全部」确认`
+                  : undefined
               if (!setActiveAccount(id)) {
                 sendJson(res, 404, { ok: false, error: '账号不存在（可能已被移除）' })
                 return
@@ -1043,7 +1061,7 @@ export function apply(ctx: any, config: Config = {}): void {
               lastAutoSwitchAt = Date.now()
               // 手动切号也算"真的换过号" ⇒ 限流冷却开始计（刚切到新号又被限流时，别立刻再换）
               lastSwitchedAt = Date.now()
-              sendJson(res, 200, { ok: true, activeId: id })
+              sendJson(res, 200, { ok: true, activeId: id, ...(warning ? { warning } : {}) })
               return
             }
             if (req.method === 'POST' && route === '/accounts/rename') {
