@@ -33,6 +33,8 @@ const {
   needsFreshSession,
   effectiveReuseLimit,
 } = await import('../src/context-feed.ts')
+// 续写指令的**单一来源**（0.6.17 从 adapter.ts 挪到 protocol.ts）—— 用例也不自造文案
+const { CONTINUE_INSTRUCTION } = await import('../src/protocol.ts')
 
 let failed = 0
 let passed = 0
@@ -49,6 +51,12 @@ const test = (name, fn) => {
 
 const HEAD = 'SYSTEM+协议+工具目录'
 const ENTRIES = (...items) => items
+
+/**
+ * 续写轮的真实条目形状（照 `adapter.ts` 拼续写 prompt 的写法）：
+ * 原对话 + 已输出的半截回答（作为 assistant）+ 续写指令。
+ */
+const continuationEntries = (partial) => ENTRIES('User: 原始需求', `Assistant: ${partial}`, `User: ${CONTINUE_INSTRUCTION}`)
 
 /** 基础输入：链式模式、复用同一会话、头部一致、已有一条链。 */
 function chainedInput(overrides = {}) {
@@ -116,16 +124,24 @@ test('链式 + 一次追加多条：用空行拼接（与 transcript 的分隔�
 })
 
 test('链式 + 续写轮（原对话 + 半截回答 + 继续指令）：增量只含新增那两条', () => {
+  // 0.6.17：这里改用**真实的**续写指令常量（原来用的是自造文案）。
+  // 续写轮的"回声"是故意发的 —— 剔掉它模型就只能从零重写，所以那两轮必须跳过剔除。
+  // `continuationEntries` 就是 adapter.ts 拼续写 prompt 时的真实形状。
   const base = ENTRIES('User: 原始需求')
   const d = decideFeed(
     chainedInput({
-      entries: ENTRIES('User: 原始需求', 'Assistant: 半截回答', 'User: 请从中断处继续'),
+      entries: continuationEntries('用户原始需求的那一轮半截回答'),
       chainEntries: base,
       chainPatch: { entries: base, parentId: 77 },
     }),
   )
   assert.equal(d.reason, 'chained')
-  assert.equal(d.prompt, 'Assistant: 半截回答\n\nUser: 请从中断处继续')
+  assert.equal(
+    d.prompt,
+    `Assistant: 用户原始需求的那一轮半截回答\n\nUser: ${CONTINUE_INSTRUCTION}`,
+    '续写轮必须把半截回答带上，否则模型会重写一遍',
+  )
+  assert.equal(d.echoDropped, undefined, '续写轮不剔回声')
   assert.equal(d.parentMessageId, 77)
 })
 
@@ -404,6 +420,39 @@ test('webapi 真的把这条判据接在重开链路径上（且用的是强制�
     /needsFreshSession\([\s\S]{0,300}?leaseSession\([\s\S]{0,300}?true,/.test(src),
     '判定要换会话后，必须用 forceNew=true 重新租一个（否则只是原地打转）',
   )
+})
+
+// ── 0.6.17：增量里不许再出现「模型回声」（Assistant: …）──────────────────────
+// 用户现场（2026-10-01 截图）：上一句回答被整段当成下一句的提示词发出去 ——
+// 那条回答本来就是服务端的上一轮输出（就在父消息位置），重发纯属白烧 token。
+test('增量剔掉模型回声：只发用户/工具结果，不发上一句回答', () => {
+  const entries = ENTRIES('User: 一', 'Assistant: 答一', 'User: 二')
+  const d = decideFeed(chainedInput({ entries, chainEntries: entries.slice(0, 1) }))
+  assert.equal(d.reason, 'chained')
+  assert.equal(d.prompt, 'User: 二', `不该把上一句回答当提示词：${JSON.stringify(d.prompt)}`)
+  assert.equal(d.echoDropped, 1, '要报出剔了几条，日志里才看得见')
+})
+
+test('工具调用的回声也剔：Assistant(工具调用) + 工具结果 ⇒ 只发工具结果', () => {
+  const entries = ENTRIES('User: 一', 'Assistant: 调用 read_file', '[Tool Result for c1]\n内容')
+  const d = decideFeed(chainedInput({ entries, chainEntries: entries.slice(0, 1) }))
+  assert.equal(d.prompt, '[Tool Result for c1]\n内容')
+  assert.equal(d.echoDropped, 1)
+})
+
+test('尾巴上只有回声时不剔（宁可多发，也不要退化成重开链而换掉会话）', () => {
+  const entries = ENTRIES('User: 一', 'Assistant: 答一')
+  const d = decideFeed(chainedInput({ entries, chainEntries: entries.slice(0, 1) }))
+  assert.equal(d.reason, 'chained', '不能因为"剔完就空了"而退回重开链')
+  assert.equal(d.prompt, 'Assistant: 答一')
+  assert.equal(d.echoDropped, undefined, '没剔就不报')
+})
+
+test('全量模式不受影响：回声照旧留在完整 prompt 里', () => {
+  const entries = ENTRIES('User: 一', 'Assistant: 答一', 'User: 二')
+  const d = decideFeed({ ...chainedInput({ entries }), mode: 'full' })
+  assert.equal(d.prompt, 'FULL-PROMPT', '全量是"从零重述"，必须保留完整对话')
+  assert.equal(d.echoDropped, undefined)
 })
 
 console.log(failed === 0 ? `\n通过 ${passed} 项，全部通过 ✅` : `\n通过 ${passed} 项，失败 ${failed} 项 ❌`)

@@ -25,7 +25,7 @@ import {
   uploadImageFile,
   type SessionCleaner,
 } from './webapi.ts'
-import { collectImageRefs, imageUploadName, looksLikeUnexecutedToolProgram, serializePromptParts, stripSystemMarkers, SystemMarkerStreamFilter, BoilerplateFilter, drainTextPipeline, ToolCallStreamFilter, TranscriptEchoGuard, type ToolSchemaLike } from './protocol.ts'
+import { CONTINUE_INSTRUCTION, TOOL_CALL_RETRY_INSTRUCTION, collectImageRefs, imageUploadName, looksLikeUnexecutedToolProgram, serializePromptParts, stripSystemMarkers, SystemMarkerStreamFilter, BoilerplateFilter, drainTextPipeline, ToolCallStreamFilter, TranscriptEchoGuard, type ToolSchemaLike } from './protocol.ts'
 
 /**
  * 把「被丢弃的完整载荷」落盘，专供事后定位。
@@ -573,33 +573,7 @@ function resolveThinking(options: any, spec: ModelSpec): { thinkingEnabled: bool
   throw new AdapterLlmError(`deepseek-web 不支持 reasoning effort "${String(effort)}"`, 'UNSUPPORTED_REASONING_EFFORT')
 }
 
-/**
- * 自动续写的用户指令（流被截后，适配器自动发起新请求让模型接着写——
- * 等价于用户手动说「继续」，但无需用户参与、且文本无缝拼接进同一条回答）。
- */
-const CONTINUE_INSTRUCTION =
-  '继续：请从你上一条回复的结尾处无缝接着往下写——不要重复任何已输出的内容，' +
-  '不要加「好的」「以下是」之类的开场白，不要重新组织语言；' +
-  '如果上一条回复停在句子中间，就从那个断点直接把句子写完并继续。'
 
-/**
- * 「把工具程序写成了正文」时的纠正指令（比自动续写更强的措辞 —— 续写是"接着写"，
- * 这个是"你刚才那一轮等于什么都没做，请重新发一次"）。
- *
- * 为什么需要（2026-09-17 11:00 现场，见 protocol.ts 里 looksLikeUnexecutedToolProgram 的说明）：
- * 染神 preset 注入了 PTC 说明（"所有动作必须通过 run_code 写 TypeScript 程序"），
- * 模型于是把 run_code 的 code 直接贴进正文；这一轮零工具调用 ⇒ agent loop 判定回合结束
- * ⇒ 界面上看起来"它停下来了"。加这一轮纠正后，模型有机会把同一段程序改发成工具调用。
- *
- * 措辞要点：① 点破"写出来 ≠ 执行了"；② 给出唯一被接受的形态；③ 明确对抗 PTC 措辞 ——
- * 否则模型会继续把系统提示里那句"写出 TypeScript 程序"当成"写进正文"的许可。
- */
-const TOOL_CALL_RETRY_INSTRUCTION =
-  '你刚才把要执行的程序写进了正文文本。写在正文里的代码不会被执行 —— 这一轮因此没有发生任何工具调用。\n' +
-  '请把同一段程序作为工具调用重新发出：只输出一个 JSON 对象，前后不要有任何其它文字：\n' +
-  '{"tool_calls":[{"name":"<工具名>","arguments":{...}}]}\n' +
-  '即使系统提示要求你写 TypeScript 程序来完成动作，那个程序也必须放进工具调用的 arguments 里，' +
-  '不能直接写在正文中 —— 只有作为工具调用发出，它才会真的被执行。'
 
 /**
  * 出现在末尾即「明显还有下文」的标点：列举 / 分句写到一半停了。
@@ -1327,7 +1301,9 @@ export function createAdapter(deps: AdapterDeps) {
         onContextFeed: (report) => {
           logger?.info?.(
             report.reason === 'chained'
-              ? `deepseek-web: 上下文投喂=链式：本轮只发增量 ${report.promptChars} 字（历史由服务端维护）`
+              ? `deepseek-web: 上下文投喂=链式：本轮只发增量 ${report.promptChars} 字（历史由服务端维护${
+                  report.echoDropped > 0 ? `，另略过 ${report.echoDropped} 条模型回声` : ''
+                }）`
               : report.reason === 'mode-full'
                 ? 'deepseek-web: 上下文投喂=每轮全量：重发完整 prompt'
                 : `deepseek-web: 链式投喂退回全量重发（原因=${report.reason}）`,

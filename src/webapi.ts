@@ -2160,6 +2160,8 @@ export interface FeedReport {
   chained: boolean
   /** 实际写进请求体的 prompt 长度（chained 时就是增量大小）。 */
   promptChars: number
+  /** 本轮从增量里剔掉了多少条「模型回声」（`Assistant: …`，见 context-feed.ts）。 */
+  echoDropped: number
 }
 
 export interface CompletionParams {
@@ -2323,6 +2325,7 @@ async function openCompletion(
         reason: feed.reason,
         chained: feed.parentMessageId !== null,
         promptChars: feed.prompt.length,
+        echoDropped: feed.echoDropped ?? 0,
       })
     }
     // ── 0.1.83：图片只发"服务端还没见过的" ────────────────────────────────

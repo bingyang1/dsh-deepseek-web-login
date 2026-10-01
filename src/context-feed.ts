@@ -89,6 +89,8 @@ export interface FeedInput {
   maxChars?: number
 }
 
+import { CONTINUE_INSTRUCTION, TOOL_CALL_RETRY_INSTRUCTION } from './protocol.ts'
+
 export interface FeedDecision {
   /** 真正写进请求体的 prompt。 */
   prompt: string
@@ -101,6 +103,41 @@ export interface FeedDecision {
   next: Omit<ChainState, 'parentId'> | undefined
   /** 为什么这么决定 —— 只用于日志，排障时能一眼看出为什么没走上链式。 */
   reason: FeedReason
+  /**
+   * 这一轮从增量里剔掉了多少条「模型回声」（`Assistant: …`）。
+   *
+   * 回声指的是：主机把**服务端上一轮的回复**也放进了消息列表，于是它出现在"新追加的条目"里。
+   * 那条回复本来就在链上（正是我们要挂的父消息），再当输入发一遍纯属浪费。
+   */
+  echoDropped?: number
+}
+
+/**
+ * 这条条目是不是「续写/纠正轮」的指令。
+ *
+ * 续写轮（`adapter.ts` 在回答被截断或模型把工具程序写进正文时自动发起）是**故意**把
+ * 上一轮的半截回答当输入再发一遍的：`Assistant: 半截回答` + `User: <续写指令>` ——
+ * 模型据此从断点接着写。所以那种"回声"不能剔（剔了它就从零重写一遍）。
+ * 判据用的是**插件自己的常量**（单一来源在 `protocol.ts`），不猜文案。
+ */
+export function isContinuationCue(entry: string): boolean {
+  const text = String(entry ?? '').trim()
+  return (
+    text === `User: ${CONTINUE_INSTRUCTION}` ||
+    text === `User: ${TOOL_CALL_RETRY_INSTRUCTION}`
+  )
+}
+
+/**
+ * 这条条目是不是「模型回声」。
+ *
+ * 主机的消息列表里既有用户消息也有**助手消息**（＝我们上一轮从服务端流下来的那段回复）；
+ * `serializePromptParts` 把它们统一转写成 `Assistant: …` / `User: …` 这样的条目。
+ * 增量投喂只需要发"服务端还没见过的"内容，而 `Assistant:` 那些条目服务端自己刚说过 ——
+ * 2026-10-01 用户截图反馈：「总是把模型上一句回答的结果，加到下一句当提示词，完全没必要」。
+ */
+export function isAssistantTranscriptEntry(entry: string): boolean {
+  return typeof entry === 'string' && /^\s*Assistant:/.test(entry)
 }
 
 /**
@@ -187,7 +224,19 @@ export function decideFeed(input: FeedInput): FeedDecision {
   if (chain.head !== head) return restart('head-changed')
   if (!isStrictPrefix(chain.entries, entries)) return restart('not-appended')
 
-  const delta = entries.slice(chain.entries.length).join('\n\n')
+  // 🔴 剔除「模型回声」（0.6.17）：增量里 `Assistant: …` 那些条目是**服务端上一轮的输出**，
+  // 它已经在链上了（就在我们要挂的父消息位置）。再当输入发一遍既白烧 token，
+  // 又让模型看到自己在"自言自语"。
+  // ⚠️ 只在增量里剔：全量 prompt 需要完整对话（那份是"从零重述"），剔了会丢上下文。
+  const appended = entries.slice(chain.entries.length)
+  // ⚠️ 续写/纠正轮整体跳过剔除：那一轮的"回声"是**故意**发的（半截回答 + 续写指令），
+  // 剔掉模型就只能从零重写。判据用插件自己的指令常量（`isContinuationCue`），不猜文案。
+  const continuation = appended.some((line) => isContinuationCue(line))
+  const meaningful = continuation ? appended : appended.filter((line) => !isAssistantTranscriptEntry(line))
+  const echoDropped = meaningful.length > 0 ? appended.length - meaningful.length : 0
+  // 边界：尾巴上**只有**回声（没有新的用户/工具内容）时不做剔除 —— 宁可多发一段，
+  // 也不要发空增量让这一轮退化成重开链（那会连带换掉会话，代价大得多）。
+  const delta = (meaningful.length > 0 ? meaningful : appended).join('\n\n')
   if (delta.trim().length === 0) return restart('empty-delta')
   const cap = input.maxChars
   if (typeof cap === 'number' && Number.isFinite(cap) && cap > 0 && delta.length > cap) {
@@ -198,6 +247,7 @@ export function decideFeed(input: FeedInput): FeedDecision {
     parentMessageId: chain.parentId,
     next: { head, entries: entries.slice(), sessionId: input.sessionId, accountKey: input.accountKey },
     reason: 'chained',
+    ...(echoDropped > 0 ? { echoDropped } : {}),
   }
 }
 
