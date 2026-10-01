@@ -144,24 +144,18 @@ export function describeRemaining(daysLeft: number): string {
 /**
  * 一句话说清 cookie 的寿命构成（界面直接展示）。
  *
- * 三种情况分开写，因为它们的含义完全不同：
- *  - 没记录 → 老记录 / 手动粘 token，下次重新登录会补上；
- *  - 全是会话级 → 浏览器侧本来就没有到期时间，看它撑多久没意义；
- *  - 有持久级 → 给出最晚那个的剩余时间（**只是浏览器侧的上界，不是登录态寿命**）。
+ * ⚠️ **刻意不报"还剩多少天"**（2026-10-01 由用户反馈删掉）：那个数字来自持久级 cookie
+ * （实测 `thumbcache_*` 这类还剩 399 天），而**真正鉴权的是 token，寿命只有几小时** ——
+ * 两个数量级放在一起只会让人读成"这号还能用 399 天"，然后发现几小时就得重登，反而更困惑。
+ * 现在只报构成（共几项 / 会话级几个 / 持久级几个），需要更细的信息去看 `/status` 原始字段。
  */
 export function describeCookieLife(
   summary: CookieLifeSummary | undefined,
-  now: number = Date.now(),
+  _now: number = Date.now(),
 ): string {
-  if (!summary) return '⚠️ 未记录（重新登录后会补上）'
+  if (!summary) return '⚠️ 未记录'
   const parts = [`${summary.total} 项`]
-  parts.push(summary.sessionCount > 0 ? `${summary.sessionCount} 会话级` : '无会话级')
+  if (summary.sessionCount > 0) parts.push(`${summary.sessionCount} 会话级`)
   if (summary.persistentCount > 0) parts.push(`${summary.persistentCount} 持久级`)
-  if (summary.latest) {
-    // 注意：`summary.latest.daysLeft` 是按生成这份 summary 的时刻算的。
-    // 调用方若隔了很久才展示，传 `now` 进来重算即可。
-    const daysLeft = (summary.latest.expiresAt - now) / 86_400_000
-    parts.push(`${summary.latest.name} ${describeRemaining(daysLeft)}`)
-  }
   return parts.join(' · ')
 }

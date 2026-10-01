@@ -689,10 +689,43 @@ function Panel(): any {
     //（它刷的是 `/status`，只看当前那个号）—— 两个同名按钮在同一个面板里会互相误导。
     const refreshAccountsBtn = el('button', 'dsw-btn ghost', '校验全部') as HTMLButtonElement
     refreshAccountsBtn.title = '对每个账号做一次只读校验（零额度）：刷新登录态、补上账号名、清掉已恢复的失败标记'
+    // 「一键重登」（0.6.14，0.6.15 挪到这里）：用本机存的邮箱密码依次自动重登 ——
+    // ⚠️ 位置很重要：第一版挂在"防风控"页的设置卡里，用户在「账号库」里根本找不到
+    //（2026-10-01 反馈）。它和「登录新账号」是同一类动作（弄到可用凭证），就该放一起。
+    const reloginAllBtn = el('button', 'dsw-btn', '一键重登') as HTMLButtonElement
+    reloginAllBtn.title =
+      '用本机保存的邮箱密码，把所有匹配得到的账号依次自动重登。' +
+      '每个号会起一次无头浏览器（无窗口、跑完即杀），所以是串行的、需要等一会儿。'
     const newGroupBtn = el('button', 'dsw-btn ghost', '新建分组') as HTMLButtonElement
     newGroupBtn.title = '给账号分类，只影响列表的显示方式 —— 不参与切号、也不影响会话复用与清理'
-    accountsIOPanel.append(addAccountBtn, exportBtn, importBtn, refreshAccountsBtn, newGroupBtn)
+    accountsIOPanel.append(addAccountBtn, reloginAllBtn, exportBtn, importBtn, refreshAccountsBtn, newGroupBtn)
     accountsCard.append(accountsIOPanel)
+    // 「一键重登」的点击处理：结果走**全局提示条**（常驻在标签栏之上）——
+    // 这样在子标签之间切换也看得见，不用在卡片里再塞一个 hint 元素。
+    reloginAllBtn.addEventListener('click', () => {
+      reloginAllBtn.disabled = true
+      showMessage('正在自动重登（每个号起一次无头浏览器，请稍候）…')
+      void api('/login/relogin-all', { method: 'POST', body: '{}' })
+        .then((result: any) => {
+          const rows: any[] = Array.isArray(result?.results) ? result.results : []
+          if (rows.length === 0) {
+            showMessage(result?.error ?? '没有可重登的账号', 'err')
+            return
+          }
+          const failed = rows.filter((r) => !r.ok)
+          showMessage(
+            `重登完成 ${result?.okCount ?? 0}/${rows.length}` +
+              (failed.length
+                ? `；失败：${failed.map((r) => `${r.display}（${String(r.message ?? '').slice(0, 40)}）`).join('　')}`
+                : `：${rows.map((r) => r.display).join('　')}`),
+            failed.length ? '' : 'ok',
+          )
+        })
+        .catch((error: any) => showMessage(`重登失败：${error?.message ?? error}`, 'err'))
+        .finally(() => {
+          reloginAllBtn.disabled = false
+        })
+    })
     // 以前这里是个"要导入的备份文件路径"输入框 —— 让人手打路径本来就别扭。
     // 现在两个按钮都弹**系统对话框**（另存为 / 打开），位置和文件名由用户自己选。
     // 实现见 src/file-picker.ts（宿主是 utility 进程，拿不到 Electron 的 dialog，
@@ -894,12 +927,13 @@ function Panel(): any {
       else if (item.lastCheckError) title.append(el('span', 'dsw-badge off', '⚠️ 未能校验（网络）'))
       main.append(title)
 
+      // 元信息只留"什么时候捕获的 / 上次校验是什么时候"。
+      // ⚠️ 2026-10-01 用户反馈后删掉两项：① 重复的脱敏账号名（标题里已经有了）；
+      // ② 整段 cookie 摘要（`5 项 · 3 会话级 · 2 持久级 · thumbcache 还剩 399 天`）——
+      // 又长又误导（天数跟几小时就失效的真实寿命差两个数量级）。
       const meta: string[] = []
-      if (item.display) meta.push(item.display)
       if (item.capturedAt) meta.push(`${shortTime(item.capturedAt)} 捕获`)
       meta.push(item.lastVerifiedAt ? `最近校验 ${relTime(item.lastVerifiedAt)}` : '尚未校验')
-      const cookieMeta: any[] = Array.isArray(item.cookieMeta) ? item.cookieMeta : []
-      meta.push(`cookie：${describeCookieLife(summarizeCookieLife(cookieMeta))}`)
       main.append(el('div', 'dsw-account-meta', meta.join(' · ')))
 
       // 探活失败 → 不只报状态，给一条可执行的路径。
@@ -1502,28 +1536,20 @@ function Panel(): any {
         // 所以这里如实说明「缺什么」以及「已证实不影响使用」，而不是留一句模糊的警告。
         const manualTokenMode = !status.auth.hasCookie && !status.auth.hasFingerprint
         if (manualTokenMode) {
-          rows.push(['凭证来源', '手动粘贴 token（实测：仅凭 Bearer token 即可完成校验/求解/生成）'])
+          rows.push(['凭证来源', '手动粘贴 token'])
         } else {
-          rows.push(['凭证来源', '浏览器登录捕获（token + cookie + 指纹头，登录态通常更耐久）'])
+          rows.push(['凭证来源', '浏览器登录捕获'])
         }
+        // Cookie 一行说清「有没有 + 构成」。**不再单列"还剩多少天"**
+        // （2026-10-01 用户反馈）：那个天数来自持久级 cookie（实测 399 天），
+        // 而真正鉴权的 token 只有几小时寿命，放一起只会误导。
         rows.push([
           'Cookie',
           status.auth.hasCookie
-            ? '✅ 已捕获'
-            : '未捕获 —— 手动 token 模式本就没有（已验证不影响请求；若日后频繁遇到 AUTH/40003，改用「浏览器登录」）',
+            ? `✅ 已捕获${status.auth.cookieLife ? ` · ${describeCookieLife(status.auth.cookieLife)}` : ''}`
+            : '未捕获（手动 token 模式本就没有；不影响请求）',
         ])
-        if (status.auth.hasCookie) {
-          // 把"登录态到底还能撑多久"从完全不可观察变成至少能看一半。
-          // ⚠️ 措辞必须诚实：实测真正鉴权用的是 token（只发 token 不带 cookie 能通过，
-          // 只发 cookie 不带 token 直接被拒 40002），所以这里只是**浏览器侧的上界**，
-          // 不能让人读成"到这天就掉线"。
-          rows.push([
-            'Cookie 过期',
-            `${describeCookieLife(status.auth.cookieLife)}（会话级 = 浏览器关掉就没了；这是浏览器侧的上界，不是登录态寿命）`,
-          ])
-        }
-        rows.push(['指纹头', status.auth.hasFingerprint ? '✅ 已捕获（x-hif-* / x-client-*）' : '未捕获 —— 同上，已实测可用'])
-        rows.push(['PoW WASM', status.auth.wasmHost || '默认地址'])
+        rows.push(['指纹头', status.auth.hasFingerprint ? '✅ 已捕获' : '未捕获（不影响请求）'])
         rows.push(['token 长度', `${status.auth.tokenLength ?? 0} 字符`])
         if (status.validation) rows.push(['服务端校验', status.validation.ok ? '通过' : `失败：${status.validation.error ?? ''}`])
 
@@ -1992,35 +2018,8 @@ function Panel(): any {
     cleanupNowRow.append(cleanupNowBtn, cleanupNowHint)
     gateCard.append(cleanupNowRow)
 
-    // 一键重登（0.6.14）：用本机存的邮箱密码，把匹配得到的账号依次自动重登。
-    // 每个号要起一次**无头**真实浏览器（无窗口、一次性 profile、跑完即杀），所以明确写出来。
-    const reloginAllRow = el('div', 'dsw-gate-row')
-    reloginAllRow.append(el('span', 'dsw-gate-label', '一键重登'))
-    const reloginAllBtn = el('button', 'dsw-btn ghost', '用存的密码重登全部') as HTMLButtonElement
-    const reloginAllHint = el('span', 'dsw-hint', '')
-    reloginAllBtn.addEventListener('click', () => {
-      reloginAllBtn.disabled = true
-      reloginAllHint.textContent = '正在自动重登（每个号起一次无头浏览器，请稍候）…'
-      void api('/login/relogin-all', { method: 'POST', body: '{}' })
-        .then((result: any) => {
-          const rows = Array.isArray(result?.results) ? result.results : []
-          reloginAllHint.textContent = rows.length
-            ? `完成 ${result?.okCount ?? 0}/${rows.length}：` +
-              rows.map((r: any) => `${r.ok ? '✅' : '❌'}${String(r.display ?? '').slice(0, 20)}`).join('　')
-            : (result?.error ?? '没有可重登的账号')
-        })
-        .catch((error: any) => {
-          reloginAllHint.textContent = `重登失败：${error?.message ?? error}`
-        })
-        .finally(() => {
-          reloginAllBtn.disabled = false
-        })
-    })
-    reloginAllRow.append(reloginAllBtn, reloginAllHint)
-    gateCard.append(reloginAllRow)
-
     // 到期前自动重登（0.6.14）：**默认关闭**。打开后每 10 分钟检查一次，凭证失效或
-    // 捕获超过 100 分钟（实测寿命 ≈2 小时）就静默跑一次无头浏览器把凭证换新。
+    // 捕获超过 100 分钟（实测寿命 1.5~6 小时）就静默跑一次无头浏览器把凭证换新。
     const autoReloginRow = el('div', 'dsw-gate-row')
     const autoReloginLabel = el('label', 'dsw-switch')
     const autoReloginInput = el('input') as HTMLInputElement

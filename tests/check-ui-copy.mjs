@@ -128,5 +128,22 @@ test('醒目样式也认 ⚠️ 前缀（重要提醒不该是灰字）', () => 
   assert.ok(/\|⚠️\/\.test\(text\)/.test(CLIENT), '自动样式判定要包含 ⚠️')
 })
 
+// ── 0.6.15：两处用户反馈（按钮找不到 + 注释啰嗦）────────────────────────────
+// 这两条都是"界面问题"，但根因不同：一个是**放错标签页**，一个是**信息过量**。
+// 它们都不会让任何用例变红，只能靠这里点名守住。
+test('「一键重登」必须在账号库的按钮行里（别放在别的标签页）', () => {
+  assert.ok(/accountsIOPanel\.append\([^)]*reloginAllBtn/.test(CLIENT), '按钮要挂在账号库的按钮行')
+  assert.ok(/const reloginAllBtn = el\('button'/.test(CLIENT), '按钮本体要存在')
+  // 反例：曾经它被 append 到 gateCard（防风控页）—— 用户在账号库里根本找不到
+  assert.ok(!/gateCard\.append\(reloginAllRow\)/.test(CLIENT), '不许再挂在防风控页')
+})
+
+test('cookie 摘要不许再出现"还剩多少天"与 cookie 名（用户反馈：误导且啰嗦）', () => {
+  assert.ok(!CLIENT.includes('会话级 = 浏览器关掉就没了'), '那句长解释要删掉')
+  assert.ok(!CLIENT.includes('这是浏览器侧的上界'), '那句长解释要删掉')
+  assert.ok(!/Cookie 过期/.test(CLIENT), '「Cookie 过期」这行要并进 Cookie 行')
+  assert.ok(!/meta\.push\(`cookie：/.test(CLIENT), '账号行不再重复 cookie 摘要（又长又和标题重复）')
+})
+
 console.log(failed === 0 ? `\n通过 ${passed} 项，全部通过 ✅` : `\n通过 ${passed} 项，失败 ${failed} 项 ❌`)
 if (failed > 0) process.exitCode = 1

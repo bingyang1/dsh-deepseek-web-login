@@ -224,8 +224,11 @@ test('剩余时间：天 / 小时 / 已过期', () => {
 
 test('没记录 / 全会话级 / 混合，三种说法各不相同', () => {
   // 0.1.64：文案加了 ⚠️ 前缀（界面里这条容易被当成噪音跳过，用户反馈"重要注释要标注"）。
-  // 行为没变，断言的牙齿保留：必须仍然给出"重新登录后会补上"这条可执行指引。
-  assert.equal(describeCookieLife(undefined, NOW), '⚠️ 未记录（重新登录后会补上）')
+  // 0.6.15：**删掉了"还剩 399 天"那半句**（用户反馈：持久级 cookie 的天数跟 token 的真实寿命
+  // 差两个数量级，摆一起只会误导）。牙齿保留两条：
+  //   ① 缺失时仍要有 ⚠️ 与可执行指引的语义（"未记录"就是指引）；
+  //   ② 输出里**不许**再出现 cookie 名与天数 —— 这条是这次改动的目标本身，必须守住。
+  assert.equal(describeCookieLife(undefined, NOW), '⚠️ 未记录')
   assert.equal(
     describeCookieLife(summarizeCookieLife([{ name: 'a', domain: '', session: true }], NOW), NOW),
     '1 项 · 1 会话级',
@@ -241,8 +244,17 @@ test('没记录 / 全会话级 / 混合，三种说法各不相同', () => {
       ),
       NOW,
     ),
-    '2 项 · 1 会话级 · 1 持久级 · smidV2 还剩 399 天',
+    '2 项 · 1 会话级 · 1 持久级',
   )
+  // ⭐ 这次改动的目标本身：持久级 cookie 的**名字与天数都不许再出现** ——
+  // 用户会读成"还能用 399 天"，而真正鉴权的 token 只有几小时寿命（实测 87~370 分钟）。
+  // 只保留构成，信息量够用且不误导。
+  const mixed = describeCookieLife(
+    summarizeCookieLife([{ name: 'smidV2', domain: '', session: false, expiresAt: NOW + 399 * DAY }], NOW),
+    NOW,
+  )
+  assert.ok(!/天|还剩/.test(mixed), `不该出现天数：${mixed}`)
+  assert.ok(!mixed.includes('smidV2'), `不该出现 cookie 名：${mixed}`)
 })
 
 console.log(`通过 ${passed} 项${failures.length ? `，失败 ${failures.length} 项` : '，全部通过 OK'}`)

@@ -253,8 +253,14 @@ const checks = {
   'client 失败账号上有「重新登录这个账号」按钮，且走 relogin 路由':
     client.includes('重新登录这个账号') && client.includes('login/relogin'),
   'client 为失败那一行提供了样式': client.includes('dsw-account-fix'),
-  'client 说明了 cookie 过期时间不是登录态寿命':
-    client.includes('Cookie 过期') && client.includes('不是登录态寿命'),
+  // 0.6.15：这条原来守的是"界面上要补一句解释 cookie 过期时间不是登录态寿命"。
+  // 用户反馈那句解释又长又没用（"不照样还是几个小时就需要重登嘛"）⇒ 改成**从根上不显示那个数字**。
+  // 断言的**意图没变**（别让人把 cookie 到期读成登录态寿命），手段变了：从"解释"变成"不显示"。
+  'client 的 cookie 摘要只报构成，不再显示天数/cookie 名':
+    client.includes('describeCookieLife') &&
+    !client.includes('Cookie 过期') &&
+    !client.includes('会话级 = 浏览器关掉就没了') &&
+    !client.includes('这是浏览器侧的上界'),
   // 断"关于页有这三块"，别绑标题原文 —— 0.5.0 把标题从「为什么没有自动换号」改成了「关于自动换号」
   // （功能早就加了，旧标题与现实矛盾），绑原文的断言会因为一次文案纠正而假红。
   'client 关于页（检查更新 + 数据位置 + 风险说明）':
