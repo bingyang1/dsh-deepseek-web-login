@@ -2113,16 +2113,27 @@ async function leaseSession(
   return { sessionId, reused: false }
 }
 
-/** 槽数超过上限时，把**最久没用**的那些连同它们的网页端会话一起淘汰掉。 */
+/**
+ * 槽数超过上限时，把**最久没用**的那些从内存里淘汰掉。
+ *
+ * 🔴 0.6.23：这里**不再删网页端会话**（旧实现做 `retireSession` + `cleanup`，也就是排队 DELETE）。
+ *
+ * 两个理由，都是用户明确提的：
+ *  1. **"回到原来的窗口还要能接着聊"** —— 把会话删了，等于把他那个窗口的上下文扔了；
+ *     他只能得到一个空白的新会话。槽是内存态、淘汰本来就不该有"销毁用户数据"的副作用。
+ *  2. **"删"本身是最强的机器特征之一**：真人不会每开一个新窗口就顺手删掉一个旧对话。
+ *     网页端留着的会话由用户自己管理（面板有「立即清理」，设置里也有清理策略）。
+ *
+ * 链一并清掉：槽没了的窗口下一轮会拿到**新会话**（`reused=false` ⇒ `detach('new-session')`），
+ * 旧链再留着只会指向一个这个窗口已经不用的会话。
+ */
 function evictIdleSlots(): void {
   if (reuseSlots.size <= MAX_CONVERSATION_SLOTS) return
   const idle = [...reuseSlots.values()].sort((a, b) => a.at - b.at)
   for (const slot of idle.slice(0, reuseSlots.size - MAX_CONVERSATION_SLOTS)) {
     reuseSlots.delete(slot.key)
-    retireSession(slot.sessionId)
-    try {
-      slot.cleanup?.(slot.sessionId)
-    } catch {}
+    contextChains.delete(slot.key)
+    if (lastChainKey === slot.key) lastChainKey = undefined
   }
 }
 
@@ -2357,7 +2368,10 @@ async function openCompletion(
       lastFeedReason = feed.reason
       params.onContextFeed?.({
         reason: feed.reason,
-        chained: feed.parentMessageId !== null,
+        // 🔴 判据是 reason，**不是** `parentMessageId !== null`（0.6.23 修）。
+        // 0.6.23 起"退回全量"也挂在链尾（parent != null），拿 parent 判会把
+        // "这一轮其实重发了全量"报成 chained=true —— 日志会直接说谎。
+        chained: feed.reason === 'chained',
         promptChars: feed.prompt.length,
         echoDropped: feed.echoDropped ?? 0,
       })

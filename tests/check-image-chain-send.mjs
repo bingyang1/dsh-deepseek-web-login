@@ -151,7 +151,7 @@ await test('链式轮之后再来一张新图：增量式累计（f4 之外不�
   assert.deepEqual(b3.ref_file_ids, ['f3'])
 })
 
-await test('head 变了 ⇒ 退回全量重发 ⇒ 图必须**全部**重发', async () => {
+await test('head 变了 ⇒ 重发全量但仍挂链尾 ⇒ 图只发服务端还没见过的', async () => {
   resetSessionReuse()
   const t = mkTransport()
   await runRound({ transport: t, entries: [E1], refFileIds: ['f1', 'f2'], id: 2 })
@@ -162,8 +162,11 @@ await test('head 变了 ⇒ 退回全量重发 ⇒ 图必须**全部**重发', a
     refFileIds: ['f1', 'f2'],
     id: 4,
   })
-  assert.equal(body.parent_message_id, null, '自证：head 变了 ⇒ 不是链式')
-  assert.deepEqual(body.ref_file_ids, ['f1', 'f2'], '全量重发时服务端手里没有历史 ⇒ 必须全发')
+  // ★ 0.6.23：head 变了要重发全量，但**会话没换、链尾没断** ⇒ 那两张图仍在服务端的链上
+  // （parent 指向链尾，服务端按链回溯就能看到）⇒ 不该重发。
+  // ⚠️ 真正需要"全部重发"的只有 detach 那条路（换账号 / 换会话 / 新会话），见下面两条。
+  assert.equal(body.parent_message_id, 2, '自证：有链就挂链尾（不再发根消息）')
+  assert.deepEqual(body.ref_file_ids, [], '图已在链上、服务端能回溯到 ⇒ 不重发')
 })
 
 await test('换账号 ⇒ 新会话 ⇒ 图必须**全部**重发（新账号那份历史不存在）', async () => {

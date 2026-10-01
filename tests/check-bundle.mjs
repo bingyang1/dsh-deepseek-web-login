@@ -508,7 +508,9 @@ const checks = {
     /contextMode === ["']chained["'] \? contextChainInfo\(\) \?\? null : null/.test(host) &&
     /contextMode === ["']full["']\) resetContextChain\(\)/.test(host) &&
     /feed\.reason !== lastFeedReason/.test(host) &&
-    /params\.onContextFeed\?\.\(\{[\s\S]{0,160}?chained: feed\.parentMessageId !== null/.test(host) &&
+    // 0.6.23：`chained` 改按 reason 判 —— 重发全量现在也挂在链尾（parent != null），
+    // 拿 parent 判会把"这一轮重发了全量"报成 chained=true（日志会说谎）。
+    /params\.onContextFeed\?\.\(\{[\s\S]{0,200}?chained: feed\.reason === "chained"/.test(host) &&
     /onContextFeed: \(report\)/.test(host) &&
     host.includes('链式投喂退回全量重发（原因='),
 
@@ -931,6 +933,31 @@ const checks = {
   'host 的重开链换会话缺省关闭（一个窗口始终只用一个网页端会话）':
     /let freshSessionOnRestart = false;/.test(host) &&
     /let freshSessionOnRestart = options\.freshSessionOnRestart === true;/.test(host),
+
+  // ── 0.6.23：一个窗口一条对话线（不许分叉、不许每轮断链）────────────────────
+  // ① 续链判据不能退回"严格前缀"（会被 DSH 每轮改写的运行时注入打穿 ⇒ 每轮断链）；
+  // ② 重发全量时 parent 必须仍是**链尾**（发 null 就是网页端分叉的根源）；
+  // ③ 报告里 `chained` 必须按 reason 算 —— 拿 parent 算会把"重发全量"报成"链式"。
+  'host 的续链判据容得下"运行时注入被原地替换"（不再要求严格前缀）':
+    (() => {
+      const i = host.indexOf('function canExtendChain')
+      if (i < 0) return false
+      const body = host.slice(i, i + 260)
+      return (
+        /next\.length <= prev\.length/.test(body) &&
+        /next\[prev\.length - 1\] === prev\[prev\.length - 1\]/.test(body) &&
+        !/prev\.every\(/.test(body)
+      )
+    })(),
+  'host 的重发全量仍挂在链尾（parent 为 null 只可能是"这个会话的第一条"）':
+    (() => {
+      const i = host.indexOf('const replay = (reason)')
+      if (i < 0) return false
+      const body = host.slice(i, i + 120)
+      return /parentMessageId: chain\.parentId/.test(body) && !/parentMessageId: null/.test(body)
+    })(),
+  'host 的投喂回执按 reason 判"是不是发了纯增量"（别拿 parent 判，那会说谎）':
+    /chained: feed\.reason === "chained"/.test(host),
 }
 
 let failed = 0

@@ -246,20 +246,44 @@ export function effectiveReuseLimit(maxTurns: number, mode: ContextMode): number
   return mode === 'chained' ? Number.POSITIVE_INFINITY : maxTurns
 }
 
-/** 严格前缀：prev 是 next 的前缀（含相等时不算"追加"）。 */
-function isStrictPrefix(prev: readonly string[], next: readonly string[]): boolean {
+/**
+ * 本轮能不能接着链往下发（替代旧的"严格前缀"判据，2026-10-01）。
+ *
+ * ## 旧判据为什么会毁掉整个链式投喂
+ *
+ * 旧实现要求**严格前缀**：`prev[i] === next[i]` 对全部 i 成立。只要有**一条**被改写，
+ * 整条链就作废 ⇒ `parent=null` ⇒ 网页端出现同层根消息（「修改 / 重新生成」+ `n / n`），
+ * 或者（0.6.10~0.6.21）直接换一个新会话。
+ *
+ * 而实测 DSH **每一轮**都会重写它自己注入的那条运行时快照，原话就在会话日志里：
+ *   `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.`
+ * —— 它是**替换式**的（位置不变、内容每轮变），所以"严格前缀"在 DSH 下几乎每轮都失败。
+ *
+ * ## 新判据（够严，但不至于被一条注入打穿）
+ *
+ * 1. **必须真的变长** —— 长度没增长时说不清是"重发"还是"历史被截断/压缩"，保守退回；
+ * 2. **链尾仍在原位**（`next[prev.length-1] === prev[prev.length-1]`）——
+ *    这条同时挡住了两种真正危险的情况：整体重写、以及在中途**插入/删除**条目
+ *    （那会让增量切错位置、漏掉内容）。
+ *
+ * 满足这两条时，中间的差异只可能是**原位替换**（就是那条运行时快照），
+ * 而增量按 `next.slice(prev.length)` 切出来的正好是**真正的新内容** —— 长度对齐，
+ * 被替换的那条不会挤进增量里。
+ */
+function canExtendChain(prev: readonly string[], next: readonly string[]): boolean {
   if (next.length <= prev.length) return false
-  for (let i = 0; i < prev.length; i += 1) {
-    if (prev[i] !== next[i]) return false
-  }
-  return true
+  return next[prev.length - 1] === prev[prev.length - 1]
 }
 
 /**
  * 决定本轮发什么。**纯函数**：不读文件、不看时间、不改全局状态。
  *
- * 判据宁可保守：只要能续链就发增量，任何一处不确定都退回"全量 + parent=null"
- * （退回去只是多花点 token，和以前行为一致；错续链则会让模型上下文错位，代价大得多）。
+ * 判据宁可保守：只要能续链就发增量，任何一处不确定就**重发全量**。
+ *
+ * ⚠️ 但"重发全量"**不等于**发根消息（0.6.23）：只要链还在（同一个网页端会话、同一个账号），
+ * 重发的那条仍然挂在**链尾**（见 `replay`）—— 发 `parent=null` 会让网页端把它渲染成
+ * 同层的另一条消息（「修改 / 重新生成」+ `n / n`），也就是"聊着聊着分叉了"。
+ * 只有**真的没有链**时（新会话 / 换了会话 / 换了账号）才发根消息（见 `detach`）。
  */
 export function decideFeed(input: FeedInput): FeedDecision {
   const full = input.full
@@ -271,20 +295,40 @@ export function decideFeed(input: FeedInput): FeedDecision {
     return { prompt: full, parentMessageId: null, next: undefined, reason: 'no-parts' }
   }
 
-  const restart = (reason: FeedReason): FeedDecision => ({
+  /** 没有可用的链（= 这个网页端会话的第一条消息）⇒ 只能发根消息，这是唯一合法的情况。 */
+  const detach = (reason: FeedReason): FeedDecision => ({
     prompt: full,
     parentMessageId: null,
     next: { head, entries: entries.slice(), sessionId: input.sessionId, accountKey: input.accountKey },
     reason,
   })
 
-  if (!input.reused) return restart('new-session')
+  /**
+   * 「链还在，但这一轮不能只发增量」⇒ 重发全量，但仍**挂在链尾**。
+   *
+   * 🔴 这是 2026-10-01 用户明确要求的取舍：**宁可多发一次，也绝不发根消息**。
+   * 旧实现这里一律 `parentMessageId: null` —— 网页端会把这条渲染成**同层的另一条消息**
+   * （「修改 / 重新生成」+ `n / n` 翻页），用户看到的就是"聊着聊着分叉了"。
+   * 挂在链尾的代价只是服务端上下文里多一段重复历史（多花一点 token），
+   * 而分叉是**结构性**的坏：它会永久破坏"一个窗口一条对话线"这个形态。
+   */
+  const replay = (reason: FeedReason): FeedDecision => ({
+    prompt: full,
+    parentMessageId: chain.parentId,
+    next: { head, entries: entries.slice(), sessionId: input.sessionId, accountKey: input.accountKey },
+    reason,
+  })
+
+  if (!input.reused) return detach('new-session')
   const chain = input.chain
-  if (!chain) return restart('no-chain')
-  if (chain.sessionId !== input.sessionId) return restart('session-changed')
-  if (chain.accountKey !== input.accountKey) return restart('account-changed')
-  if (chain.head !== head) return restart('head-changed')
-  if (!isStrictPrefix(chain.entries, entries)) return restart('not-appended')
+  if (!chain) return detach('no-chain')
+  // 换了会话 / 换了账号 ⇒ 旧链的 message_id 在新会话里没有意义，只能当新会话的第一条。
+  if (chain.sessionId !== input.sessionId) return detach('session-changed')
+  if (chain.accountKey !== input.accountKey) return detach('account-changed')
+  if (chain.head !== head) return replay('head-changed')
+  // ⚠️ 这里曾经是 `isStrictPrefix`。它会被**每条**被改写的运行时注入打穿（DSH 每轮都改），
+  // 于是链式投喂在真机上"每轮都重开"—— 见 canExtendChain 的注释。
+  if (!canExtendChain(chain.entries, entries)) return replay('not-appended')
 
   // 🔴 剔除「模型回声」（0.6.17）：增量里 `Assistant: …` 那些条目是**服务端上一轮的输出**，
   // 它已经在链上了（就在我们要挂的父消息位置）。再当输入发一遍既白烧 token，
@@ -299,10 +343,10 @@ export function decideFeed(input: FeedInput): FeedDecision {
   // 边界：尾巴上**只有**回声（没有新的用户/工具内容）时不做剔除 —— 宁可多发一段，
   // 也不要发空增量让这一轮退化成重开链（那会连带换掉会话，代价大得多）。
   const delta = (meaningful.length > 0 ? meaningful : appended).join('\n\n')
-  if (delta.trim().length === 0) return restart('empty-delta')
+  if (delta.trim().length === 0) return replay('empty-delta')
   const cap = input.maxChars
   if (typeof cap === 'number' && Number.isFinite(cap) && cap > 0 && delta.length > cap) {
-    return restart('delta-too-long')
+    return replay('delta-too-long')
   }
   return {
     prompt: delta,

@@ -168,15 +168,17 @@ await test('chained 模式连续三轮：每轮 parent 都是上一轮的 messag
   assert.equal(c.body.prompt, E3)
 })
 
-await test('历史被改写（非严格追加）⇒ 退回全量并重新起链', async () => {
+await test('历史被改写（链尾变了）⇒ 退回全量重发，但仍挂在链尾（不发根消息）', async () => {
   resetSessionReuse()
   applyContextMode('chained')
   const { transport } = mkTransport()
   await runRound({ transport, entries: [E1], sse: sseWithId(2) })
   const rewritten = await runRound({ transport, entries: ['User: 第一问（被压缩改写过）', E2], sse: sseWithId(4) })
-  assert.equal(rewritten.body.parent_message_id, null, '不确定就必须退回根消息')
-  assert.equal(rewritten.body.prompt, rewritten.full)
-  assert.equal(contextChainInfo()?.parentId, 4, '退回之后要以这一轮为新链首')
+  // ★ 0.6.23：不再退回根消息 —— 发 parent=null 会在网页端渲染成同层的另一条消息
+  // （「修改 / 重新生成」+ `n / n`），用户明确要求"一个窗口一条对话线"。
+  assert.equal(rewritten.body.parent_message_id, 2, '有链就挂链尾：根消息会让网页端分叉')
+  assert.equal(rewritten.body.prompt, rewritten.full, '但这一轮必须重发全量（增量会切错位置）')
+  assert.equal(contextChainInfo()?.parentId, 4, '这一轮的 id 成为下一轮的父消息')
 })
 
 await test('拿不到 ready（没有 message_id）⇒ 链作废，下一轮退回全量', async () => {
@@ -225,7 +227,7 @@ await test('从 chained 切回 full ⇒ 立刻回到全量，且不记链', asyn
   assert.equal(contextChainInfo(), undefined)
 })
 
-await test('固定头变了（工具目录/系统提示变化）⇒ 重新起链', async () => {
+await test('固定头变了（工具目录/系统提示变化）⇒ 重发全量，但仍挂链尾', async () => {
   resetSessionReuse()
   applyContextMode('chained')
   const { transport } = mkTransport()
@@ -251,7 +253,9 @@ await test('固定头变了（工具目录/系统提示变化）⇒ 重新起链
   for await (const _ of gen) {
     /* 只关心请求体 */
   }
-  assert.equal(bodies[0].parent_message_id, null)
+  // ★ 0.6.23：parent 不再是 null —— 头部变了要重发全量，但**不换会话、不发根消息**
+  // （根消息会在网页端渲染成同层的另一条消息：用户看到的"分叉"）。
+  assert.equal(bodies[0].parent_message_id, 2, '有链就挂链尾')
   assert.equal(bodies[0].prompt, 'NEW-HEAD\n\n---\n\n' + E2, '头部变了就不能只发增量')
 })
 

@@ -19,6 +19,7 @@ const {
   resetSessionReuse,
   disposeSessionReuse,
   DEFAULT_SESSION_REUSE_TURNS,
+  MAX_CONVERSATION_SLOTS,
 } = await import('../src/webapi.ts')
 
 let passed = 0
@@ -319,6 +320,35 @@ await test('没有 user.id 时 token 刷新 ⇒ 按旧行为新建会话（有�
   assert.equal(created.length, 1)
   await once(authNew)
   assert.equal(created.length, 2, '没有 user.id 时 token 不同只能按旧行为新建')
+})
+
+// ── 0.6.23：槽位超限只清内存，不碰网页端会话 ────────────────────────────────
+// 用户诉求原话：「换 dsh 会话的时候网页端换新会话，回到原来窗口还要接着之前那个聊」。
+// 旧实现在槽位超限时会 `retireSession + cleanup`（= 排队 DELETE）—— 那等于把用户
+// 那个窗口的上下文扔了，而且"删会话"本身是最强的机器特征之一。
+await test('★ 槽位超限：只淘汰内存槽，绝不删网页端会话', async () => {
+  resetSessionReuse()
+  const deleted = []
+  const { created, transport } = mkTransport()
+  setFetchImpl(async () => new Response(SSE_OK, { status: 200, headers: SSE_HEADERS }))
+  // 造 maxSlots + 1 个不同窗口，必然触发淘汰
+  for (let i = 0; i <= MAX_CONVERSATION_SLOTS; i += 1) {
+    const params = {
+      prompt: 'P',
+      thinkingEnabled: false,
+      modelType: 'default',
+      idleTimeoutMs: 5_000,
+      dshSessionId: `win-${i}`,
+      onDeleteSession: (id) => deleted.push(id),
+    }
+    for await (const _ of streamWebCompletion(authA, params, transport)) void _
+  }
+  assert.equal(
+    created.length,
+    MAX_CONVERSATION_SLOTS + 1,
+    `每个窗口各建一个会话，实际 ${created.length}`,
+  )
+  assert.deepEqual(deleted, [], '★ 一个都不许删 —— 淘汰只清内存槽（删了就等于扔掉那个窗口的上下文）')
 })
 
 // 复位，别把注入层留给别的测试

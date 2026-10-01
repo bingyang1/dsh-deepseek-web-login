@@ -34,6 +34,41 @@ const CASES = [
     to: 'export const DEFAULT_FRESH_SESSION_ON_RESTART = true',
     suite: 'tests/check-context-feed.mjs',
   },
+  {
+    name: '把 canExtendChain 改回严格前缀（＝0.6.22：被运行时注入打穿 ⇒ 每轮断链）',
+    file: 'src/context-feed.ts',
+    from: '  return next[prev.length - 1] === prev[prev.length - 1]',
+    to: '  return prev.every((line, i) => line === next[i])',
+    suite: 'tests/check-context-feed.mjs',
+  },
+  {
+    name: '让槽位淘汰重新删网页端会话（＝回到原窗口接不上，且是很强的机器特征）',
+    file: 'src/webapi.ts',
+    from: `    contextChains.delete(slot.key)
+    if (lastChainKey === slot.key) lastChainKey = undefined
+  }
+}`,
+    to: `    contextChains.delete(slot.key)
+    if (lastChainKey === slot.key) lastChainKey = undefined
+    retireSession(slot.sessionId)
+    try {
+      slot.cleanup?.(slot.sessionId)
+    } catch {}
+  }
+}`,
+    suite: 'tests/check-session-reuse.mjs',
+  },
+  {
+    name: '把 replay 的 parent 改回 null（＝会发根消息 ⇒ 网页端分叉 / 修改重新生成）',
+    file: 'src/context-feed.ts',
+    from: `  const replay = (reason: FeedReason): FeedDecision => ({
+    prompt: full,
+    parentMessageId: chain.parentId,`,
+    to: `  const replay = (reason: FeedReason): FeedDecision => ({
+    prompt: full,
+    parentMessageId: null,`,
+    suite: 'tests/check-context-chain.mjs',
+  },
 ]
 
 let failures = 0

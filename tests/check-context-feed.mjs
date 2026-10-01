@@ -208,15 +208,17 @@ test('账号换了（切号）：重新起链', () => {
   assert.equal(d.parentMessageId, null)
 })
 
-test('固定头变了（系统提示/工具目录）：重新起链，不拿旧 head 续', () => {
+test('固定头变了（系统提示/工具目录）：重发全量，但仍挂链尾（不发根消息）', () => {
   const d = decideFeed(chainedInput({ input: { head: HEAD + '（工具变了）' } }))
   assert.equal(d.reason, 'head-changed')
-  assert.equal(d.parentMessageId, null)
+  assert.equal(d.prompt, 'FULL-PROMPT', '头部变了 ⇒ 这一轮必须重发全量')
+  // ★ 0.6.23：parent 不再是 null —— 见 decideFeed 里 `replay` 的说明
+  assert.equal(d.parentMessageId, 42, '★ 有链就挂链尾：发根消息会让网页端分叉')
   assert.deepEqual(d.next?.entries, ENTRIES('User: 一', 'Assistant: 答一', '[Tool Result for c1]\n结果'))
 })
 
-test('历史不是严格追加（前一条被改写）：重新起链', () => {
-  // 典型的"压缩/回退"：旧条目在新数组里变成了别的内容
+test('链尾那条被改写（不是纯追加）：重发全量，但仍挂链尾', () => {
+  // 典型的"压缩/回退"：链的最后一条在新数组里变成了别的内容
   const d = decideFeed(
     chainedInput({
       entries: ENTRIES('User: 一', 'Assistant: 答一（被压缩重写过）', '[Tool Result for c1]\n结果'),
@@ -224,10 +226,11 @@ test('历史不是严格追加（前一条被改写）：重新起链', () => {
     }),
   )
   assert.equal(d.reason, 'not-appended')
-  assert.equal(d.parentMessageId, null)
+  assert.equal(d.prompt, 'FULL-PROMPT')
+  assert.equal(d.parentMessageId, 42, '★ 挂链尾，不发根消息')
 })
 
-test('历史变短（回退）：也算非追加 → 重新起链', () => {
+test('历史变短（回退）：也算非追加 → 重发全量但挂链尾', () => {
   const d = decideFeed(
     chainedInput({
       entries: ENTRIES('User: 一'),
@@ -235,17 +238,17 @@ test('历史变短（回退）：也算非追加 → 重新起链', () => {
     }),
   )
   assert.equal(d.reason, 'not-appended')
-  assert.equal(d.parentMessageId, null)
+  assert.equal(d.parentMessageId, 42, '★ 挂链尾，不发根消息')
 })
 
-test('条目数没变（同一步重试）：重新起链', () => {
+test('条目数没变（同一步重试）：重发全量但挂链尾', () => {
   const same = ENTRIES('User: 一', 'Assistant: 答一')
   const d = decideFeed(chainedInput({ entries: same, chainEntries: same }))
   assert.equal(d.reason, 'not-appended')
-  assert.equal(d.parentMessageId, null)
+  assert.equal(d.parentMessageId, 42, '★ 挂链尾，不发根消息')
 })
 
-test('追加了条目但内容全空白：当作没有新增 → 重新起链', () => {
+test('追加了条目但内容全空白：当作没有新增 → 重发全量但挂链尾', () => {
   const d = decideFeed(
     chainedInput({
       entries: ENTRIES('User: 一', '   '),
@@ -253,10 +256,10 @@ test('追加了条目但内容全空白：当作没有新增 → 重新起链', 
     }),
   )
   assert.equal(d.reason, 'empty-delta')
-  assert.equal(d.parentMessageId, null)
+  assert.equal(d.parentMessageId, 42, '★ 挂链尾，不发根消息')
 })
 
-test('增量本身超预算：不值当冒险 → 重新起链', () => {
+test('增量本身超预算：不值当冒险 → 重发全量但挂链尾', () => {
   const d = decideFeed(
     chainedInput({
       entries: ENTRIES('User: 一', 'X'.repeat(500)),
@@ -265,7 +268,36 @@ test('增量本身超预算：不值当冒险 → 重新起链', () => {
     }),
   )
   assert.equal(d.reason, 'delta-too-long')
-  assert.equal(d.parentMessageId, null)
+  assert.equal(d.parentMessageId, 42, '★ 挂链尾，不发根消息')
+})
+
+// ── 0.6.23：DSH 每轮改写"运行时注入" ⇒ 必须续链，不许断 ──────────────────────
+// 现场（2026-10-01，会话 13fc4478 的原始事件）：DSH 每轮都重写它注入的运行时快照
+//   `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.`
+// —— **替换式**：位置不变、内容每轮变。旧的"严格前缀"判据因此几乎每轮都失败
+// ⇒ `parent` 变 null ⇒ 网页端出现同层根消息（0.6.21 及以前还会直接换一个新会话）。
+// 用户看到的正是"聊着聊着就分叉 / 会话变多"。
+test('★ 运行时注入被原地替换（DSH 每轮都这样）⇒ 仍然续链，parent 保持链尾', () => {
+  const chainEntries = ENTRIES('User: 一', 'User: <runtime ctx: 12:50>', 'Assistant: 答一')
+  const entries = ENTRIES('User: 一', 'User: <runtime ctx: 12:51>', 'Assistant: 答一', 'User: 二')
+  const d = decideFeed(
+    chainedInput({ entries, chainEntries, chainPatch: { entries: chainEntries, parentId: 9 } }),
+  )
+  assert.equal(d.reason, 'chained', '注入被替换不该打断链')
+  assert.equal(d.prompt, 'User: 二', '增量必须只是真正的新内容（被替换那条不该挤进来）')
+  assert.equal(d.parentMessageId, 9)
+})
+
+test('★ 中途插入条目（不是原位替换）⇒ 不续链，但仍挂链尾（不发根消息）', () => {
+  const chainEntries = ENTRIES('User: 一', 'Assistant: 答一')
+  // 在中间插了一条 —— 增量会切错位置，必须退回全量重发
+  const entries = ENTRIES('User: 一', 'User: <新注入>', 'Assistant: 答一', 'User: 二')
+  const d = decideFeed(
+    chainedInput({ entries, chainEntries, chainPatch: { entries: chainEntries, parentId: 9 } }),
+  )
+  assert.equal(d.reason, 'not-appended')
+  assert.equal(d.prompt, 'FULL-PROMPT', '退回全量')
+  assert.equal(d.parentMessageId, 9, '★ 仍挂链尾 —— 发根消息会在网页端产生分叉')
 })
 
 test('增量刚好不超预算：仍然走增量（边界）', () => {
