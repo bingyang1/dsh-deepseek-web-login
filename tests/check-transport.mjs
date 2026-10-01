@@ -1,10 +1,10 @@
 /**
- * 回归：传输层选择（网页端请求从 Chromium 网络栈还是 Node 出去）。
+ * 回归：传输层选择（网页端请求从 Chrome 网络栈还是 Node 出去）。
  *
  * 这条选择是"指纹像不像浏览器"的总开关 —— 实测 Node fetch 的 JA4 是 `t13d…h1`，
- * Chromium 网络栈则与 Chrome 的 cipher 列表哈希逐字节一致。选错了整套改造白做，
+ * Chrome 网络栈（Electron 的 net.fetch，底层是 Chromium 网络库）则与 Chrome 的 cipher 列表哈希逐字节一致。选错了整套改造白做，
  * 所以几个易错点必须守住：
- *  - 环境不支持 Chromium 时必须**降级**而不是让请求发不出去（且要如实标记 degraded）；
+ *  - 环境不支持 Chrome 网络栈时必须**降级**而不是让请求发不出去（且要如实标记 degraded）；
  *  - 降级判定只看"能力"，**不是"失败后换一条重试"** —— 完成请求重发可能就是一次重复生成；
  *  - 设置文件损坏/值非法 → 回落到默认，不许崩；
  *  - 切换后 webapi 的注入层必须真的跟着变（否则界面显示切了、实际没切）。
@@ -45,7 +45,7 @@ function run(name, fn) {
 
 const FILE = join(HOME, 'web-login', 'transport.json')
 
-run('默认走 Chromium 网络栈（这才是"看起来像浏览器"的那个）', () => {
+run('默认走 Chrome 网络栈（这才是"看起来像浏览器"的那个）', () => {
   assert.equal(DEFAULT_TRANSPORT, 'chromium')
 })
 

@@ -2,6 +2,16 @@
 
 本项目遵循大致语义化版本；日期为本地时间。
 
+## 0.6.19 — 2026-10-01
+
+**面板文案：传输层统一称为 Chrome 网络栈。**
+
+- 设置页按钮、状态提示、切换反馈、降级提示、tooltip 中的「Chromium 网络栈」全部改为「Chrome 网络栈」，
+  与实际要模仿的指纹（Chrome）保持一致。
+- tooltip 增加原因说明：官方 DSH 桌面端把插件跑成 `ELECTRON_RUN_AS_NODE=1` 的 Node 子进程，
+  拿不到 `electron.net.fetch`，因此不支持 Chrome 网络栈，只能降级为 Node fetch。
+- 内部实现、传输层类型、默认值仍保持 `chromium` 不变（底层就是 Chromium 网络库，指纹与 Chrome 一致）。
+
 ## 0.6.18 — 2026-10-01
 
 **修会话爆炸：token 刷新/内部请求不再冲掉 chat 的网页端会话。**

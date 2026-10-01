@@ -2544,7 +2544,7 @@ function Panel(): any {
     transportRow.append(el('span', 'dsw-gate-label', '请求从哪出去'))
     const transportBtns: Record<string, HTMLButtonElement> = {}
     for (const pair of [
-      ['chromium', 'Chromium 网络栈（推荐）'],
+      ['chromium', 'Chrome 网络栈（推荐）'],
       ['node', 'Node'],
     ] as const) {
       const key = pair[0]
@@ -2771,17 +2771,17 @@ function Panel(): any {
       for (const key of Object.keys(transportBtns)) {
         transportBtns[key].classList.toggle('active', key === requested)
       }
-      // 环境不支持时把 Chromium 选项禁掉，别让人选了没反应
+      // 环境不支持时把 Chrome 选项禁掉，别让人选了没反应
       const available = info.chromiumAvailable !== false
       transportBtns.chromium.disabled = !available
       transportBtns.chromium.title = available
         ? ''
-        : '本环境拿不到 electron.net.fetch（只有 Electron 的 utility 进程里有）'
+        : '本环境拿不到 electron.net.fetch（官方 DSH 桌面端把插件跑成 Node 子进程，不支持 Chrome 网络栈）'
 
       const parts = [
-        effective === 'chromium' ? '实际生效：Chromium 网络栈' : '实际生效：Node fetch',
+        effective === 'chromium' ? '实际生效：Chrome 网络栈' : '实际生效：Node fetch',
       ]
-      if (info.degraded) parts.push('配置要求 Chromium，但本环境不支持，已降级为 Node')
+      if (info.degraded) parts.push('配置要求 Chrome，但本环境不支持，已降级为 Node')
       if (effective === 'chromium') parts.push('cipher 列表哈希与 Chrome 一致、ALPN 走 h2')
       transportHint.textContent = parts.join(' · ')
       transportProxyHint.textContent = String(info.hint ?? '')
@@ -2794,7 +2794,7 @@ function Panel(): any {
         if (result?.ok) {
           applyTransportCard(result)
           transportMsg.textContent =
-            `已切换到 ${result.effective === 'chromium' ? 'Chromium 网络栈' : 'Node fetch'}，即时生效` +
+            `已切换到 ${result.effective === 'chromium' ? 'Chrome 网络栈' : 'Node fetch'}，即时生效` +
             (result.persisted === false
               ? '（未能写入配置，重启后会回到上次保存的值）'
               : '（已写入配置，重启后仍生效）')

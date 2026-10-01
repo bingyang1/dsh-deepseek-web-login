@@ -369,7 +369,7 @@ export function apply(ctx: any, config: Config = {}): void {
   logger.info?.(
     `deepseek-web: 传输层=${transportState.effective}` +
       (transportState.degraded
-        ? '（配置要求 Chromium，但本环境没有 electron.net.fetch，已降级为 Node）'
+        ? '（配置要求 Chrome，但本环境没有 electron.net.fetch，已降级为 Node）'
         : ''),
   )
 
@@ -1435,7 +1435,7 @@ export function apply(ctx: any, config: Config = {}): void {
               }
               logger.info?.(
                 `deepseek-web: 传输层切换为 ${transportState.effective}` +
-                  (transportState.degraded ? '（要求 Chromium 但本环境不可用，已降级 Node）' : ''),
+                  (transportState.degraded ? '（要求 Chrome 但本环境不可用，已降级 Node）' : ''),
               )
               sendJson(res, 200, {
                 ok: true,

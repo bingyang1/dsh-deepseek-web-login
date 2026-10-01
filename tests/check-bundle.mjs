@@ -559,7 +559,7 @@ const checks = {
   // 0.1.66：面板文案是纯文本 —— `**系统代理**` 会被原样显示成带星号。
   // 0.1.64 只扫了 client/cookies，host 侧这处一直漏着（界面截图上看不出，得读源码才发现）。
   'host 传输层提示没有 markdown 星号（0.1.66）':
-    host.includes('Chromium 网络栈会跟随「系统代理」') &&
+    host.includes('Chrome 网络栈会跟随「系统代理」') &&
     !/跟随\*\*系统代理\*\*/.test(host),
 
   'host 图片丢失要写进正文（0.1.66）':

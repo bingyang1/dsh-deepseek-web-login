@@ -1,7 +1,7 @@
 /**
  * 回归：传输层（fetch）注入必须**每次现取**，不能在模块加载那一刻固化。
  *
- * 事故（2026-09-12，本会话内实测）：为把请求从 Node 网络栈切到 Chromium 网络栈
+ * 事故（2026-09-12，本会话内实测）：为把请求从 Node 网络栈切到 Chrome 网络栈
  * （`electron.net.fetch`），给 webapi.ts 加了可注入的 fetch。最初写法是：
  *
  *     let activeFetch: typeof fetch = fetch      // ← 在模块加载时就把全局 fetch 固化
