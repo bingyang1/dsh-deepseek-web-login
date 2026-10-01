@@ -979,6 +979,18 @@ const checks = {
     // 页面辅助函数必须以字面量名出现在产物里（evaluate 的表达式里用的就是这两个名字）
     host.includes('"__dshRebuildFormData"') &&
     host.includes('"__dshB64ToBytes"'),
+
+  // ── 0.6.26：内部请求不许占用对话的会话槽 ───────────────────────────────────
+  // 用户现场：新开窗口只发一句「在？」，网页端却出现「修改」+ `2 / 2`。
+  // 根因是 `session-title`（不带 promptParts）与对话共用一个 slotKey：
+  // 内部请求先建会话、发根消息，对话复用该会话又因无链再发一条根消息 ⇒ 两条被当成同一消息的两个版本。
+  // ⚠️ 两处（openCompletion / streamWebCompletion）必须用**同一个**函数算键，
+  // 否则链会写在一个键、读另一个键 —— 所以这里断"函数存在"而不是断某个调用点。
+  'host 的内部请求用独立会话槽（对话槽里只会有一条根消息，不再出现「修改」+ n/n）':
+    /function requestSlotKey\(auth, params\) \{/.test(host) &&
+    /params\.promptParts \? slotKeyFor\(auth, params\.dshSessionId\) : `internal\|\$\{accountKey\(auth\)\}`/.test(host),
+  'client 的「自动换号」提示说清了"换号会在网页端多出一个会话"':
+    client.includes('每换一次号，网页端就会多出一个新会话'),
 }
 
 let failed = 0

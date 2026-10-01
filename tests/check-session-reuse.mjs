@@ -57,8 +57,15 @@ function mkTransport() {
 const authA = { token: 'token-A', cookie: 'c=A' }
 const authB = { token: 'token-B', cookie: 'c=B' }
 
-/** 跑一次 complete 并收集正文 + 被回收的会话 id。 */
-async function runOnce({ auth = authA, transport, fetched, sessionReuseTurns } = {}) {
+/**
+ * 跑一次 complete 并收集正文 + 被回收的会话 id。
+ *
+ * ⚠️ 默认按**真实 chat 请求**构造：带 `promptParts`。0.6.26 起"不带 promptParts 的请求"
+ * （session-title / 压缩等内部请求）会用**独立的槽**，不再占用对话的会话 —— 见 webapi 的
+ * `requestSlotKey`。所以想测"窗口 ↔ 网页端会话"的对应关系，就必须传 parts，
+ * 否则所有请求都会被当成内部请求而共用一个槽（那是另一条用例专门测的行为）。
+ */
+async function runOnce({ auth = authA, transport, fetched, sessionReuseTurns, promptParts, dshSessionId } = {}) {
   const collected = []
   const deleted = []
   const seen = []
@@ -73,6 +80,8 @@ async function runOnce({ auth = authA, transport, fetched, sessionReuseTurns } =
       thinkingEnabled: false,
       modelType: 'default',
       idleTimeoutMs: 5_000,
+      promptParts: promptParts ?? { head: 'HEAD', entries: ['User: x'] },
+      ...(dshSessionId !== undefined ? { dshSessionId } : {}),
       ...(sessionReuseTurns !== undefined ? { sessionReuseTurns } : {}),
       onDeleteSession: (id) => deleted.push(id),
     },
@@ -261,6 +270,7 @@ await test('按 DSH 会话分槽：换窗口各用各的会话，切回去复用
       thinkingEnabled: false,
       modelType: 'default',
       idleTimeoutMs: 5_000,
+      promptParts: { head: 'HEAD', entries: ['User: x'] },
       dshSessionId,
       onDeleteSession: () => {},
     }
@@ -297,7 +307,13 @@ await test('同一账号 token 刷新（有 user.id）⇒ 仍复用原会话，�
   const authOld = { token: 'token-A-old', cookie: 'c=A', user: { id: 'user-123', display: '192***27' } }
   const authNew = { token: 'token-A-new', cookie: 'c=A', user: { id: 'user-123', display: '192***27' } }
   const once = async (auth) => {
-    const params = { prompt: 'P', thinkingEnabled: false, modelType: 'default', idleTimeoutMs: 5_000 }
+    const params = {
+      prompt: 'P',
+      thinkingEnabled: false,
+      modelType: 'default',
+      idleTimeoutMs: 5_000,
+      promptParts: { head: 'HEAD', entries: ['User: x'] },
+    }
     for await (const _ of streamWebCompletion(auth, params, transport)) void _
   }
   await once(authOld)
@@ -313,7 +329,13 @@ await test('没有 user.id 时 token 刷新 ⇒ 按旧行为新建会话（有�
   const authOld = { token: 'token-A-old', cookie: 'c=A' }
   const authNew = { token: 'token-A-new', cookie: 'c=A' }
   const once = async (auth) => {
-    const params = { prompt: 'P', thinkingEnabled: false, modelType: 'default', idleTimeoutMs: 5_000 }
+    const params = {
+      prompt: 'P',
+      thinkingEnabled: false,
+      modelType: 'default',
+      idleTimeoutMs: 5_000,
+      promptParts: { head: 'HEAD', entries: ['User: x'] },
+    }
     for await (const _ of streamWebCompletion(auth, params, transport)) void _
   }
   await once(authOld)
@@ -338,6 +360,7 @@ await test('★ 槽位超限：只淘汰内存槽，绝不删网页端会话', a
       thinkingEnabled: false,
       modelType: 'default',
       idleTimeoutMs: 5_000,
+      promptParts: { head: 'HEAD', entries: ['User: x'] },
       dshSessionId: `win-${i}`,
       onDeleteSession: (id) => deleted.push(id),
     }
@@ -349,6 +372,30 @@ await test('★ 槽位超限：只淘汰内存槽，绝不删网页端会话', a
     `每个窗口各建一个会话，实际 ${created.length}`,
   )
   assert.deepEqual(deleted, [], '★ 一个都不许删 —— 淘汰只清内存槽（删了就等于扔掉那个窗口的上下文）')
+})
+
+// ── 0.6.26：内部请求不许占用对话的会话槽 ────────────────────────────────────
+// 用户现场（2026-10-01 截图）：新开一个窗口、只发一句「在？」，网页端却显示「修改」+ `2 / 2`。
+// 时序是：`session-title`（不带 promptParts 的内部请求）先到 → 建会话、发**根消息**
+// （那段 `Create a concise title…` 还直接显示在用户对话里）；随后用户的真实消息复用这个会话，
+// 又因为没有链而再发一条**根消息** ⇒ 服务端把两条当成同一条用户消息的两个版本。
+await test('★ 内部请求（session-title）用自己的会话，不占用对话的槽', async () => {
+  resetSessionReuse()
+  const { created, transport } = mkTransport()
+  setFetchImpl(async () => new Response(SSE_OK, { status: 200, headers: SSE_HEADERS }))
+  const run = async (params) => {
+    for await (const _ of streamWebCompletion(authA, params, transport)) void _
+  }
+  const base = { prompt: 'P', thinkingEnabled: false, modelType: 'default', idleTimeoutMs: 5_000 }
+  const chat = { ...base, promptParts: { head: 'HEAD', entries: ['User: 在'] }, dshSessionId: 'win-1' }
+  const title = { ...base, dshSessionId: 'win-1' } // 内部请求：同一个窗口，但不带 parts
+
+  await run(title) // ① 标题请求先到
+  assert.equal(created.length, 1, '内部请求自建一个会话')
+  await run(chat) // ② 用户的真实消息
+  assert.equal(created.length, 2, '★ 对话必须拿自己的会话，不能复用内部请求那个（否则对话里会多一条同层根消息）')
+  await run(chat) // ③ 同一窗口继续说
+  assert.equal(created.length, 2, '对话自己稳定复用')
 })
 
 // 复位，别把注入层留给别的测试

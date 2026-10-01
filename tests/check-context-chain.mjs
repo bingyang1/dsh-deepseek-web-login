@@ -353,7 +353,7 @@ await test('★ 消费方在终止事件之前就停 ⇒ 会话仍要退役（N0
 
 // 0.6.18：内部请求（如 session-title）不能抢 chat 的链，否则每个标题/压缩请求都会
 // 因「历史不是严格追加」而重开链 + 强制换新会话，把当前窗口的网页端会话冲掉。
-await test('内部非 chat 请求（不传 promptParts）不破坏 chat 的链，也不强制建新会话', async () => {
+await test('★ 内部非 chat 请求用自己的会话：既不碰 chat 的链，也不占用对话的槽', async () => {
   resetSessionReuse()
   applyContextMode('chained')
   const { transport, created } = mkTransport()
@@ -364,13 +364,15 @@ await test('内部非 chat 请求（不传 promptParts）不破坏 chat 的链�
   // 第二轮：模拟 session-title / compaction 等内部调用 —— 不传 promptParts
   const title = await runRound({ transport, entries: [E1], sse: sseWithId(3), omitParts: true })
   assert.equal(title.body.parent_message_id, null, '内部请求走全量，不发 parent')
-  assert.equal(created.length, 1, '内部请求不许强制换新会话')
+  // ★ 0.6.26：内部请求拿**自己的**会话。让它复用对话的会话会造成：
+  // 「内部请求先发一条根消息 → 对话复用该会话、因无链又发一条根消息」⇒ 网页端「修改」+ `2 / 2`。
+  assert.equal(created.length, 2, '★ 内部请求必须有自己的会话（不许占用对话的槽）')
   assert.equal(contextChainInfo()?.parentId, 2, 'chat 的链不能被内部请求覆盖')
   // 第三轮：回到 chat，必须还能续上原来的链
   const chat2 = await runRound({ transport, entries: [E1, E2], sse: sseWithId(4) })
   assert.equal(chat2.body.parent_message_id, 2, 'chat 应续上被内部请求保护下来的链')
   assert.equal(chat2.body.prompt, E2, '只发 chat 新增的那一条')
-  assert.equal(created.length, 1, '三轮只建一个会话')
+  assert.equal(created.length, 2, 'chat 稳定复用自己那个；加上内部请求的，共两个')
 })
 
 // ── 0.6.25：投喂决策留痕（真机排查的唯一抓手）───────────────────────────────

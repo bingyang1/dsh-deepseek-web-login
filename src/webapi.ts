@@ -1962,8 +1962,7 @@ const reuseSlots = new Map<string, SessionSlot>()
 
 /**
  * 同时最多养几条会话（＝几个 DSH 窗口）。
- * 超了淘汰**最久没用**的那条并连带删掉它的网页端会话 —— 否则开过的窗口越多、
- * 网页端残留的会话越多（每条都占着服务端的上下文）。
+ * 超了只淘汰**最久没用**的那条**内存槽**（0.6.23 起不再删网页端会话，见 evictIdleSlots）。
  */
 export const MAX_CONVERSATION_SLOTS = 6
 
@@ -1971,6 +1970,28 @@ export const MAX_CONVERSATION_SLOTS = 6
 function slotKeyFor(auth: WebAuth, dshSessionId?: string): string {
   const sid = typeof dshSessionId === 'string' && dshSessionId.trim() ? dshSessionId.trim() : '(unknown)'
   return `${accountKey(auth)}|${sid}`
+}
+
+/**
+ * 这一次请求该落在哪个槽上。
+ *
+ * 🔴 **内部请求不占用对话的槽**（2026-10-01 用户截图实锤）。
+ *
+ * `session-title`（以及压缩之类的内部请求）**不带结构化 promptParts**，但它们和对话
+ * 共用同一个 DSH sessionId。于是新开一个窗口、只发一句"在？"的时序是：
+ *
+ *   ① `session-title` 先到 → 建会话 → 发一条**根消息**（那段 `Create a concise title…`）
+ *   ② 用户的真实消息随后到 → **复用**这个会话 → 但内部请求不传 parts、没有链
+ *      ⇒ `decideFeed` 只能 `detach('no-chain')` ⇒ **又是根消息**
+ *
+ * 服务端把这两条看成**同一条用户消息的两个版本** ⇒ 网页端显示「修改」+ `2 / 2`，
+ * 而且标题 prompt 直接暴露在用户的对话里。
+ *
+ * 分开之后：对话槽里的第一条消息**永远**是这个窗口真正发出的那一条，根消息只有一条。
+ * 代价是内部请求自己占一个（按账号共享的）会话，它不出现在对话里。
+ */
+function requestSlotKey(auth: WebAuth, params: { dshSessionId?: string; promptParts?: unknown }): string {
+  return params.promptParts ? slotKeyFor(auth, params.dshSessionId) : `internal|${accountKey(auth)}`
 }
 
 /**
@@ -2369,7 +2390,8 @@ async function openCompletion(
   let lastFailure: AdapterLlmError | undefined
   const canFailover = makeCanFailover(params)
   // 归属键：这个窗口（DSH 会话）自己的网页端会话与链。见 slotKeyFor 的说明。
-  const slotKey = slotKeyFor(auth, params.dshSessionId)
+  //
+  const slotKey = requestSlotKey(auth, params)
   for (let attempt = 0; attempt < 2; attempt++) {
     let lease = await leaseSession(
       auth,
@@ -2658,7 +2680,8 @@ export async function* streamWebCompletion(
   const controller = new AbortController()
   const signal = params.signal ? AbortSignal.any([params.signal, controller.signal]) : controller.signal
   // 归属键：账号 + DSH 会话（窗口）。这条请求要用的网页端会话与投喂链都挂在它下面。
-  const slotKey = slotKeyFor(auth, params.dshSessionId)
+  // ⚠️ 必须与 openCompletion 用**同一个**函数算 —— 两处不一致会让链写在一个键、读另一个键。
+  const slotKey = requestSlotKey(auth, params)
   /** 本轮真的按某条链发过吗（收尾时按它决定是"接上"还是"作废"）。 */
   let sentChainKey: string | undefined
   // SSE 路径也要问「还能不能换号」（与 openCompletion 同一个判据）：节流的退避长短由它决定。
