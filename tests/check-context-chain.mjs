@@ -78,7 +78,7 @@ const authB = { token: 'token-B', cookie: 'c=B' }
  * 跑一轮：把 entries 拼成 prompt（和 adapter 一样：head + --- + 条目），
  * 同时把结构化 parts 传下去 —— 正是生产调用点的形状。
  */
-async function runRound({ auth = authA, transport, entries, sse, sessionReuseTurns, breakAfter } = {}) {
+async function runRound({ auth = authA, transport, entries, sse, sessionReuseTurns, breakAfter, omitParts } = {}) {
   const bodies = []
   const feeds = []
   const deleted = []
@@ -90,21 +90,18 @@ async function runRound({ auth = authA, transport, entries, sse, sessionReuseTur
     })
   })
   const full = `${HEAD}\n\n---\n\n${entries.join('\n\n')}`
-  const gen = streamWebCompletion(
-    auth,
-    {
-      prompt: full,
-      promptParts: { head: HEAD, entries, maxChars: 1_500_000 },
-      // 决策回执（0.1.63）：webapi 只在「决策原因变化」时回调一次
-      onContextFeed: (report) => feeds.push(report),
-      thinkingEnabled: false,
-      modelType: 'default',
-      idleTimeoutMs: 5_000,
-      ...(sessionReuseTurns !== undefined ? { sessionReuseTurns } : {}),
-      onDeleteSession: (id) => deleted.push(id),
-    },
-    transport,
-  )
+  const params = {
+    prompt: full,
+    // 决策回执（0.1.63）：webapi 只在「决策原因变化」时回调一次
+    onContextFeed: (report) => feeds.push(report),
+    thinkingEnabled: false,
+    modelType: 'default',
+    idleTimeoutMs: 5_000,
+    ...(sessionReuseTurns !== undefined ? { sessionReuseTurns } : {}),
+    onDeleteSession: (id) => deleted.push(id),
+  }
+  if (!omitParts) params.promptParts = { head: HEAD, entries, maxChars: 1_500_000 }
+  const gen = streamWebCompletion(auth, params, transport)
   let text = ''
   // `breakAfter` 模拟**消费方提前停止迭代**：DSH 读完终止事件（finish）就不再取值 ——
   // 这正是 0.6.16 修的 bug 的触发条件（`item.done` 永远取不到 ⇒ complete 恒 false）。
@@ -348,6 +345,28 @@ await test('★ 消费方在终止事件之前就停 ⇒ 会话仍要退役（N0
   const a = await runRound({ transport, entries: [E1], sse: sseWithId(2), breakAfter: 'text' })
   assert.deepEqual(a.deleted, ['sess-1'], '没等到终态就断了 ⇒ 这个会话可能停在半路，必须退役')
   assert.equal(contextChainInfo(), undefined, '没跑完不该记链')
+})
+
+// 0.6.18：内部请求（如 session-title）不能抢 chat 的链，否则每个标题/压缩请求都会
+// 因「历史不是严格追加」而重开链 + 强制换新会话，把当前窗口的网页端会话冲掉。
+await test('内部非 chat 请求（不传 promptParts）不破坏 chat 的链，也不强制建新会话', async () => {
+  resetSessionReuse()
+  applyContextMode('chained')
+  const { transport, created } = mkTransport()
+  // 第一轮：正常的 chat，建立链
+  await runRound({ transport, entries: [E1], sse: sseWithId(2) })
+  assert.equal(created.length, 1, 'chat 第一轮只建一个会话')
+  assert.equal(contextChainInfo()?.parentId, 2, '链已建立')
+  // 第二轮：模拟 session-title / compaction 等内部调用 —— 不传 promptParts
+  const title = await runRound({ transport, entries: [E1], sse: sseWithId(3), omitParts: true })
+  assert.equal(title.body.parent_message_id, null, '内部请求走全量，不发 parent')
+  assert.equal(created.length, 1, '内部请求不许强制换新会话')
+  assert.equal(contextChainInfo()?.parentId, 2, 'chat 的链不能被内部请求覆盖')
+  // 第三轮：回到 chat，必须还能续上原来的链
+  const chat2 = await runRound({ transport, entries: [E1, E2], sse: sseWithId(4) })
+  assert.equal(chat2.body.parent_message_id, 2, 'chat 应续上被内部请求保护下来的链')
+  assert.equal(chat2.body.prompt, E2, '只发 chat 新增的那一条')
+  assert.equal(created.length, 1, '三轮只建一个会话')
 })
 
 // 收尾：把全局模式还原成默认，避免影响同进程里的其它用例/后续跑批

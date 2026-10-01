@@ -410,14 +410,17 @@ test('全量模式：即使要发根消息也不换会话（否则每轮多建+�
   assert.equal(needsFreshSession({ parentMessageId: null }, true, 'full'), false)
 })
 // 「宿主真的调用了它」——判据写好了没人调，这个项目已经犯过两次。
+test('没有 promptParts 的内部请求：即使 parent=null + reused，也不强制换新会话', () => {
+  assert.equal(needsFreshSession({ parentMessageId: null }, true, 'chained', false), false)
+})
 test('webapi 真的把这条判据接在重开链路径上（且用的是强制新会话那条租用）', () => {
   const src = readFileSync(new URL('../src/webapi.ts', import.meta.url), 'utf8')
   assert.ok(
-    /needsFreshSession\(\s*feed,\s*lease\.reused,\s*currentContextMode\(\)\s*\)/.test(src),
-    'webapi 必须调用 needsFreshSession（并把当前模式传进去）',
+    /needsFreshSession\(\s*feed,\s*lease\.reused,\s*currentContextMode\(\),\s*params\.promptParts !== undefined\s*\)/.test(src),
+    'webapi 必须调用 needsFreshSession（并把当前模式和是否有结构化 parts 传进去）',
   )
   assert.ok(
-    /needsFreshSession\([\s\S]{0,300}?leaseSession\([\s\S]{0,300}?true,/.test(src),
+    /needsFreshSession\([\s\S]{0,500}?leaseSession\([\s\S]{0,300}?true,/.test(src),
     '判定要换会话后，必须用 forceNew=true 重新租一个（否则只是原地打转）',
   )
 })

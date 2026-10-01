@@ -159,12 +159,18 @@ export function needsFreshSession(
   feed: Pick<FeedDecision, 'parentMessageId'>,
   reused: boolean,
   mode: ContextMode,
+  /** 本轮是否真的传了结构化 prompt（即真的想走链）。不传结构 = 内部请求走全量，不必强制换新会话。 */
+  hasPromptParts = true,
 ): boolean {
   // ⚠️ **只在链式模式下生效**。全量模式里"每轮都是根消息"本来就是常态，
   // 若也一律换新会话，就变成**每轮多建 + 多删一个会话**（+2 个请求/轮）——
   // 请求密度本身就是风控关注点，不能为了一个只有链式模式才有的问题付这个代价。
   // 链式模式下重开链是**异常路径**（换窗口/head 变了/会话轮换），代价可以接受。
   if (mode !== 'chained') return false
+  // 0.6.18：没有结构化 parts 的请求（session-title / compaction 等）在链式模式下也走全量，
+  // 它们不是"重开链"，不需要干净会话；强制换新会让每个内部请求都退役当前会话，
+  // 把 chat 的网页端会话活活冲掉。
+  if (!hasPromptParts) return false
   return feed.parentMessageId === null && reused
 }
 

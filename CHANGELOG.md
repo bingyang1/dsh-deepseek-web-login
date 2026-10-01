@@ -2,6 +2,30 @@
 
 本项目遵循大致语义化版本；日期为本地时间。
 
+## 0.6.18 — 2026-10-01
+
+**修会话爆炸：token 刷新/内部请求不再冲掉 chat 的网页端会话。**
+
+用户现场：链式投喂下，一个窗口聊了几句后网页端突然多出几个新会话，上一句的会话也没了；
+刷新后只剩一个。根因有两个，合在一起触发：
+
+1. **`accountKey` 用 `token|cookie` 当账号身份** —— token 每 2 小时左右就会刷新（自动/手动重登），
+   刷新后插件认为"换了账号"，旧网页端会话被退役，投喂链也断了。
+2. **内部请求（`session-title`、`compaction` 等）也传 `promptParts` 走链式** —— 这些请求的条目
+   和 chat 的链不匹配，触发了「历史不是严格追加 → 重开链 → 强制换新会话」，于是每个标题/压缩
+   请求都把当前 chat 会话冲掉，旧的删、新的建。
+
+### 改动
+
+- `webapi.ts`：`accountKey` 优先用服务端返回的 `user.id` 当稳定身份；没有 `user.id` 时才回退到
+  `token|cookie`（兼容手动粘 token 的老记录）。
+- `adapter.ts`：只有用户可见的 `chat` 才把 `promptParts` 传下去；`session-title` / `compaction`
+  等内部调用走全量，不再抢 chat 的链。
+- `context-feed.ts` / `webapi.ts`：没有 `promptParts` 的请求不触发「强制换新会话」，也不会因为
+  没 ready 而把 chat 的链删掉。
+- 回归用例：`check-session-reuse` +2（token 刷新稳定性/回退）、`check-context-chain` +1、
+  `check-context-feed` +1，全部反向验证。
+
 ## 0.6.17 — 2026-10-01
 
 **增量投喂不再重发「模型上一句回答」（用户反馈：完全没必要）。**

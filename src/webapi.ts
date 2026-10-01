@@ -2009,9 +2009,16 @@ export function contextChainInfo():
   }
 }
 
-/** 凭证摘要：只用来判断「是不是同一个账号」。不做安全用途、不落日志。 */
+/** 凭证摘要：只用来判断「是不是同一个账号」。不做安全用途、不落日志。
+ *
+ * 🔴 0.6.18：改用服务端返回的 `user.id` 当稳定身份。旧实现把 `token|cookie` 当身份，
+ * 而 token 每 2 小时左右就会刷新（自动/手动重登）⇒ 刷新后插件认为是「换了账号」，
+ * 旧网页端会话被退役删除、投喂链也断了，用户看到的就是「聊了几句会话就没了、下一句又建新会话」。
+ * `user.id` 是账号在服务端的真实身份，稳定不变；没有时才回退到 token+cookie。
+ */
 function accountKey(auth: WebAuth): string {
-  const raw = `${auth?.token ?? ''}|${auth?.cookie ?? ''}`
+  const userId = auth?.user?.id
+  const raw = typeof userId === 'string' && userId ? `uid:${userId}` : `${auth?.token ?? ''}|${auth?.cookie ?? ''}`
   let hash = 2166136261
   for (let i = 0; i < raw.length; i += 1) {
     hash ^= raw.charCodeAt(i)
@@ -2301,7 +2308,7 @@ async function openCompletion(
     // 0.6.10：**重开链（parent=null）不能在"复用来的"会话里发根消息** —— 那会在同一个网页端
     // 会话里造出同一条消息的兄弟分支（网页端显示成「修改 / 重新生成」+ `n / n`），
     // 用户看到的就是"换个窗口聊天又把上下文清了一遍"。判据是纯函数，有用例守。
-    if (needsFreshSession(feed, lease.reused, currentContextMode())) {
+    if (needsFreshSession(feed, lease.reused, currentContextMode(), params.promptParts !== undefined)) {
       // ⚠️ 保留**原来那个** reason 再重算：重算时 `reused` 已是 false，会得到 'new-session'，
       // 那会把真正的原因（not-appended / head-changed / session-changed…）从日志里抹掉 ——
       // 而"这一轮为什么没走增量"正是这个回执存在的唯一理由。
@@ -2743,7 +2750,9 @@ export async function* streamWebCompletion(
     if (sentFeed?.next && roundOk && !poisoned && typeof responseMessageId === 'number') {
       contextChains.set(slotKey, { ...sentFeed.next, parentId: responseMessageId })
       lastChainKey = slotKey
-    } else if (sentChainKey !== undefined) {
+    } else if (sentChainKey !== undefined && params.promptParts !== undefined) {
+      // 0.6.18：没有 promptParts 的请求（session-title / compaction 等内部调用）
+      // 不是链式请求，失败/没 ready 也不该把 chat 的链删掉。
       contextChains.delete(sentChainKey)
       if (lastChainKey === sentChainKey) lastChainKey = undefined
     }

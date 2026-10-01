@@ -288,6 +288,39 @@ await test('没给 dshSessionId（老宿主）⇒ 退化成共用一个槽，行
   assert.equal(created.length, 1, '没有身份信息时可复用同一个会话（老行为）')
 })
 
+// 0.6.18：token 刷新后仍要认出是同一个账号，不能因此退役当前会话、破坏链。
+await test('同一账号 token 刷新（有 user.id）⇒ 仍复用原会话，不新建', async () => {
+  resetSessionReuse()
+  const { created, transport } = mkTransport()
+  setFetchImpl(okFetch)
+  const authOld = { token: 'token-A-old', cookie: 'c=A', user: { id: 'user-123', display: '192***27' } }
+  const authNew = { token: 'token-A-new', cookie: 'c=A', user: { id: 'user-123', display: '192***27' } }
+  const once = async (auth) => {
+    const params = { prompt: 'P', thinkingEnabled: false, modelType: 'default', idleTimeoutMs: 5_000 }
+    for await (const _ of streamWebCompletion(auth, params, transport)) void _
+  }
+  await once(authOld)
+  assert.equal(created.length, 1)
+  await once(authNew)
+  assert.equal(created.length, 1, 'token 刷新后仍应复用同一个网页端会话')
+})
+
+await test('没有 user.id 时 token 刷新 ⇒ 按旧行为新建会话（有测试防退化）', async () => {
+  resetSessionReuse()
+  const { created, transport } = mkTransport()
+  setFetchImpl(okFetch)
+  const authOld = { token: 'token-A-old', cookie: 'c=A' }
+  const authNew = { token: 'token-A-new', cookie: 'c=A' }
+  const once = async (auth) => {
+    const params = { prompt: 'P', thinkingEnabled: false, modelType: 'default', idleTimeoutMs: 5_000 }
+    for await (const _ of streamWebCompletion(auth, params, transport)) void _
+  }
+  await once(authOld)
+  assert.equal(created.length, 1)
+  await once(authNew)
+  assert.equal(created.length, 2, '没有 user.id 时 token 不同只能按旧行为新建')
+})
+
 // 复位，别把注入层留给别的测试
 setFetchImpl()
 

@@ -1282,6 +1282,8 @@ export function createAdapter(deps: AdapterDeps) {
         finishReason = undefined
         textLenAtRoundStart = textBlock?.text?.length ?? 0
         roundStartedAt = Date.now()
+        // 0.6.18：只有 chat 才配网页端投喂链；session-title/compaction 等内部调用不该抢链。
+        const chatLike = allowsAutoContinue(options?.purpose)
         try {
       for await (const event of runStream(auth as WebAuth, {
         prompt: currentPrompt,
@@ -1291,11 +1293,19 @@ export function createAdapter(deps: AdapterDeps) {
         canFailover: deps.canFailover,
         // 链式投喂用：把结构与 prompt 一起传下去，webapi 才能算出"这一轮新增了哪几条"。
         // 漏传 = 链式模式静默退化成全量（有产物断言守着）。
-        promptParts: {
-          head: promptParts.head,
-          entries: promptParts.entries,
-          maxChars: deps.config.maxPromptChars ?? DEFAULT_MAX_PROMPT_CHARS,
-        },
+        // ⚠️ 只有用户可见的 chat 才走链：内部用途（session-title / compaction 等）
+        // 也共享同一个 DSH sessionId，传 promptParts 会让它们的条目去撞 chat 的链，
+        // 结果每条标题/压缩请求都触发「历史不是严格追加 → 重开链 → 强制换新会话」，
+        // 把当前窗口的网页端会话活活冲掉（用户看到"其他窗口/上一句的会话又没了"）。
+        ...(chatLike
+          ? {
+              promptParts: {
+                head: promptParts.head,
+                entries: promptParts.entries,
+                maxChars: deps.config.maxPromptChars ?? DEFAULT_MAX_PROMPT_CHARS,
+              },
+            }
+          : {}),
         // 链式投喂的决策回执（0.1.63）→ 一行日志。webapi 只在「原因变化」时回调，
         // 所以不会每轮刷屏，但"哪一轮开始不再发增量、为什么"一定看得见。
         onContextFeed: (report) => {
