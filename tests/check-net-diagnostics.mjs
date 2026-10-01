@@ -87,7 +87,7 @@ await run('非 Electron 环境：electronNetFetch() 返回 undefined 而不是�
 await run('非 Electron 环境：诊断返回 ok:false 并说明原因，不抛错', async () => {
   const result = await runNetFetchDiagnostics(undefined, 'probe')
   assert.equal(result.ok, false)
-  assert.match(String(result.error), /net\.fetch 不可用/)
+  assert.match(String(result.error), /Node fetch|未启用 Chrome 网络栈/)
 })
 
 await run('非 Electron 环境：即使 auth 缺失 + 要求 stream 也不会崩', async () => {

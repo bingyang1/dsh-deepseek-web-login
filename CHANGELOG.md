@@ -2,6 +2,18 @@
 
 本项目遵循大致语义化版本；日期为本地时间。
 
+## 0.6.21 — 2026-10-01
+
+**修复：传输层诊断测试未跟随浏览器代理。**
+
+- 面板显示「通过系统 Edge/Chrome 进程代理」时，「测试传输层」按钮仍只检查 `electron.net.fetch`，
+  导致实际已生效的浏览器代理被误判为不可用。
+- `transport.ts` 新增 `currentEffectiveFetch()`，记录并暴露当前实际生效的 fetch 种类
+  (`node` / `electron` / `browser`)。
+- `net-diagnostics.ts` 改为用当前生效的 fetch 做探测，测试结果区分 `electron.net.fetch` 与
+  `浏览器代理`。
+- 当实际生效为 Node fetch 时，错误提示改为「未启用 Chrome 网络栈」。
+
 ## 0.6.20 — 2026-10-01
 
 **浏览器代理传输层：官方 DSH 桌面端也能走真实 Chrome 指纹。**

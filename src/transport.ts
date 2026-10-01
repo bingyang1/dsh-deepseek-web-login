@@ -142,21 +142,44 @@ export function resolveTransportState(requested: TransportKind): TransportState 
 }
 
 let appliedBrowserFetch: typeof fetch | undefined
+let currentEffectiveKind: 'node' | 'electron' | 'browser' = 'node'
 
 export { shutdownBrowserTransport } from './browser-transport.ts'
+
+/** 当前实际生效的 fetch 实现与它是哪一种 Chrome/Node 网络栈。 */
+export function currentEffectiveFetch(): {
+  fetch: typeof fetch
+  kind: 'node' | 'electron' | 'browser'
+} {
+  if (currentEffectiveKind === 'browser' && appliedBrowserFetch) {
+    return { fetch: appliedBrowserFetch, kind: 'browser' }
+  }
+  const electron = electronNetFetch()
+  if (currentEffectiveKind === 'electron' && electron) {
+    return { fetch: electron, kind: 'electron' }
+  }
+  return { fetch: globalThis.fetch, kind: 'node' }
+}
 
 /** 把状态落到 webapi 的注入层（`undefined` 即还原为 Node 全局 fetch）。 */
 export function applyTransportState(state: TransportState): void {
   if (state.effective === 'chromium' && state.viaBrowserProxy) {
     appliedBrowserFetch = createBrowserFetch()
     setFetchImpl(appliedBrowserFetch)
+    currentEffectiveKind = 'browser'
     return
   }
   if (appliedBrowserFetch) {
     void shutdownBrowserTransport()
     appliedBrowserFetch = undefined
   }
-  setFetchImpl(state.effective === 'chromium' ? electronNetFetch() : undefined)
+  if (state.effective === 'chromium' && electronNetFetch()) {
+    setFetchImpl(electronNetFetch())
+    currentEffectiveKind = 'electron'
+    return
+  }
+  setFetchImpl(undefined)
+  currentEffectiveKind = 'node'
 }
 
 /** 读设置 → 解析 → 应用，一步到位。 */

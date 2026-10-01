@@ -34,7 +34,7 @@ import { createServer } from 'node:http'
 import { dirname, join } from 'node:path'
 import { resolveDshHome, type WebAuth } from './auth.ts'
 import { buildDsHeaders, fetchImplKind, scheduleDeleteSession, setFetchImpl, streamWebCompletion } from './webapi.ts'
-import { electronNetFetch } from './transport.ts'
+import { currentEffectiveFetch } from './transport.ts'
 
 export type NetFetchMode = 'probe' | 'stream'
 
@@ -134,11 +134,12 @@ export async function probeStreamingSupport(fetchImpl: typeof fetch) {
  * 整个过程**不改变主请求路径** —— 注入的传输层用完即还原（finally 保证）。
  */
 export async function runNetFetchDiagnostics(auth: WebAuth | undefined, mode: NetFetchMode = 'probe') {
-  const netFetch = electronNetFetch()
-  if (!netFetch) {
-    return { ok: false, error: 'electron.net.fetch 不可用（宿主未暴露 net）' } as const
+  const { fetch: netFetch, kind: transportKind } = currentEffectiveFetch()
+  if (transportKind === 'node') {
+    return { ok: false, error: '当前实际生效的是 Node fetch，未启用 Chrome 网络栈' } as const
   }
 
+  const transportLabel = transportKind === 'browser' ? '浏览器代理' : 'electron.net.fetch'
   const transportBefore = fetchImplKind()
   const results: any[] = []
 
@@ -147,7 +148,7 @@ export async function runNetFetchDiagnostics(auth: WebAuth | undefined, mode: Ne
     const response = await netFetch('https://tls.peet.ws/api/all')
     const payload: any = await response.json()
     results.push({
-      step: '① netFetch → tls.peet.ws（指纹）',
+      step: `① ${transportLabel} → tls.peet.ws（指纹）`,
       ok: true,
       status: response.status,
       ja3_hash: payload?.tls?.ja3_hash,
@@ -157,15 +158,15 @@ export async function runNetFetchDiagnostics(auth: WebAuth | undefined, mode: Ne
       ua: String(payload?.user_agent ?? '').slice(0, 70),
     })
   } catch (error: any) {
-    results.push({ step: '① netFetch → tls.peet.ws（指纹）', ok: false, error: error?.message ?? String(error) })
+    results.push({ step: `① ${transportLabel} → tls.peet.ws（指纹）`, ok: false, error: error?.message ?? String(error) })
   }
 
   // ② 流式能力（零额度、零外部依赖）：拿不到 response.body 就没法读 SSE，成败点
-  results.push({ step: '② netFetch 本地分块流（response.body + AbortSignal）', ...(await probeStreamingSupport(netFetch)) })
+  results.push({ step: `② ${transportLabel} 本地分块流（response.body + AbortSignal）`, ...(await probeStreamingSupport(netFetch)) })
 
   // ③ 鉴权（只读 users/current，不生成）
   if (!auth) {
-    results.push({ step: '③ netFetch → users/current（鉴权）', ok: false, error: '尚未登录' })
+    results.push({ step: `③ ${transportLabel} → users/current（鉴权）`, ok: false, error: '尚未登录' })
   } else {
     try {
       const started = Date.now()
@@ -175,14 +176,14 @@ export async function runNetFetchDiagnostics(auth: WebAuth | undefined, mode: Ne
       })
       const text = await response.text()
       results.push({
-        step: '③ netFetch → users/current（鉴权）',
+        step: `③ ${transportLabel} → users/current（鉴权）`,
         ok: response.ok,
         status: response.status,
         ms: Date.now() - started,
         body: text.slice(0, 240),
       })
     } catch (error: any) {
-      results.push({ step: '③ netFetch → users/current（鉴权）', ok: false, error: error?.message ?? String(error) })
+      results.push({ step: `③ ${transportLabel} → users/current（鉴权）`, ok: false, error: error?.message ?? String(error) })
     }
   }
 
@@ -210,7 +211,7 @@ export async function runNetFetchDiagnostics(auth: WebAuth | undefined, mode: Ne
         }
       }
       results.push({
-        step: '④ netFetch → DeepSeek 流式 completion（端到端）',
+        step: `④ ${transportLabel} → DeepSeek 流式 completion（端到端）`,
         ok: true,
         text_chunks: chunks,
         ms: Date.now() - started,
@@ -218,7 +219,7 @@ export async function runNetFetchDiagnostics(auth: WebAuth | undefined, mode: Ne
       })
     } catch (error: any) {
       results.push({
-        step: '④ netFetch → DeepSeek 流式 completion（端到端）',
+        step: `④ ${transportLabel} → DeepSeek 流式 completion（端到端）`,
         ok: false,
         code: error?.code,
         error: error?.message ?? String(error),
@@ -240,7 +241,7 @@ export async function runNetFetchDiagnostics(auth: WebAuth | undefined, mode: Ne
     }
   }
 
-  return { ok: true, mode, transportBefore, transportAfter: fetchImplKind(), results } as const
+  return { ok: true, mode, transportKind, transportBefore, transportAfter: fetchImplKind(), results } as const
 }
 
 /** 启动探测的标记文件路径（与 gate.json 同目录，沿用 DSH_HOME 约定）。 */
