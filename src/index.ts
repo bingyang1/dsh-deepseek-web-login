@@ -118,6 +118,7 @@ import {
   DEFAULT_TRANSPORT,
   TRANSPORT_HINT,
   type TransportKind,
+  shutdownBrowserTransport,
 } from './transport.ts'
 import {
   applyContextMode,
@@ -369,8 +370,10 @@ export function apply(ctx: any, config: Config = {}): void {
   logger.info?.(
     `deepseek-web: 传输层=${transportState.effective}` +
       (transportState.degraded
-        ? '（配置要求 Chrome，但本环境没有 electron.net.fetch，已降级为 Node）'
-        : ''),
+        ? '（配置要求 Chrome，但本环境没有 electron.net.fetch 也没有系统浏览器，已降级为 Node）'
+        : transportState.viaBrowserProxy
+          ? '（通过系统 Edge/Chrome 进程代理）'
+          : ''),
   )
 
   // ── 自动切换账号（**检查点式**，刻意不用定时器）────────────────────────
@@ -1435,7 +1438,11 @@ export function apply(ctx: any, config: Config = {}): void {
               }
               logger.info?.(
                 `deepseek-web: 传输层切换为 ${transportState.effective}` +
-                  (transportState.degraded ? '（要求 Chrome 但本环境不可用，已降级 Node）' : ''),
+                  (transportState.degraded
+                    ? '（要求 Chrome 但本环境不可用，已降级 Node）'
+                    : transportState.viaBrowserProxy
+                      ? '（通过系统 Edge/Chrome 进程代理）'
+                      : ''),
               )
               sendJson(res, 200, {
                 ok: true,
@@ -1981,6 +1988,9 @@ export function apply(ctx: any, config: Config = {}): void {
     } catch {}
     try {
       void sessionCleaner.flush()
+    } catch {}
+    try {
+      void shutdownBrowserTransport()
     } catch {}
   }, 'dsh-deepseek-web-login: teardown')
 }

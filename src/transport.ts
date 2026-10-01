@@ -26,6 +26,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { resolveDshHome } from './auth.ts'
+import {
+  createBrowserFetch,
+  shutdownBrowserTransport,
+  systemBrowserAvailable,
+} from './browser-transport.ts'
 import { setFetchImpl } from './webapi.ts'
 
 export type TransportKind = 'chromium' | 'node'
@@ -74,32 +79,83 @@ export interface TransportState {
   requested: TransportKind
   /** 实际生效的那一个 */
   effective: TransportKind
-  /** 要求 chromium 但环境不支持，已降级到 Node */
+  /** 要求 chromium 但没有任何可用 Chrome 网络栈实现，已降级到 Node */
   degraded: boolean
   /** 本环境是否具备 Chromium 网络栈（Electron utility 进程里才有） */
   chromiumAvailable: boolean
+  /** 本环境是否具备系统浏览器（Edge/Chrome），可用作浏览器代理 */
+  browserAvailable: boolean
+  /** 实际走的是浏览器代理（不是 electron.net.fetch） */
+  viaBrowserProxy: boolean
 }
 
 /**
  * 决定实际用哪个。
  *
- * 降级只在**启动时**按能力判定（拿不到 `electron.net.fetch` 就用 Node），
- * **不做「请求失败后自动换一条重试」** —— 完成请求一旦重发可能就是一次重复生成，
- * 代价比"切错了手动改回来"大得多。
+ * 优先级：electron.net.fetch > 系统浏览器代理 > Node fetch。
+ * 降级只在**启动时**按能力判定，**不做「请求失败后自动换一条重试」** ——
+ * 完成请求一旦重发可能就是一次重复生成，代价比"切错了手动改回来"大得多。
  */
 export function resolveTransportState(requested: TransportKind): TransportState {
-  const chromiumAvailable = electronNetFetch() !== undefined
-  if (requested === 'chromium' && chromiumAvailable) {
-    return { requested, effective: 'chromium', degraded: false, chromiumAvailable }
-  }
+  const electronFetch = electronNetFetch()
+  const chromiumAvailable = electronFetch !== undefined
+  const browserAvailable = systemBrowserAvailable()
+
   if (requested === 'chromium') {
-    return { requested, effective: 'node', degraded: true, chromiumAvailable }
+    if (electronFetch) {
+      return {
+        requested,
+        effective: 'chromium',
+        degraded: false,
+        chromiumAvailable: true,
+        browserAvailable,
+        viaBrowserProxy: false,
+      }
+    }
+    if (browserAvailable) {
+      return {
+        requested,
+        effective: 'chromium',
+        degraded: false,
+        chromiumAvailable: false,
+        browserAvailable: true,
+        viaBrowserProxy: true,
+      }
+    }
+    return {
+      requested,
+      effective: 'node',
+      degraded: true,
+      chromiumAvailable: false,
+      browserAvailable: false,
+      viaBrowserProxy: false,
+    }
   }
-  return { requested, effective: 'node', degraded: false, chromiumAvailable }
+  return {
+    requested,
+    effective: 'node',
+    degraded: false,
+    chromiumAvailable,
+    browserAvailable,
+    viaBrowserProxy: false,
+  }
 }
+
+let appliedBrowserFetch: typeof fetch | undefined
+
+export { shutdownBrowserTransport } from './browser-transport.ts'
 
 /** 把状态落到 webapi 的注入层（`undefined` 即还原为 Node 全局 fetch）。 */
 export function applyTransportState(state: TransportState): void {
+  if (state.effective === 'chromium' && state.viaBrowserProxy) {
+    appliedBrowserFetch = createBrowserFetch()
+    setFetchImpl(appliedBrowserFetch)
+    return
+  }
+  if (appliedBrowserFetch) {
+    void shutdownBrowserTransport()
+    appliedBrowserFetch = undefined
+  }
   setFetchImpl(state.effective === 'chromium' ? electronNetFetch() : undefined)
 }
 

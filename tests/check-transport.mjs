@@ -20,6 +20,8 @@ import { join } from 'node:path'
 // 先钉住 DSH_HOME，测试不许碰真实的 ~/.dsh
 const HOME = mkdtempSync(join(tmpdir(), 'dsh-transport-'))
 process.env.DSH_HOME = HOME
+// 关闭浏览器代理，确保测试退化逻辑时只看 electron.net.fetch 的能力判定
+process.env.DSH_NO_BROWSER_TRANSPORT = '1'
 
 const {
   DEFAULT_TRANSPORT,

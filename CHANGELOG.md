@@ -2,6 +2,19 @@
 
 本项目遵循大致语义化版本；日期为本地时间。
 
+## 0.6.20 — 2026-10-01
+
+**浏览器代理传输层：官方 DSH 桌面端也能走真实 Chrome 指纹。**
+
+- 新增 `src/browser-transport.ts`：当 `electron.net.fetch` 不可用时，启动系统里的 Edge/Chrome 进程
+  （headless + 独立 profile），通过 CDP `Runtime.addBinding` 把请求代理给浏览器的 `fetch()`。
+- 请求实际从浏览器网络栈发出，TLS/HTTP2 指纹与真实浏览器一致；响应通过 binding 分块传回 Node，
+  再包装成标准 `Response`（含 ReadableStream）。
+- `transport.ts` 自动 fallback：electron.net.fetch → 系统浏览器代理 → Node fetch。
+- 设置页提示更新：走浏览器代理时显示「通过系统 Edge/Chrome 进程代理」；无浏览器时才降级 Node。
+- 新增回归用例 `tests/check-browser-transport.mjs`；保留 `DSH_NO_BROWSER_TRANSPORT=1` 测试开关。
+- 传输层文案保持「Chrome 网络栈」（0.6.19）。
+
 ## 0.6.19 — 2026-10-01
 
 **面板文案：传输层统一称为 Chrome 网络栈。**
