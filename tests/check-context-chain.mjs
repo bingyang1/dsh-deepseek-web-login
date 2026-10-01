@@ -373,6 +373,44 @@ await test('内部非 chat 请求（不传 promptParts）不破坏 chat 的链�
   assert.equal(created.length, 1, '三轮只建一个会话')
 })
 
+// ── 0.6.25：投喂决策留痕（真机排查的唯一抓手）───────────────────────────────
+// 判据只在"原因变化时"打宿主日志，而**宿主日志不落盘** ⇒ 真机上查不到"这一轮为什么没走增量"，
+// 2026-10-01 两次排查都只能往产物里插桩。这条守住留痕真的会写、且写到点子上。
+await test('★ 每轮决策落盘 feed-decisions.jsonl，并给出"链尾是否还在原位"', async () => {
+  const { feedDecisionLogPath } = await import('../src/webapi.ts')
+  const { readFileSync, existsSync, rmSync } = await import('node:fs')
+  const file = feedDecisionLogPath()
+  if (existsSync(file)) rmSync(file)
+
+  resetSessionReuse()
+  applyContextMode('chained')
+  const { transport } = mkTransport()
+  await runRound({ transport, entries: [E1], sse: sseWithId(2) })
+  await runRound({ transport, entries: [E1, E2], sse: sseWithId(3) })
+  await runRound({ transport, entries: ['User: 第一问（被改写）', E2], sse: sseWithId(4) })
+
+  assert.ok(existsSync(file), '留痕文件必须被创建')
+  const notes = readFileSync(file, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+  assert.equal(notes.length, 3, `三轮应写三条，实际 ${notes.length}`)
+
+  // 第一轮：还没有链 ⇒ 当链首
+  assert.equal(notes[0].reason, 'new-session')
+  assert.equal(notes[0].chainLen, null)
+  assert.equal(notes[0].reused, false)
+
+  // 第二轮：严格追加 ⇒ 走增量，且链尾仍在原位
+  assert.equal(notes[1].reason, 'chained', `实际 ${notes[1].reason}`)
+  assert.equal(notes[1].reused, true)
+  assert.equal(notes[1].tailSame, true, 'chain 是 entries 的前缀时 tailSame 必须为 true')
+
+  // 第三轮：历史被改写 ⇒ 退回全量，tailSame=false —— 这正是"为什么没续链"的直接答案
+  assert.equal(notes[2].reason, 'not-appended')
+  assert.equal(notes[2].tailSame, false, '链尾被改写时必须报 false，否则这条留痕没用')
+})
+
 // 收尾：把全局模式还原成默认，避免影响同进程里的其它用例/后续跑批
 applyContextMode('full')
 resetSessionReuse()

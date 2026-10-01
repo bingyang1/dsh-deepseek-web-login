@@ -19,7 +19,7 @@
  *     {"v":"…"} / {"o":"APPEND","v":"…"}        承接上一个 path 的续段
  *     {"p":"response/status","v":"FINISHED"}    状态
  */
-import { appendFileSync, mkdirSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { WebAuth } from './auth.ts'
@@ -2010,6 +2010,63 @@ let sentRefIdsSession: string | undefined
  */
 let lastFeedReason: FeedReason | undefined
 
+/** 投喂决策留痕的路径（与 gate.json 同目录）。 */
+export function feedDecisionLogPath(): string {
+  return join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'web-login', 'feed-decisions.jsonl')
+}
+
+/** 留痕保留多少条（环形）。 */
+export const FEED_DECISION_KEEP = 300
+/** 超过这个字节数就裁剪一次（`statSync` 很便宜，不必每次读全文件）。 */
+const FEED_DECISION_MAX_BYTES = 256 * 1024
+
+/** 一轮投喂决策的**结构性**事实（不记任何内容）。 */
+export interface FeedDecisionNote {
+  at: number
+  /** `chained` = 真的只发了增量；其余都是"重发全量"的具体理由。 */
+  reason: FeedReason
+  /** 这一轮的网页端会话是不是复用来的。 */
+  reused: boolean
+  /** 网页端会话 id 前 8 位。 */
+  session: string
+  /** 账号键前 8 位（切号会让它变）。 */
+  account: string
+  /** 链里已发出的条目数（没有链时 null）。 */
+  chainLen: number | null
+  /** 本轮结构化条目的条数。 */
+  entriesLen: number | null
+  /**
+   * 🔴 **链尾是否仍在本轮的同一位置** —— 这是 `canExtendChain` 第二条判据的直接答案，
+   * 也是"这一轮为什么没续链"最有用的一条：`false` 说明 DSH 的历史被改写过，
+   * `null` 说明这一轮压根没传结构化 prompt。
+   */
+  tailSame: boolean | null
+}
+
+/**
+ * 记一轮投喂决策。
+ *
+ * 为什么必须有它（2026-10-01 两次排查都被它卡住）：
+ * 判据只在**原因变化时**打 `链式投喂退回全量重发（原因=X）`，而**宿主日志不落盘** ——
+ * 真机上根本查不到"这一轮为什么没走增量"，最后只能往已安装的产物里插桩。
+ * 把决策要素落成 jsonl 之后，直接读文件就能回答，不必再占一个发版周期。
+ *
+ * ⚠️ 只记**结构性事实**（长度 / 原因 / 是否复用 / 链尾是否还在原位），不记内容。
+ */
+function noteFeedDecision(note: FeedDecisionNote): void {
+  try {
+    const file = feedDecisionLogPath()
+    mkdirSync(join(file, '..'), { recursive: true })
+    appendFileSync(file, `${JSON.stringify(note)}\n`, 'utf8')
+    if (statSync(file).size > FEED_DECISION_MAX_BYTES) {
+      const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean)
+      writeFileSync(file, `${lines.slice(-FEED_DECISION_KEEP).join('\n')}\n`, 'utf8')
+    }
+  } catch {
+    /* 留痕失败不影响请求主流程 */
+  }
+}
+
 /** 丢弃当前的链（会话退役/测试隔离用）。 */
 export function resetContextChain(): void {
   contextChains.clear()
@@ -2363,6 +2420,27 @@ async function openCompletion(
       feed = { ...planFeed(lease.sessionId, lease.reused), reason }
     }
     const sessionId = lease.sessionId
+    // 决策留痕（0.6.25）：把"这一轮为什么走/没走增量"落盘 —— 宿主日志不落盘，真机上查不到。
+    {
+      const chainForNote = contextChains.get(slotKey)
+      const chainEntries = chainForNote?.entries
+      const currentEntries = params.promptParts?.entries
+      noteFeedDecision({
+        at: Date.now(),
+        reason: feed.reason,
+        reused: lease.reused,
+        session: String(sessionId).slice(0, 8),
+        account: accountKey(auth),
+        chainLen: chainEntries ? chainEntries.length : null,
+        entriesLen: currentEntries ? currentEntries.length : null,
+        tailSame:
+          !chainEntries || !currentEntries
+            ? null
+            : currentEntries.length <= chainEntries.length
+              ? false
+              : currentEntries[chainEntries.length - 1] === chainEntries[chainEntries.length - 1],
+      })
+    }
     // 决策回执（0.1.63）：只在原因变化时上报一次，让日志能回答"这一轮为什么没走增量"。
     if (feed.reason !== lastFeedReason) {
       lastFeedReason = feed.reason
