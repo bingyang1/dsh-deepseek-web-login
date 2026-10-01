@@ -459,7 +459,13 @@ const checks = {
     /typeof d\.response_message_id === ["']number["'][\s\S]{0,80}?onResponseMessageId/.test(host) &&
     // 0.6.12：链改成按 DSH 会话分槽的 Map（`contextChains.set(slotKey, {...})`），
     // 断言的**意图**不变：跑完且拿到 response id 才把那一条链接上。
-    /sentFeed\?\.next && complete && !poisoned[\s\S]{0,200}?contextChains\.set\([\s\S]{0,80}?parentId: responseMessageId/.test(host) &&
+    // 0.6.16：判据从裸 `complete` 改成 `roundOk`（= complete || 服务端显式终态）。
+    // 意图不变（跑完且拿到 response id 才把链接上），但"跑完"的定义必须包含显式终态 ——
+    // 只认 complete 会把成功的一轮判成没跑完（现场 bug：每轮新建会话 + 旧会话被删）。
+    /sentFeed\?\.next && roundOk && !poisoned[\s\S]{0,200}?contextChains\.set\([\s\S]{0,80}?parentId: responseMessageId/.test(host) &&
+    // 牙齿：不许退回"只认 complete"的老写法；`roundOk` 必须是 complete 与显式终态的并集。
+    /const roundOk = complete \|\| sawTerminal/.test(host) &&
+    /kind === ["']finish["']/.test(host) &&
     host.includes('context-feed.json'),
 
   // ── 0.2.0 ────────────────────────────────────────────────

@@ -78,9 +78,10 @@ const authB = { token: 'token-B', cookie: 'c=B' }
  * 跑一轮：把 entries 拼成 prompt（和 adapter 一样：head + --- + 条目），
  * 同时把结构化 parts 传下去 —— 正是生产调用点的形状。
  */
-async function runRound({ auth = authA, transport, entries, sse, sessionReuseTurns } = {}) {
+async function runRound({ auth = authA, transport, entries, sse, sessionReuseTurns, breakAfter } = {}) {
   const bodies = []
   const feeds = []
+  const deleted = []
   setFetchImpl(async (url, init) => {
     bodies.push(JSON.parse(String(init?.body ?? '{}')))
     return new Response(typeof sse === 'function' ? sse(bodies.length) : sse ?? SSE_NO_ID, {
@@ -100,13 +101,19 @@ async function runRound({ auth = authA, transport, entries, sse, sessionReuseTur
       modelType: 'default',
       idleTimeoutMs: 5_000,
       ...(sessionReuseTurns !== undefined ? { sessionReuseTurns } : {}),
-      onDeleteSession: () => {},
+      onDeleteSession: (id) => deleted.push(id),
     },
     transport,
   )
   let text = ''
-  for await (const ev of gen) if (ev.kind === 'text') text += ev.text
-  return { body: bodies[0], bodies, text, full, feeds }
+  // `breakAfter` 模拟**消费方提前停止迭代**：DSH 读完终止事件（finish）就不再取值 ——
+  // 这正是 0.6.16 修的 bug 的触发条件（`item.done` 永远取不到 ⇒ complete 恒 false）。
+  for await (const ev of gen) {
+    if (ev.kind === 'text') text += ev.text
+    if (breakAfter === 'finish' && ev.kind === 'finish') break
+    if (breakAfter === 'text' && ev.kind === 'text') break
+  }
+  return { body: bodies[0], bodies, text, full, feeds, deleted }
 }
 
 const E1 = 'User: 第一问'
@@ -314,6 +321,33 @@ await test('resetContextChain 一并清掉「上次上报过的原因」（复�
   resetContextChain()
   const c = await runRound({ transport, entries: [E1, E2, E3], sse: sseWithId(4) })
   assert.deepEqual(c.feeds.map((f) => f.reason), ['mode-full'], 'reset 之后必须能重新看到决策原因')
+})
+
+// ── 2026-10-01 用户现场：链式模式下一个窗口聊三句 ⇒ 网页端多出三个新会话（旧会话还被删）──
+// 根因：收尾时"放过这个会话"的条件里有 `complete`，而 `complete` 只在「底层流的迭代器自然结束」
+// 时才置真 —— 消费方（DSH）读到终止事件就停止取值，`item.done` 永远取不到 ⇒ 每一轮都被判成
+// "没跑完" ⇒ 会话被退役+删除、链也记不上 ⇒ 下一轮只能新建会话。
+// 修法：把服务端的**显式终态**（`kind:'finish'`）也算作"这一轮成了"。下面两条一正一反守着它。
+await test('★ 消费方读完终止事件就停 ⇒ 会话必须保留、链必须记上（0.6.16 修的现场 bug）', async () => {
+  resetSessionReuse()
+  applyContextMode('chained')
+  const { transport, created } = mkTransport()
+  const a = await runRound({ transport, entries: [E1], sse: sseWithId(2), breakAfter: 'finish' })
+  assert.equal(a.text, 'ok', '自证：这一轮真的产出了正文')
+  assert.deepEqual(created, ['sess-1'], '应该只建了一个会话')
+  assert.deepEqual(a.deleted, [], `读完终止事件就停，不该回收会话（否则每轮都会新建一个）：${a.deleted}`)
+  const chain = contextChainInfo()
+  assert.ok(chain, '这一轮成功了 ⇒ 链必须记上（否则下一轮只能全量重发）')
+  assert.equal(chain.parentId, 2)
+})
+
+await test('★ 消费方在终止事件之前就停 ⇒ 会话仍要退役（N04 的意图不能被削弱）', async () => {
+  resetSessionReuse()
+  applyContextMode('chained')
+  const { transport } = mkTransport()
+  const a = await runRound({ transport, entries: [E1], sse: sseWithId(2), breakAfter: 'text' })
+  assert.deepEqual(a.deleted, ['sess-1'], '没等到终态就断了 ⇒ 这个会话可能停在半路，必须退役')
+  assert.equal(contextChainInfo(), undefined, '没跑完不该记链')
 })
 
 // 收尾：把全局模式还原成默认，避免影响同进程里的其它用例/后续跑批

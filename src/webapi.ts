@@ -1955,6 +1955,14 @@ function slotKeyFor(auth: WebAuth, dshSessionId?: string): string {
 const contextChains = new Map<string, ChainState>()
 /** 最近用过的链归属键 —— 面板只展示"当前那条"，用它定位。 */
 let lastChainKey: string | undefined
+/**
+ * 最近一次"收尾把会话退役"的原因（0.6.16）。
+ *
+ * 为什么要有它：2026-10-01 那次"每轮新建一个网页端会话（旧会话还被删了）"查了一整轮 ——
+ * 判据只在"原因变化时"写宿主日志、而宿主日志不落盘，最后靠**往产物里插桩**才定位到。
+ * 现在原因直接挂在 `/context-mode` 的 `chain` 上：`not-finished` 就是那条 bug 复发。
+ */
+let lastRetireReason: string | undefined
 
 /**
  * 服务端**已知**的图片 file_id（0.1.83）：本会话内已经随请求发出去过的那批。
@@ -1996,6 +2004,8 @@ export function contextChainInfo():
     parentId: chain.parentId,
     // 同时养着几条会话（＝几个 DSH 窗口各一条）
     slots: reuseSlots.size,
+    // 上一次收尾为什么把会话退役了（`rotated` 是正常轮换；`not-finished` 是异常）。
+    ...(lastRetireReason ? { lastRetire: lastRetireReason } : {}),
   }
 }
 
@@ -2537,6 +2547,14 @@ export async function* streamWebCompletion(
   let iterator: AsyncGenerator<WebStreamEvent> | undefined
   let body: any
   let complete = false
+  /**
+   * 本轮见过服务端的**显式终态**（`kind:'finish'`）吗。
+   *
+   * 与 `complete` 的分工：`complete` 需要"底层流的迭代器自然结束"（消费方必须多取一次），
+   * 而消费方读完终止事件就可能不取了 ⇒ 只认 `complete` 会把**成功的一轮**误判成没跑完，
+   * 于是会话被退役+删除、链也记不上（2026-10-01 的"每轮新建会话"就是这条）。
+   */
+  let sawTerminal = false
   let poisoned = false
   let timer: ReturnType<typeof setTimeout> | undefined
   /** 本轮实际发出去了什么（链式投喂据此记账；见 finally 里的链更新）。 */
@@ -2663,8 +2681,20 @@ export async function* streamWebCompletion(
       if (item.done) {
         complete = true
         break
+      }      if (item.value.kind === 'error') poisoned = true
+      // 🔴 服务端给**显式终态**就算这一轮成功（`[DONE]` 时解析器补发的 `kind:'finish'`）。
+      //
+      // 为什么不能只等 `item.done`（2026-10-01 实测的严重 bug）：消费方（DSH）读完终止事件
+      // 就**停止迭代**，于是我们的 `finally` 先跑 —— 此时 `item.done` 从没被取到，`complete`
+      // 永远是 false ⇒ 收尾把会话 `retireSession + cleanup`（**弃用并删除**）、链也记不上
+      // ⇒ 下一轮只能再新建一个会话。用户看到的就是"链式模式下一个窗口聊三句 = 网页端多出三个
+      // 新会话，而且旧会话被删掉"。
+      // 两个都是服务端给的**显式终态**，任一出现就算这一轮成功：
+      // `kind:'finish'` 是 `[DONE]` 时解析器补发的收尾事件；`status=FINISHED` 是
+      // `response/status` 那一帧。多认一个是为了防"消费方在 finish 之前就停"的残余情形。
+      if (item.value.kind === 'finish' || (item.value.kind === 'status' && item.value.value === 'FINISHED')) {
+        sawTerminal = true
       }
-      if (item.value.kind === 'error') poisoned = true
       yield item.value
     }
   } catch (error: any) {
@@ -2689,8 +2719,16 @@ export async function* streamWebCompletion(
     // 于是下一次请求会接着用一个"上一条流还没消费完"的会话。
     // F10：改成遍历本次创建过的**全部**会话；唯一放过的只有「正常跑完且仍在复用」的那个。
     finalized = true
+    // 「这一轮成了吗」= 底层流自然结束 **或** 我们已经把服务端的显式终态交给了消费方。
+    // 判据必须取并集（理由见 `sawTerminal` 的注释）—— 只认前者会把成功的一轮判成没跑完。
+    const roundOk = complete || sawTerminal
+    lastRetireReason = undefined
     for (const id of owned) {
-      if (id === sessionId && complete && !poisoned && limit > 0) continue
+      // N04 的意图保留：提前结束/取消（没见到显式终态）仍然要退役 —— 那个会话可能停在半路。
+      if (id === sessionId && roundOk && !poisoned && limit > 0) continue
+      // 记下"为什么退役"，下次这类"每轮新建会话"的排查不用再插桩（0.6.16 加的可见性）。
+      lastRetireReason =
+        id !== sessionId ? 'extra-session' : poisoned ? 'poisoned' : !roundOk ? 'not-finished' : 'rotated'
       retireSession(id)
       cleanup(id)
     }
@@ -2699,7 +2737,7 @@ export async function* streamWebCompletion(
     // 一律作废 —— 下一轮 decideFeed 会看到"没有链"，自动退回全量重发。
     // 注意这里按**每一次请求**记账（一轮里可能有首轮 + 续写轮多次调用），不是按 DSH 回合：
     // 续写轮的增量与 parent 正是靠这次记账才对得上。
-    if (sentFeed?.next && complete && !poisoned && typeof responseMessageId === 'number') {
+    if (sentFeed?.next && roundOk && !poisoned && typeof responseMessageId === 'number') {
       contextChains.set(slotKey, { ...sentFeed.next, parentId: responseMessageId })
       lastChainKey = slotKey
     } else if (sentChainKey !== undefined) {
