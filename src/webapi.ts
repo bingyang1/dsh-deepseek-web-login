@@ -764,15 +764,20 @@ const MAX_IDS_PER_REQUEST = 20
  * 于是进程退出/被强杀之后，下次启动还能把这些会话补删掉 —— 在此之前，
  * 复用槽和待删队列只活在内存里，进程一走就静默丢失，网页端就会一直堆。
  *
- * 三个事件对应三种账：
- *   - `leased`  会话进了复用槽（此刻**还没删**，所以是欠账）；
- *   - `queued`  会话进了待删队列（同样是欠账，只是排队了）；
- *   - `deleted` **确认删掉**（服务端接受了）→ 唯一能销账的信号。
+ * 四个事件对应四种账：
+ *   - `leased`    会话进了复用槽（此刻**还没删**，所以是欠账）；
+ *   - `queued`    会话进了待删队列（同样是欠账，只是排队了）；
+ *   - `deleted`   **确认删掉**（服务端接受了）→ 销账信号；
+ *   - `abandoned` **决定不删了**（用户切成「不删」）→ 也是销账信号。
+ *
+ * ⚠️ `abandoned` 必须存在（2026-10-01）：切到「不删」时要把 journal 里的欠账摘掉，
+ * 否则下次启动在别的清理模式下补扫，又会把这些会话删掉 —— 用户明明选了"不删"。
  */
 export type SessionLifecycleEvent =
   | { kind: 'leased'; auth: WebAuth; sessionId: string }
   | { kind: 'queued'; auth: WebAuth; sessionId: string }
   | { kind: 'deleted'; sessionId: string }
+  | { kind: 'abandoned'; sessionId: string }
 
 let sessionLifecycleHook: ((event: SessionLifecycleEvent) => void) | undefined
 
@@ -1077,6 +1082,27 @@ export function createSessionCleaner(options: SessionCleanerOptions = {}): Sessi
     armTimer()
   }
 
+  /**
+   * 放弃待删队列 —— 只是**不删了**，绝不去删。
+   *
+   * 🔴 2026-10-01 实测 bug（用户报「我明明设了不删，会话还是被删了」）：
+   * 旧实现在 `configure()` 里对 `mode === 'keep'` 调用的是 `flush()`，而 `flush()`
+   * 是**真的发 DELETE**（`doFlush` → `deleteChunk`）。
+   * 于是"用户点『不删』"这个动作，反而**立刻触发了一次批量删除** —— 语义完全相反。
+   *
+   * 另外必须逐条发 `abandoned`：journal 里这几条是"欠一次删除"的账，
+   * 不销账的话，下次启动只要清理模式不是 keep，补扫就会把它们删掉。
+   */
+  function abandonQueue(): void {
+    if (timer !== undefined) {
+      clearT(timer)
+      timer = undefined
+    }
+    const dropped = queue
+    queue = []
+    for (const item of dropped) emitSessionLifecycle({ kind: 'abandoned', sessionId: item.sessionId })
+  }
+
   function configure(next: Partial<SessionCleanupPolicy>): SessionCleanupPolicy {
     const modeChanged = next.mode !== undefined && next.mode !== policy.mode
     if (next.mode !== undefined) policy.mode = next.mode
@@ -1091,7 +1117,8 @@ export function createSessionCleaner(options: SessionCleanerOptions = {}): Sessi
       }
     }
     if (modeChanged) applyModeDefaults()
-    if (policy.mode === 'keep') void flush() // 切到「不删」时把已排队的清掉，避免残留
+    // 切到「不删」= **放弃**这批待删（不是"删掉它们"）。见 abandonQueue 的说明。
+    if (policy.mode === 'keep') abandonQueue()
     logger?.info?.(
       `deepseek-web: 会话清理策略已更新 —— ${policy.mode}` +
         (policy.mode === 'deferred'

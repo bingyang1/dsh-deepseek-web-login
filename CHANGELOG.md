@@ -1,6 +1,47 @@
 # Changelog
 
-本项目遵循大致语义化版本；日期为本地时间。
+本项目大致遵循语义化版本；日期为本地时间。
+
+## 0.6.22 — 2026-10-01
+
+**修复：一个窗口聊两句、网页端多出三个会话；以及选「不删」反而触发一次批量删除。**
+
+两个独立 bug。这次不再是推测——判据来自实机证据：会话 `13fc4478` 的原始事件日志
+（哪一轮发了什么、有几个 step）＋ `~/.dsh/web-login/sessions-in-use.json` 的实际内容
+（11 条记录：8 条 `queued` / 3 条 `slot`，时间点与前者的 turn/step 逐一对应）。
+
+### ① 重开链强制换新会话 ⇒ 每个回合多一个网页端会话
+
+- `needsFreshSession` 的旧判据：链式模式下「要发根消息 + 会话是复用来的」就**换一个新会话**
+  （0.6.10 引入，当时的假设是"重开链是异常路径，代价可接受"）。
+- 实测该假设不成立：DSH 每一轮都会重新生成**替换式**的运行时注入
+  （原话：`Current runtime context. This snapshot supersedes earlier runtime-context snapshots.`），
+  链的 entries 于是不再是本轮 entries 的严格前缀 ⇒ `decideFeed` 必然 `restart('not-appended')`
+  ⇒ parent=null ⇒ 换新会话、旧会话交回清理。实测时间线：12:50:36 建会话①、12:51:07 建②、
+  12:51:13 建③ —— 一个窗口、两句对话。
+- 现在**默认不换**：重开链就在当前会话里发根消息，一个窗口始终只用一个网页端会话。
+- 保留开关：面板「上下文」页 →「重开链时换新会话」，或 `gate.json` 的
+  `freshSessionOnRestart`（缺省 `false`）。打开即恢复 0.6.10 的行为。
+
+### ② 在设置页选「不删」，反而立刻触发一次批量删除
+
+- `createSessionCleaner().configure()` 对 `mode === 'keep'` 调用的是 `flush()`，
+  而 `flush()` → `doFlush()` → `deleteChunk()` 是**真的发 DELETE 请求**——
+  用户的意图与执行结果完全相反。
+- 改为「放弃队列」：清空待删队列、撤掉定时器，并**逐条发 `abandoned`** 让宿主把
+  `session-journal` 里的欠账销掉。少了销账这一步，下次启动只要清理模式不是 `keep`，
+  补扫又会把这些会话删掉（等于"不删"只生效到本次进程结束）。
+- 宿主的销账分支（`deleted` / `abandoned`）移到 `journalEnabled` 判断**之前** ——
+  `keep` 模式下 `journalEnabled` 为 `false`，否则记录根本摘不掉。
+
+### 验证
+
+- `tsc --noEmit`、`npm run test`（60/60 用例文件）、`check-smoke`、`check-bundle` 全部通过
+- 新增 5 条用例，其中 2 条是**行为断言**（★：切成「不删」后一个 `DELETE` 都不许发出；
+  放弃删除必须逐条报 `abandoned`）
+- 两条修复各自做了**变异反向验证**：把源码改回 bug ⇒ 对应用例变红、`rc=1`
+- 首版用例的默认值断言曾与常量脱钩（`reset` 里写死 `false`），导致"改默认值"的变异跑不出红；
+  已把默认值收敛成单一来源 `DEFAULT_FRESH_SESSION_ON_RESTART`
 
 ## 0.6.21 — 2026-10-01
 

@@ -32,9 +32,15 @@ const {
   writeContextModeSetting,
   needsFreshSession,
   effectiveReuseLimit,
+  applyFreshSessionOnRestart,
+  currentFreshSessionOnRestart,
+  resetFreshSessionOnRestart,
+  DEFAULT_FRESH_SESSION_ON_RESTART,
 } = await import('../src/context-feed.ts')
 // 续写指令的**单一来源**（0.6.17 从 adapter.ts 挪到 protocol.ts）—— 用例也不自造文案
 const { CONTINUE_INSTRUCTION } = await import('../src/protocol.ts')
+// 清理器：用来守"切到不删不许真的删"（0.6.22）—— 那是行为断言，比扫源码强
+const { createSessionCleaner, setSessionLifecycleHook } = await import('../src/webapi.ts')
 
 let failed = 0
 let passed = 0
@@ -51,6 +57,26 @@ const test = (name, fn) => {
 
 const HEAD = 'SYSTEM+协议+工具目录'
 const ENTRIES = (...items) => items
+
+// ── 0.6.22：默认值本身必须是「不换会话」────────────────────────────────────
+// ⚠️ 这条必须**放在所有 apply/reset 之前** —— 它断言的是"模块刚加载、还没被任何
+// 设置改过"的初始状态。放到后面就只能测到 reset 的返回值，测不到真实默认值。
+test('模块初始状态：重开链不换会话（新装的人一个窗口就一个会话）', () => {
+  assert.equal(currentFreshSessionOnRestart(), false)
+})
+// 默认值只有一个来源（声明 + reset 都读它）。这条守的是"改默认值会被发现"：
+// 第一版把 reset 里写成字面量 false，导致"默认改成 true"这个变异跑不出红。
+test('默认值常量是 false，且 reset 回到的是它（单一来源）', () => {
+  assert.equal(DEFAULT_FRESH_SESSION_ON_RESTART, false)
+  applyFreshSessionOnRestart(true)
+  assert.equal(currentFreshSessionOnRestart(), true)
+  resetFreshSessionOnRestart()
+  assert.equal(
+    currentFreshSessionOnRestart(),
+    DEFAULT_FRESH_SESSION_ON_RESTART,
+    'reset 必须回到默认值本身，不能硬编码',
+  )
+})
 
 /**
  * 续写轮的真实条目形状（照 `adapter.ts` 拼续写 prompt 的写法）：
@@ -385,8 +411,36 @@ test('超预算被截断时：entries 仍是**未截断**的那份，full 才是
 // 现场（2026-09-30，用户报"换个窗口聊天就把上下文清理一次"）：重开链发的是根消息
 // （parent=null），而那时用的还是**复用来的**会话 ⇒ 往一个有内容的会话里又塞一个根，
 // 网页端渲染成同一条消息的多个兄弟版本（「修改 / 重新生成」+ n/n 翻页）。
-test('要发根消息 + 会话是复用来的 ⇒ 必须换新会话', () => {
-  assert.equal(needsFreshSession({ parentMessageId: null }, true, 'chained'), true)
+// ── 0.6.22：重开链**默认不再换新会话** ─────────────────────────────────────
+// 现场（2026-10-01，会话 `13fc4478`）：一个 DSH 窗口聊了两句，网页端出现**三个**会话。
+// 根因不是判据写错，而是 0.6.10 的前提不成立 —— 那时假定"重开链是异常路径"，
+// 实测 DSH 每轮都会重新生成**替换式**的运行时注入
+// （`Current runtime context. This snapshot supersedes earlier runtime-context snapshots.`），
+// 链的 entries 于是不再是本轮 entries 的严格前缀 ⇒ `decideFeed` 走 restart ⇒ parent=null
+// ⇒ "重开链换新会话"**几乎每个 turn 都生效**，旧的还被交回清理。
+// 现在默认**不换**（宁可让那个会话多一条根消息，也不要会话数失控）；
+// 0.6.10 的行为保留成开关 —— 下面第二条守着它还活着。
+test('默认：要发根消息 + 会话是复用来的 ⇒ **不**换新会话（会话数优先）', () => {
+  resetFreshSessionOnRestart()
+  assert.equal(needsFreshSession({ parentMessageId: null }, true, 'chained'), false)
+})
+
+test('设置项默认是关的（新装的人不该莫名其妙多出会话）', () => {
+  resetFreshSessionOnRestart()
+  assert.equal(currentFreshSessionOnRestart(), false)
+})
+
+test('打开开关 ⇒ 恢复 0.6.10 的行为：重开链换新会话', () => {
+  applyFreshSessionOnRestart(true)
+  try {
+    assert.equal(needsFreshSession({ parentMessageId: null }, true, 'chained'), true)
+    // 续链时一律不换（换了父链就断）—— 开关不该把这条也带歪
+    assert.equal(needsFreshSession({ parentMessageId: 42 }, true, 'chained'), false)
+    // 本来就是新会话 ⇒ 也不重复换
+    assert.equal(needsFreshSession({ parentMessageId: null }, false, 'chained'), false)
+  } finally {
+    resetFreshSessionOnRestart()
+  }
 })
 test('要发根消息但本来就是新会话 ⇒ 不重复换（否则每轮白建一个）', () => {
   assert.equal(needsFreshSession({ parentMessageId: null }, false, 'chained'), false)
@@ -456,6 +510,57 @@ test('全量模式不受影响：回声照旧留在完整 prompt 里', () => {
   const d = decideFeed({ ...chainedInput({ entries }), mode: 'full' })
   assert.equal(d.prompt, 'FULL-PROMPT', '全量是"从零重述"，必须保留完整对话')
   assert.equal(d.echoDropped, undefined)
+})
+
+// ── 0.6.22：切到「不删」只能"放弃删除"，绝不能真的删 ─────────────────────────
+// 用户现场（2026-10-01）：明明在设置页选了「不删」，网页端的会话还是被删了。
+// 根因：`configure()` 对 `mode === 'keep'` 调的是 `flush()`，而 `flush()` → `doFlush()`
+// → `deleteChunk()` 是**真的发 DELETE** —— 用户的意图与执行结果完全相反。
+//
+// 这条用**真调用**守（不扫源码）：装一个假的 fetch，断言一个 DELETE 都没发出去。
+test('★ 切到「不删」必须放弃待删队列，且一个 DELETE 都不许发', () => {
+  const calls = []
+  const cleaner = createSessionCleaner({
+    // 延迟设得极长、批量设得极大 ⇒ 队列只会"躺着"，不会自己触发清理
+    policy: { mode: 'deferred', delayMs: 3_600_000, batchSize: 50 },
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), method: String(init?.method ?? 'GET') })
+      return new Response('{}', { status: 200 })
+    },
+  })
+  const auth = { token: 't', cookie: 'c', userAgent: 'ua' }
+  cleaner.schedule(auth, 'sess-a')
+  cleaner.schedule(auth, 'sess-b')
+  assert.equal(cleaner.pendingCount(), 2, '两条应先躺在队列里等着（延迟很长，不会自动清）')
+
+  cleaner.configure({ mode: 'keep' })
+
+  assert.equal(cleaner.pendingCount(), 0, '切成「不删」后队列必须清空')
+  assert.equal(
+    calls.filter((call) => call.method === 'DELETE').length,
+    0,
+    `★ 切到「不删」绝不能真的删会话，实际发出了：${JSON.stringify(calls)}`,
+  )
+})
+
+// 「队列清空」还不够 —— 那些会话的欠账要能从 journal 销掉，否则下次启动在别的
+// 清理模式下补扫，又会把它们删掉（相当于"用户说不删"只生效到本次进程结束）。
+test('★ 放弃删除时要把欠账销掉（否则下次启动补扫又会删）', () => {
+  const events = []
+  setSessionLifecycleHook((event) => events.push(event))
+  try {
+    const cleaner = createSessionCleaner({
+      policy: { mode: 'deferred', delayMs: 3_600_000, batchSize: 50 },
+      fetchImpl: async () => new Response('{}', { status: 200 }),
+    })
+    const auth = { token: 't', cookie: 'c', userAgent: 'ua' }
+    cleaner.schedule(auth, 'sess-x')
+    cleaner.configure({ mode: 'keep' })
+    const abandoned = events.filter((e) => e.kind === 'abandoned').map((e) => e.sessionId)
+    assert.deepEqual(abandoned, ['sess-x'], '必须逐条报 abandoned，宿主才能把它从 journal 摘掉')
+  } finally {
+    setSessionLifecycleHook(undefined)
+  }
 })
 
 console.log(failed === 0 ? `\n通过 ${passed} 项，全部通过 ✅` : `\n通过 ${passed} 项，失败 ${failed} 项 ❌`)

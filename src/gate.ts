@@ -279,6 +279,20 @@ export interface GateSettings {
    * 真正的执行方是 `index.ts` 里的定时检查（`autoReloginOne`）。
    */
   autoRelogin?: boolean
+  /**
+   * 重开链时是否换一个**全新的网页端会话**。**默认关闭**（0.6.22）。
+   *
+   * 关闭（默认）：一个窗口始终一个网页端会话，重开链只是在原会话里发一条根消息。
+   * 打开：恢复 0.6.10 的行为 —— 每次重开链都新建会话、旧会话交回清理（网页端会多出会话）。
+   *
+   * 为什么默认关：DSH 每轮都会刷新替换式的运行时注入，导致链几乎每个 turn 都要重开；
+   * 实测"一个窗口聊两句 → 网页端三个会话"。详见 `context-feed.ts` 的
+   * `currentFreshSessionOnRestart` 注释（那里有完整实测时间线）。
+   *
+   * 同 sessionCleanup：**不参与节流逻辑**，只是搭同一份设置文件与同一个设置页存储；
+   * 真正的执行方是 `context-feed.ts` 的 `needsFreshSession`。
+   */
+  freshSessionOnRestart?: boolean
 }
 
 /** 节流设置文件：`${DSH_HOME || ~/.dsh}/web-login/gate.json`（插件自治，与凭证同目录）。 */
@@ -345,6 +359,10 @@ export function readGateSettings(): Partial<GateSettings> | undefined {
     // 自动重登（0.6.14）：与 sessionCleanup 同一种"搭同一份设置文件存储"的字段，
     // 不参与节流逻辑，执行方是 index.ts 里的定时检查。**缺省 false**（要用户明确打开）。
     if (typeof parsed?.autoRelogin === 'boolean') out.autoRelogin = parsed.autoRelogin
+    // 重开链换会话（0.6.22）：缺省 **false**（不换）—— 见 GateSettings 里的说明。
+    if (typeof parsed?.freshSessionOnRestart === 'boolean') {
+      out.freshSessionOnRestart = parsed.freshSessionOnRestart
+    }
     return Object.keys(out).length > 0 ? out : undefined
   } catch {
     return undefined
@@ -394,6 +412,8 @@ export interface RequestGateOptions {
   serialToolCalls?: boolean
   /** 到期前自动重登（同上，本模块不执行，只是存下来以便落盘与回显；执行方见 GateSettings 的说明）。 */
   autoRelogin?: boolean
+  /** 重开链是否换新会话（同上，本模块不执行；执行方见 GateSettings 的说明）。缺省 false。 */
+  freshSessionOnRestart?: boolean
   /**
    * 会话清理策略（本模块不执行，同样只是存下来以便落盘与回显）。
    *
@@ -624,6 +644,9 @@ export function createRequestGate(options: RequestGateOptions = {}): RequestGate
   // 🔴 **缺省＝串行**（0.5.0 起改的默认）：只有**显式 false** 才允许批量。
   // 改默认的代价：升级后第一轮协议文本就变 ⇒ 投喂链断一次（全量重发 + 新会话）。
   let serialToolCalls = options.serialToolCalls !== false
+  // 重开链是否换新会话（0.6.22）：**缺省＝不换**（只有显式 true 才换）。
+  // 同样"只是存着"，真正的执行在 context-feed.ts 的 needsFreshSession。
+  let freshSessionOnRestart = options.freshSessionOnRestart === true
   let cleanupMode = options.sessionCleanup
   // 会话清理的三个区间（同样不参与节流逻辑）。存在这里是为了**能落盘**：
   // writeGateSettings 写的是 settings() 的返回值，不存就丢。
@@ -649,6 +672,7 @@ export function createRequestGate(options: RequestGateOptions = {}): RequestGate
       contextWindow,
       autoSwitchMinutes,
       serialToolCalls,
+      freshSessionOnRestart,
     }
   }
 
@@ -662,6 +686,9 @@ export function createRequestGate(options: RequestGateOptions = {}): RequestGate
     if (next.contextWindow !== undefined) contextWindow = clampContextWindow(Number(next.contextWindow))
     if (next.autoSwitchMinutes !== undefined) autoSwitchMinutes = clampAutoSwitchMinutes(Number(next.autoSwitchMinutes))
     if (typeof next.serialToolCalls === 'boolean') serialToolCalls = next.serialToolCalls
+    if (typeof next.freshSessionOnRestart === 'boolean') {
+      freshSessionOnRestart = next.freshSessionOnRestart
+    }
     // 三个区间：非法的输入直接当"没给"（不报错、也不覆盖已有的有效值）
     if (next.cleanupBatch !== undefined) {
       const value = normalizeCleanupRange(next.cleanupBatch, CLEANUP_BATCH_BOUNDS)

@@ -161,17 +161,73 @@ export function needsFreshSession(
   mode: ContextMode,
   /** 本轮是否真的传了结构化 prompt（即真的想走链）。不传结构 = 内部请求走全量，不必强制换新会话。 */
   hasPromptParts = true,
+  /** 是否允许"重开链时换新会话"。缺省取模块级设置（默认 **否**），见 `currentFreshSessionOnRestart`。 */
+  allowRestartSwap: boolean = currentFreshSessionOnRestart(),
 ): boolean {
   // ⚠️ **只在链式模式下生效**。全量模式里"每轮都是根消息"本来就是常态，
   // 若也一律换新会话，就变成**每轮多建 + 多删一个会话**（+2 个请求/轮）——
   // 请求密度本身就是风控关注点，不能为了一个只有链式模式才有的问题付这个代价。
-  // 链式模式下重开链是**异常路径**（换窗口/head 变了/会话轮换），代价可以接受。
   if (mode !== 'chained') return false
   // 0.6.18：没有结构化 parts 的请求（session-title / compaction 等）在链式模式下也走全量，
   // 它们不是"重开链"，不需要干净会话；强制换新会让每个内部请求都退役当前会话，
   // 把 chat 的网页端会话活活冲掉。
   if (!hasPromptParts) return false
+  // 🔴 0.6.22：重开链**默认不再换会话**。见 `currentFreshSessionOnRestart` 的长注释
+  // （0.6.10 的假设"重开链是异常路径"在 DSH 下不成立 —— 宿主每轮都会刷新
+  // `Current runtime context` 一类的注入，链几乎每个 turn 都要重开）。
+  if (!allowRestartSwap) return false
   return feed.parentMessageId === null && reused
+}
+
+/**
+ * 重开链时是否换一个**全新的网页端会话**（0.6.22 起默认 **否**）。
+ *
+ * ## 为什么默认关掉（2026-10-01 实测）
+ *
+ * 0.6.10 引入"重开链换新会话"时的假设是：**重开链是异常路径**（换窗口 / head 变了 /
+ * 会话轮换），所以"多建一个会话 + 抛弃旧的"这点代价可以接受。
+ *
+ * 实测这个假设不成立。DSH 每一轮都会重新生成一份**替换式**的运行时注入
+ * （原话：`Current runtime context. This snapshot supersedes earlier runtime-context snapshots.`），
+ * 它一变，`chain.entries` 就不再是本轮 entries 的严格前缀 ⇒ `decideFeed` 必然
+ * `restart('not-appended')` ⇒ 配上一个 parent=null 的根消息 ⇒ 这里换新会话。
+ *
+ * 用户实测（会话 `13fc4478`，一个窗口聊了两句）：
+ *   12:50:36 新建会话 ①（turn 1）
+ *   12:51:07 新建会话 ②（turn 2 step 1，重开链）
+ *   12:51:13 新建会话 ③（turn 2 step 2，重开链）
+ * 一个窗口 → 网页端三个会话，且旧的两个因为不再被复用而进了待删队列。
+ *
+ * 关掉之后：重开链**就在当前会话里发全量根消息**，会话数保持"一个窗口一个会话"。
+ * 代价：那个会话里会多出一条同层的根消息（网页端可能显示「修改 / 重新生成」+ `n / n`），
+ * 这是**刻意选择**的结果 —— 会话数失控比多一条分支严重得多，而且旧会话里的历史还在。
+ * 想要 0.6.10 的行为（宁可多一个会话也要干净上下文）可以把面板开关打开。
+ */
+export const DEFAULT_FRESH_SESSION_ON_RESTART = false
+
+/**
+ * ⚠️ 默认值只有**这一个来源**：初始值、`resetFreshSessionOnRestart()` 都读它。
+ *
+ * 为什么强调（2026-10-01 自己踩的）：第一版把 `reset…()` 里的 `false` 写成了**字面量**，
+ * 与声明处的默认值成了两个来源 —— 于是"把默认改成 true"这个变异**跑不出红**
+ * （用例先 reset 就把变异抹掉了），守卫形同虚设。同义多源必须收敛成一处。
+ */
+let freshSessionOnRestart = DEFAULT_FRESH_SESSION_ON_RESTART
+
+/** 取当前设置（即时生效，无需重启）。 */
+export function currentFreshSessionOnRestart(): boolean {
+  return freshSessionOnRestart
+}
+
+/** 设置（设置页保存时立刻生效，无需重启）。 */
+export function applyFreshSessionOnRestart(value: boolean): boolean {
+  freshSessionOnRestart = value === true
+  return freshSessionOnRestart
+}
+
+/** 只给测试用：还原**默认值**（不是硬编码的 false —— 否则变异测试抓不到默认值改动）。 */
+export function resetFreshSessionOnRestart(): void {
+  freshSessionOnRestart = DEFAULT_FRESH_SESSION_ON_RESTART
 }
 
 /**

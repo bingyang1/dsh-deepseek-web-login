@@ -122,6 +122,7 @@ import {
 } from './transport.ts'
 import {
   applyContextMode,
+  applyFreshSessionOnRestart,
   contextModeSettingsPath,
   readContextModeSetting,
   writeContextModeSetting,
@@ -340,6 +341,8 @@ export function apply(ctx: any, config: Config = {}): void {
     // 到期前自动重登（0.6.14）：**缺省关闭**（`=== true` 而不是 `!== false`）——
     // 打开它会每约 2 小时静默起一次无头浏览器，这种事必须是用户明确点开的。
     autoRelogin: savedGate?.autoRelogin === true,
+    // 重开链是否换新会话（0.6.22）：**缺省关闭**（`=== true`）—— 见 GateSettings 的说明。
+    freshSessionOnRestart: savedGate?.freshSessionOnRestart === true,
     longRunBreakMs: savedGate?.longRunBreakMs,
     // ⚠️ 会话清理这几个字段必须**一起传**（2026-09-14 修）：设置页保存时写的是
     // `gate.settings()` 的返回值 —— 没存进闸门的字段会被**静默抹掉**，
@@ -350,6 +353,11 @@ export function apply(ctx: any, config: Config = {}): void {
     cleanupGapMs: cleanupGapRange,
     logger,
   })
+
+  // 重开链是否换新会话（0.6.22）：把设置同步到 context-feed 的模块级开关。
+  // ⚠️ 必须在**任何请求之前**执行 —— 它影响链的决策（见 needsFreshSession）。
+  applyFreshSessionOnRestart(gate.settings().freshSessionOnRestart === true)
+
   // 旧版（≤0.1.25）只有一份 deepseek-auth.json；首次启动时迁进账号库。
   // 只在「库为空 且 旧文件在」时跑一次；成功迁移后**删掉旧文件**（审计 F21：
   // 留 `.migrated-*` 明文副本会让"退出清凭证"变成谎话）。
@@ -713,11 +721,14 @@ export function apply(ctx: any, config: Config = {}): void {
     return listAccounts().find((account) => account.token === token)?.id
   }
   setSessionLifecycleHook((event) => {
-    if (!journalEnabled) return
-    if (event.kind === 'deleted') {
+    // ⚠️ 销账（deleted / abandoned）必须放在 journalEnabled 判断**之前**：
+    // keep 模式下 journalEnabled 为 false（不再记新账），但用户切成「不删」时
+    // 要把**既有**的欠账摘掉 —— 否则下次启动在别的模式下补扫，又会删掉这些会话。
+    if (event.kind === 'deleted' || event.kind === 'abandoned') {
       removeJournalEntry(event.sessionId)
       return
     }
+    if (!journalEnabled) return
     const accountId = accountIdOfAuth(event.auth)
     if (!accountId) return
     upsertJournalEntry({
@@ -1047,6 +1058,14 @@ export function apply(ctx: any, config: Config = {}): void {
                 }
                 patch.serialToolCalls = body.serialToolCalls
               }
+              // 重开链是否换新会话（0.6.22）：只收布尔值，缺省关闭。
+              if (body.freshSessionOnRestart !== undefined) {
+                if (typeof body.freshSessionOnRestart !== 'boolean') {
+                  sendJson(res, 400, { ok: false, error: 'freshSessionOnRestart 必须是布尔值' })
+                  return
+                }
+                patch.freshSessionOnRestart = body.freshSessionOnRestart
+              }
               // 到期前自动重登（0.6.14）：只收布尔值，缺省关闭。
               // 定时检查每轮都重读设置文件 ⇒ 存下去就即时生效，不用重启。
               if (body.autoRelogin !== undefined) {
@@ -1071,6 +1090,10 @@ export function apply(ctx: any, config: Config = {}): void {
               // head 又是 decideFeed 的判据之一 ⇒ 切换会让投喂链断一次（下一轮全量重发 + 新会话），
               // 之后稳定。界面上写了这句。
               if (applied.serialToolCalls !== undefined) adapterConfig.serialToolCalls = applied.serialToolCalls
+              // 重开链是否换新会话：context-feed 每轮现读 ⇒ 改完即时生效（不用重启）。
+              if (applied.freshSessionOnRestart !== undefined) {
+                applyFreshSessionOnRestart(applied.freshSessionOnRestart)
+              }
               // 清理策略由 cleaner 执行 → 同步生效
               if (patch.sessionCleanup) sessionCleaner.configure({ mode: patch.sessionCleanup })
               // 三个区间即时作用到清理器（它会用新区间重新随机取值）

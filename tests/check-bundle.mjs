@@ -919,6 +919,18 @@ const checks = {
     /browserProfileCleared && partitionOK/.test(host),
   'host 的手动粘贴 token 对「包装 JSON 解出空」fail-closed（不再把 JSON 当 token 落盘）':
     /raw\.startsWith\("\{"\) && !unwrapStoredToken\(token\)/.test(host),
+
+  // ── 0.6.22：一个窗口只用一个网页端会话（用户现场：聊两句多出三个）──────────
+  // ⚠️ 这两条断的是**分支本身**，不是全文有没有某个词：
+  //   · 「不删」那一行必须走 abandonQueue（放弃），且**不能**再是 flush（真删）；
+  //   · 重开链换会话的**缺省**必须是关（gate 侧只有显式 true 才算开）。
+  'host 的「不删」只放弃队列、绝不触发删除（0.6.21 那次"点不删反而删"不得回归）':
+    host.includes('kind: "abandoned"') &&
+    /if \(policy\.mode === "keep"\) abandonQueue\(\);/.test(host) &&
+    !/policy\.mode === "keep"\) void flush\(\)/.test(host),
+  'host 的重开链换会话缺省关闭（一个窗口始终只用一个网页端会话）':
+    /let freshSessionOnRestart = false;/.test(host) &&
+    /let freshSessionOnRestart = options\.freshSessionOnRestart === true;/.test(host),
 }
 
 let failed = 0

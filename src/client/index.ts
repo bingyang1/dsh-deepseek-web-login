@@ -2599,6 +2599,35 @@ function Panel(): any {
     contextCard.append(contextStatus)
     const contextHintText = el('p', 'dsw-hint', '')
     contextCard.append(contextHintText)
+
+    // 重开链是否换新会话（0.6.22）：**默认关**。
+    // 用户现场：一个窗口聊两句，网页端多出三个会话 —— DSH 每轮都会重新生成替换式的
+    // 运行时注入（`Current runtime context … supersedes earlier snapshots`），
+    // 投喂链几乎每个回合都要重开，而"重开链就换会话"于是每回合都生效。
+    // 关掉后一个窗口始终只用一个网页端会话；开 = 恢复 0.6.10 的老行为。
+    const freshRow = el('div', 'dsw-gate-row')
+    const freshLabel = el('label', 'dsw-switch')
+    const freshInput = el('input', 'dsw-switch-input') as HTMLInputElement
+    freshInput.type = 'checkbox'
+    freshLabel.append(freshInput, el('span', 'dsw-switch-track'), el('span', undefined, '重开链时换新会话'))
+    freshRow.append(freshLabel)
+    contextCard.append(freshRow)
+    const freshHint = el('p', 'dsw-hint', '')
+    contextCard.append(freshHint)
+
+    const paintFreshSession = (): void => {
+      freshHint.textContent = freshInput.checked
+        ? '开：每次重开链都新建一个网页端会话、旧的弃用 —— 上下文最干净，代价是网页端会多出会话。'
+        : '默认关：一个窗口始终只用一个网页端会话。DSH 每轮都会刷新运行时注入，投喂链几乎每个回合都会重开 ——' +
+          '关掉才能保证"聊十句也只有一个会话"。'
+    }
+    freshInput.checked = false
+    paintFreshSession()
+    freshInput.addEventListener('change', () => {
+      paintFreshSession()
+      void saveGate({ freshSessionOnRestart: freshInput.checked })
+    })
+
     const contextMsg = createMsgNode()
     contextCard.append(contextMsg.node)
     contextPane.append(contextCard)
@@ -2944,6 +2973,9 @@ function Panel(): any {
       paintSerialTools()
       // 到期前自动重登：后端给的是当前值（缺省 false ⇒ 未勾选）
       autoReloginInput.checked = g.autoRelogin === true
+      // 重开链是否换新会话（0.6.22）：缺省/旧宿主没这个字段 ⇒ 当关闭（＝一个窗口一个会话）
+      freshInput.checked = g.freshSessionOnRestart === true
+      paintFreshSession()
 
       const mode = g.cleanup?.mode ?? 'deferred'
       for (const key of Object.keys(cleanupBtns)) {
@@ -2983,6 +3015,8 @@ function Panel(): any {
       serialToolCalls?: boolean
       /** 到期前自动重登（缺省关闭）。 */
       autoRelogin?: boolean
+      /** 重开链时换新会话（缺省关闭；见上下文页的开关）。 */
+      freshSessionOnRestart?: boolean
       cleanupBatch?: { min: number; max: number }
       cleanupDelayMs?: { min: number; max: number }
       cleanupGapMs?: { min: number; max: number }
