@@ -260,7 +260,44 @@ export async function shutdownBrowserTransport(): Promise<void> {
   launchPromise = undefined
 }
 
-function bodyToPageInit(body: BodyInit | null | undefined): string {
+/** 页面上下文里的辅助函数名（把 base64 还原成字节）。 */
+const B64_HELPER = '__dshB64ToBytes'
+/** 页面上下文里的辅助函数名（把序列化过的 parts 重建成 FormData）。 */
+const FORMDATA_HELPER = '__dshRebuildFormData'
+
+/** 页面里用到的两个小工具（随每次 evaluate 一起注入，保持无状态）。 */
+const PAGE_HELPERS = `
+  const ${B64_HELPER} = (b64) => {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
+    return out;
+  };
+  const ${FORMDATA_HELPER} = (parts) => {
+    const form = new FormData();
+    for (const p of parts) {
+      if (p.t === 'text') form.append(p.name, p.value);
+      else form.append(p.name, new File([${B64_HELPER}(p.b64)], p.filename, { type: p.type }));
+    }
+    return form;
+  };
+`
+
+/**
+ * 把 Node 侧的请求体转成"能在页面里重建它"的表达式。
+ *
+ * 🔴 0.6.20 的第一版只支持 string / Uint8Array / ArrayBuffer，遇到 FormData 直接抛
+ * "暂不支持" —— 而**图片上传走的就是 FormData（multipart）**（见 `webapi.uploadImageFile`），
+ * 于是"切到浏览器代理传输层之后图片全传不上去"（2026-10-01 用户报，报错文案就来自这里）。
+ *
+ * 0.6.24：FormData / Blob 都按**字节**搬过去，在页面里重建。
+ * 细节：
+ *  - 用 **base64** 而不是 JSON 数组传字节（体积约为 1/2.4，CDP 消息不至于被图片撑爆）；
+ *  - 用 `new File(...)` 而不是 `new Blob(...)` —— 必须保住 **filename**，
+ *    服务端是按**文件名后缀**判图片类型的（见 protocol.ts 的说明）；
+ *  - 语言无关地遍历 FormData 的 entry：`TextPart` 原样作为字段，其余一律当文件。
+ */
+async function bodyToPageInit(body: BodyInit | null | undefined): Promise<string> {
   if (body === undefined || body === null) {
     return 'undefined'
   }
@@ -268,12 +305,44 @@ function bodyToPageInit(body: BodyInit | null | undefined): string {
     return JSON.stringify(body)
   }
   if (body instanceof Uint8Array) {
-    return `new Uint8Array(${JSON.stringify(Array.from(body))})`
+    return `${B64_HELPER}(${JSON.stringify(Buffer.from(body).toString('base64'))})`
   }
   if (body instanceof ArrayBuffer) {
-    return `new Uint8Array(${JSON.stringify(Array.from(new Uint8Array(body)))})`
+    return `${B64_HELPER}(${JSON.stringify(Buffer.from(new Uint8Array(body)).toString('base64'))})`
   }
-  throw new Error('浏览器代理传输层暂不支持 Blob/FormData/ReadableStream 请求体')
+  if (typeof FormData !== 'undefined' && body instanceof FormData) {
+    // ⚠️ 用 forEach 而不是 `entries()`：后者要 `DOM.Iterable` lib，本项目的 lib 里没有
+    // （为一个遍历去动 tsconfig 影响面太大）。先收成数组，再逐个 await 读字节。
+    const raw: Array<[string, FormDataEntryValue]> = []
+    body.forEach((value, name) => {
+      raw.push([name, value])
+    })
+    const parts: Array<Record<string, unknown>> = []
+    for (const [name, value] of raw) {
+      if (typeof value === 'string') {
+        parts.push({ t: 'text', name, value })
+        continue
+      }
+      // File / Blob（Node 20+ 两者都有 arrayBuffer()）
+      const blob = value as Blob
+      const b64 = Buffer.from(new Uint8Array(await blob.arrayBuffer())).toString('base64')
+      parts.push({
+        t: 'file',
+        name,
+        filename: (blob as File).name || name || 'blob',
+        type: blob.type || 'application/octet-stream',
+        b64,
+      })
+    }
+    return `${FORMDATA_HELPER}(${JSON.stringify(parts)})`
+  }
+  if (typeof Blob !== 'undefined' && body instanceof Blob) {
+    const b64 = Buffer.from(new Uint8Array(await body.arrayBuffer())).toString('base64')
+    return `new Blob([${B64_HELPER}(${JSON.stringify(b64)})], { type: ${JSON.stringify(body.type || 'application/octet-stream')} })`
+  }
+  throw new Error(
+    '浏览器代理传输层不支持的请求体类型（支持 string / Uint8Array / ArrayBuffer / FormData / Blob）',
+  )
 }
 
 export function createBrowserFetch(): typeof fetch {
@@ -295,7 +364,8 @@ export function createBrowserFetch(): typeof fetch {
       }
     }
 
-    const bodyExpr = bodyToPageInit(init?.body)
+    // ⚠️ 现在要 await：FormData/Blob 需要先读出字节才能序列化（图片上传就走这条路）。
+    const bodyExpr = await bodyToPageInit(init?.body)
     const requestId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
 
     // 先注册状态，再 evaluate；binding 事件可能在 evaluate 还没返回时就到了。
@@ -325,6 +395,7 @@ export function createBrowserFetch(): typeof fetch {
 
     const expression = `
       (async () => {
+        ${PAGE_HELPERS}
         const requestId = ${JSON.stringify(requestId)};
         try {
           const init = {

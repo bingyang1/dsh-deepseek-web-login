@@ -99,6 +99,66 @@ async function main() {
     }
   })
 
+  // 5. ★ FormData（multipart）—— 图片上传走的就是这条路
+  // 0.6.20 的浏览器代理传输层只支持 string/Uint8Array/ArrayBuffer，遇到 FormData 直接抛
+  // "暂不支持"，于是"切到浏览器代理之后图片全传不上去"（2026-10-01 用户报）。
+  await test('★ 浏览器 fetch 能上传 FormData（图片上传走这条路）', async () => {
+    delete process.env.DSH_NO_BROWSER_TRANSPORT
+    const { createBrowserFetch, shutdownBrowserTransport, systemBrowserAvailable } = await import(
+      '../src/browser-transport.ts?formdata=' + Date.now()
+    )
+    if (!systemBrowserAvailable()) {
+      console.log('    (skip: 本机无 Edge/Chrome)')
+      return
+    }
+    // PNG 的 8 字节魔数 —— 用来确认**文件字节真的到了**，而不只是表单结构对
+    const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const server = createServer((req, res) => {
+      const chunks = []
+      req.on('data', (c) => chunks.push(c))
+      req.on('end', () => {
+        const body = Buffer.concat(chunks)
+        const text = body.toString('latin1')
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            contentType: req.headers['content-type'] ?? '',
+            filename: /filename="([^"]*)"/.exec(text)?.[1] ?? '',
+            fileType: /Content-Type: ([^\r\n]+)/.exec(text)?.[1] ?? '',
+            gotMagic: body.includes(PNG_MAGIC),
+          }),
+        )
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    await new Promise((r) => setTimeout(r, 200))
+    const port = server.address().port
+    try {
+      const fetch = createBrowserFetch()
+      const form = new FormData()
+      // 200 KB —— 真实图片的量级。不能只用 11 字节：那样测不出 base64 搬运/CDP 消息大小的问题。
+      const payload = new Uint8Array(200_000).fill(7)
+      payload.set(PNG_MAGIC, 0)
+      // ⚠️ 必须带 filename：服务端按**文件名后缀**判图片类型（见 protocol.ts）
+      form.append('file', new Blob([payload], { type: 'image/png' }), 'sample.png')
+      const response = await fetch(`http://localhost:${port}/api/v0/file/upload_file`, {
+        method: 'POST',
+        // ⚠️ 不带 content-type：multipart 的 boundary 由浏览器自己加（带了反而会坏）
+        headers: { 'x-ds-pow-response': 'pow' },
+        body: form,
+      })
+      assert.equal(response.status, 200)
+      const json = await response.json()
+      assert.match(json.contentType, /^multipart\/form-data; boundary=/, `实际 content-type：${json.contentType}`)
+      assert.equal(json.filename, 'sample.png', '文件名必须保住（服务端按后缀判类型）')
+      assert.equal(json.fileType, 'image/png')
+      assert.equal(json.gotMagic, true, '文件字节必须原样到达')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      await shutdownBrowserTransport()
+    }
+  })
+
   console.log()
   console.log(failures.length ? `失败 ${failures.length} 项` : '全部通过 OK')
   for (const failure of failures) console.log('  ' + failure)

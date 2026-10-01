@@ -958,6 +958,27 @@ const checks = {
     })(),
   'host 的投喂回执按 reason 判"是不是发了纯增量"（别拿 parent 判，那会说谎）':
     /chained: feed\.reason === "chained"/.test(host),
+
+  // ── 0.6.24：浏览器代理传输层必须能搬 FormData（图片上传就是 multipart）──────────
+  // 0.6.20 那版只支持 string/Uint8Array/ArrayBuffer，遇到 FormData 直接抛"暂不支持"
+  // ⇒ 切到浏览器代理之后**图片全传不上去**（用户截图里的报错就是它）。
+  // 断言限定在 bodyToPageInit 函数体内：正向要求有 FormData 分支与两个页面辅助函数，
+  // 负向要求那句"暂不支持"不在这个函数里（限定范围，避免被别处的注释误伤）。
+  'host 的浏览器代理传输层能把 FormData 搬进页面（图片上传不再失败）':
+    (() => {
+      const i = host.indexOf('async function bodyToPageInit')
+      if (i < 0) return false
+      const body = host.slice(i, i + 2600)
+      return (
+        /typeof FormData !== "undefined" && body instanceof FormData/.test(body) &&
+        // ⚠️ helper 的**常量定义在函数之前**（模块顶层），所以只在函数体内要求"引用了它"
+        /FORMDATA_HELPER/.test(body) &&
+        !/暂不支持 Blob\/FormData/.test(body)
+      )
+    })() &&
+    // 页面辅助函数必须以字面量名出现在产物里（evaluate 的表达式里用的就是这两个名字）
+    host.includes('"__dshRebuildFormData"') &&
+    host.includes('"__dshB64ToBytes"'),
 }
 
 let failed = 0

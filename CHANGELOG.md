@@ -2,6 +2,44 @@
 
 本项目大致遵循语义化版本；日期为本地时间。
 
+## 0.6.24 — 2026-10-01
+
+**修复：浏览器代理传输层不支持 `FormData` ⇒ 图片全部上传失败。**
+
+### 现象
+
+切到浏览器代理传输层（0.6.20 起，官方 DSH 桌面端拿不到 `electron.net.fetch` 时的默认路径）后，
+粘贴图片会得到：
+
+```
+有 1 张图片没能传给模型（DeepSeek 图片上传失败：浏览器代理传输层暂不支持
+Blob/FormData/ReadableStream 请求体），本轮回答只基于文字内容。
+```
+
+### 根因
+
+0.6.20 的 `bodyToPageInit()` 只把 `string` / `Uint8Array` / `ArrayBuffer` 转成页面侧可重建的表达式，
+遇到别的类型直接抛错。而**图片上传走的正是 `FormData`（multipart）**
+（`webapi.uploadImageFile` 里 `form.append('file', new Blob(...), name)`）。
+
+### 修法
+
+`bodyToPageInit()` 现在支持 `FormData` 与 `Blob`，做法是把内容按**字节**搬到页面里重建：
+
+- 字节用 **base64** 传（而非 JSON 数组）—— 体积约为 1/2.4，CDP 消息不会被大图撑爆；
+- 页面侧注入两个小工具：`__dshB64ToBytes`（base64 → Uint8Array）与
+  `__dshRebuildFormData`（按 parts 重建 `FormData`）；
+- 文件部分用 **`new File(...)`** 而不是 `new Blob(...)` —— 必须保住 **filename**，
+  因为服务端按**文件名后缀**判图片类型（见 `protocol.ts`）；
+- 语言无关地遍历 `FormData`（用 `forEach`，不用 `entries()` —— 后者要 `DOM.Iterable` lib）。
+
+### 验证
+
+- 新增一条**真实往返**用例：启本地 HTTP 服务，用 200 KB 的假 PNG 走 `FormData` 上传，
+  断言 `content-type` 带 boundary、`filename` 保住、PNG 魔数（8 字节）原样到达
+- 变异反向验证：把 `FormData` 分支禁用 ⇒ 用例变红、`rc=1`，报错信息与用户截图**逐字一致**
+- `tsc --noEmit`、`npm run test`（60/60）、`check-smoke`、`check-bundle` 全通过
+
 ## 0.6.23 — 2026-10-01
 
 **一个窗口 = 一条对话线：不再断链、不再分叉、不再删会话。**
