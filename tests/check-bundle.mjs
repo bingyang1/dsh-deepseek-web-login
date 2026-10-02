@@ -1022,6 +1022,21 @@ const checks = {
   'host 的投喂留痕路径走 webLoginDir（单一来源，认 DSH_HOME）':
     /function feedDecisionLogPath\(\) \{[\s\S]{0,120}?join\(webLoginDir\(\), "feed-decisions\.jsonl"\)/.test(host) &&
     !/homedir\(\), "\.dsh", "web-login"/.test(host),
+
+  // ── 0.6.29：账号级失败不许把会话丢掉 ───────────────────────────────────────
+  // 旧实现在三处失败分支都 `retireSession()`（"失败即弃"）⇒ 登录态过期（401）后重新登录，
+  // 槽是空的 ⇒ 新建网页端会话 + 整段历史全量重发（用户现场 2026-10-02：网页端"又新建一个窗口"）。
+  // 401/429/muted/busy/throttled 都是**账号级**状态，换新会话照样被限 ⇒ 保住原会话才对。
+  'host 的账号级失败（认证/限流）改记 keepIds，不再退役会话':
+    /error instanceof AdapterLlmError && \(error\.code === "AUTH" \|\| error\.code === "RATE_LIMIT"\)\) keepIds\?\.add\(sessionId\)/.test(
+      host,
+    ) &&
+    /if \(code === "AUTH" \|\| code === "RATE_LIMIT"\) keepIds\?\.add\(sessionId\)/.test(host) &&
+    // ⚠️ 打包器会**去掉单语句的花括号**（源里的 `if (x) { a() }` 在产物里是 `if (x) a()`）⇒
+    // 断言里别写花括号，否则必然假红。
+    /if \(accountLevel\)[\s\S]{0,24}?keepIds\?\.add\(sessionId\)/.test(host),
+  'host 的收尾逻辑认 keepIds（新建出来的会话撞上账号级失败也不许被回收）':
+    /for \(const id of owned\) \{[\s\S]{0,140}?if \(limit > 0 && keepIds\.has\(id\)/.test(host),
 }
 
 let failed = 0

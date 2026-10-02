@@ -94,9 +94,15 @@ async function runOnce({ auth = authA, transport, fetched, sessionReuseTurns, pr
     transport,
   )
   let text = ''
-  for await (const ev of gen) if (ev.kind === 'text') text += ev.text
+  /** 失败也把 `deleted` 交出来 —— 用例要断言"没把会话交给宿主去删"。 */
+  let error
+  try {
+    for await (const ev of gen) if (ev.kind === 'text') text += ev.text
+  } catch (raised) {
+    error = raised
+  }
   collected.push(text)
-  return { text, deleted, seen }
+  return { text, deleted, seen, error }
 }
 
 const okFetch = async () => new Response(SSE_OK, { status: 200, headers: SSE_HEADERS })
@@ -169,7 +175,9 @@ await test('关闭复用（0）：回到每请求一个会话，且用完即删'
   assert.equal(deleted.length, 3, `关闭复用时每次都要回收，实际 ${deleted.length}`)
 })
 
-await test('失败即弃：请求失败后不复用那个坏会话', async () => {
+// 范围（0.6.29 收窄）：**只有**"服务端可能已经开始生成、会话停在半路"的失败才弃会话。
+// 5xx / 网络失败 / 取消 / 空响应属于这一类；认证与限流**不属于**（见下面那条用例）。
+await test('服务端 5xx（会话可能停在半路）⇒ 不复用那个会话', async () => {
   resetSessionReuse()
   const { created, transport } = mkTransport()
   let boom = true
@@ -402,6 +410,90 @@ await test('★ 内部请求（session-title）用自己的会话，不占用对
   assert.equal(created.length, 2, '★ 对话必须拿自己的会话，不能复用内部请求那个（否则对话里会多一条同层根消息）')
   await run(chat) // ③ 同一窗口继续说
   assert.equal(created.length, 2, '对话自己稳定复用')
+})
+
+// ── 0.6.29：账号级失败不许把会话丢掉 ─────────────────────────────────────
+// 旧实现对所有 `!resp.ok` 无条件 `retireSession()`（"失败即弃"）。后果（2026-10-02 用户现场）：
+// 登录态过期 ⇒ HTTP 401 ⇒ 会话被弃 ⇒ 他重新登录后槽是空的 ⇒ **新建网页端会话 +
+// 29 条历史全量重发**，网页端看起来就是"又新建一个窗口"。
+// 401 说的是**令牌**、429 说的是**账号**限流 —— 会话本身好好的，而且**换新会话也照样被限**，
+// 退役它没有任何好处，唯一的效果是把用户的对话丢掉。
+const JSON_ENVELOPE = (bizMsg) => ({
+  status: 200,
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ code: 0, msg: '', data: { biz_code: 1, biz_msg: bizMsg } }),
+})
+
+for (const [label, makeResponse] of [
+  ['登录态过期（HTTP 401）', () => new Response('invalid token', { status: 401 })],
+  ['账号级限流（HTTP 429）', () => new Response('too many requests', { status: 429 })],
+  [
+    '账号被停用到某时刻（业务码 user is muted）',
+    () => new Response(JSON_ENVELOPE('user is muted until 2026-10-03 00:00:00').body, JSON_ENVELOPE('').headers),
+  ],
+  [
+    '发得太频繁（业务码 throttled 文案族）',
+    () => new Response(JSON_ENVELOPE('too many requests, please try again later').body, JSON_ENVELOPE('').headers),
+  ],
+]) {
+  await test(`★ ${label} ⇒ 会话必须保住（重新登录/解除后接着原会话聊）`, async () => {
+    resetSessionReuse()
+    const { transport, created } = mkTransport()
+    const parts = (entries) => ({ head: 'HEAD', entries })
+
+    // ① 先正常聊一轮，建立会话
+    await runOnce({ transport, fetched: okFetch, dshSessionId: 'win-A', promptParts: parts(['User: 一']) })
+    assert.equal(created.length, 1, '第一轮建一个会话')
+
+    // ② 账号级失败
+    const failed = await runOnce({
+      transport,
+      dshSessionId: 'win-A',
+      promptParts: parts(['User: 一', 'Assistant: 答一']),
+      fetched: async () => makeResponse(),
+    })
+    assert.ok(failed.error, '自证：这一轮真的失败了（否则这条用例什么都没测到）')
+    assert.deepEqual(
+      failed.deleted,
+      [],
+      '账号级失败之后不许把会话交给宿主去删（那等于扔掉用户整段对话）',
+    )
+
+    // ③ 恢复后必须**接回原会话**，而不是新建
+    await runOnce({
+      transport,
+      fetched: okFetch,
+      dshSessionId: 'win-A',
+      promptParts: parts(['User: 一', 'Assistant: 答一', 'User: 二']),
+    })
+    assert.equal(created.length, 1, `账号级失败后必须接回原会话；实际新建了 ${created.length} 个`)
+  })
+}
+
+// 另一条路径：**新建的**会话当轮就撞上账号级失败。
+// 这时它已经在收尾逻辑的 `owned` 集合里（上面那条用的是复用来的会话，不在集合里 ⇒ 走的是
+// 另一处内联跳过）。两处都得守，否则"新窗口第一句话就登录态过期"会白建一个会话。
+await test('★ 新窗口第一轮就登录态过期 ⇒ 这个会话也不许被回收（重登后直接接着用）', async () => {
+  resetSessionReuse()
+  const { transport, created } = mkTransport()
+  const failed = await runOnce({
+    transport,
+    dshSessionId: 'win-fresh',
+    promptParts: { head: 'HEAD', entries: ['User: 一'] },
+    fetched: async () => new Response('invalid token', { status: 401 }),
+  })
+  assert.ok(failed.error, '自证：这一轮真的失败了')
+  assert.equal(created.length, 1, '自证：这一轮真的建了一个会话')
+  assert.deepEqual(failed.deleted, [], '新建的会话撞上 401 也不许被回收')
+
+  // 重登后：必须直接接着用那个会话，不再新建
+  await runOnce({
+    transport,
+    fetched: okFetch,
+    dshSessionId: 'win-fresh',
+    promptParts: { head: 'HEAD', entries: ['User: 一'] },
+  })
+  assert.equal(created.length, 1, `重登后必须接回那个会话；实际总共建了 ${created.length} 个`)
 })
 
 // 复位，别把注入层留给别的测试

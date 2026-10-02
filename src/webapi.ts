@@ -2409,6 +2409,12 @@ async function openCompletion(
   params: CompletionParams,
   signal: AbortSignal,
   transport: CompletionTransport,
+  /**
+   * 账号级失败（认证/限流）时把会话 id 记进来 —— 调用方的收尾逻辑据此**保住**它。
+   * 为什么由这里判：外层不知道 `sessionId`（它在 `await` 之后才拿到），
+   * 而"这次失败是不是账号级的"只有这里看得见（错误码 / 业务码）。见 `keepIds` 的说明。
+   */
+  keepIds?: Set<string>,
 ): Promise<{ sessionId: string; resp: Response; feed: FeedDecision }> {
   let lastFailure: AdapterLlmError | undefined
   const canFailover = makeCanFailover(params)
@@ -2546,8 +2552,18 @@ async function openCompletion(
         signal,
       })
     } catch (error: any) {
-      retireSession(sessionId)
-      params.onDeleteSession?.(sessionId)
+      // ⚠️ 只有**网络层状态未知**（请求可能已经发出去一半）才退役。
+      // AUTH / RATE_LIMIT 都是**请求被拒**（PoW 也在 completion 之前求），会话没被动过 ⇒
+      // 退役它只会让用户重新登录后丢掉整段对话。
+      // 2026-10-02 用户现场：登录态过期 ⇒ 401 ⇒ 会话被弃 ⇒ 重登后"网页端又新建一个窗口"、
+      // 29 条历史全量重发（他要的恰恰是"回到原来那个会话接着聊"）。
+      const rejected =
+        error instanceof AdapterLlmError && (error.code === 'AUTH' || error.code === 'RATE_LIMIT')
+      if (rejected) keepIds?.add(sessionId)
+      else {
+        retireSession(sessionId)
+        params.onDeleteSession?.(sessionId)
+      }
       // ⚠️ N04：**先放行已经是 AdapterLlmError 的错误**。
       // 旧写法无条件包成 TRANSPORT，会把 PoW/网络层带出来的 AUTH / RATE_LIMIT
       // 等结构化分类抹掉 —— 宿主于是按"可重试的传输错误"处理本该停止重试的情况。
@@ -2566,8 +2582,18 @@ async function openCompletion(
           : code === 'RATE_LIMIT'
             ? ' —— 网页版限流'
             : ''
-      retireSession(sessionId) // 失败即弃，下次换新会话
-      params.onDeleteSession?.(sessionId)
+      // 🔴 认证/限流被拒时**不要**退役会话（旧写法是无条件 `retireSession() // 失败即弃`）。
+      // 401/403 说的是**令牌**过期、429 说的是**账号级**限流 —— 跟"这个会话"毫无关系：
+      // 换一个新会话账号照样被限，唯一的后果是把用户的对话丢掉（他重新登录后只能新建会话、
+      // 把历史全量重发一遍）。2026-10-02 现场：登录态过期 ⇒ 401 ⇒ 会话被弃 ⇒
+      // `feed-decisions` 里同账号冒出 `new-session`、网页端"又新建一个窗口"。
+      // 会话真的废了会由**业务码**显式告知（`isInvalidSessionError`），那条路径照旧退役；
+      // 5xx / 网络失败 / 取消也照旧退役（服务端可能已经开始生成，会话停在半路 —— N04 的意图）。
+      if (code === 'AUTH' || code === 'RATE_LIMIT') keepIds?.add(sessionId)
+      else {
+        retireSession(sessionId)
+        params.onDeleteSession?.(sessionId)
+      }
       // 0.6.8：AUTH（HTTP 401/403）也走"能不能换号"这条判据 ——
       // 能换号 ⇒ 5s 后重发，由重发前的检查点换上可用账号，整轮自己接下去（用户不用手点「继续」）；
       // 不能 ⇒ 10 分钟（> maxDelayMs）⇒ 重试策略直接放弃，行为与加这个功能之前一致。
@@ -2669,9 +2695,19 @@ async function openCompletion(
           'MALFORMED_RESPONSE',
           { status: resp.status },
         )
-    retireSession(sessionId) // 这个会话已经废了，顺手回收，不留垃圾
-    params.onDeleteSession?.(sessionId)
-    if (attempt === 0 && biz && isInvalidSessionError(biz)) {
+    // 账号级失败（`muted`＝账号被限到某时刻 / `busy`＝账号同时在生成 / `throttled`＝发得太频繁 /
+    // `AUTH`＝令牌失效）跟**这个会话**毫无关系 —— 换一个新会话账号照样被限，唯一的后果是把用户的
+    // 对话丢掉。所以这里**保住**它，等用户重新登录/限流解除后接着聊。
+    // 只有业务码明说"这个会话废了"（`invalid chat session id`）才退役。
+    const accountLevel = !!biz && (muted || busy || throttled || failureCode === 'AUTH')
+    const ruined = !!biz && isInvalidSessionError(biz)
+    if (accountLevel) {
+      keepIds?.add(sessionId)
+    } else {
+      retireSession(sessionId)
+      params.onDeleteSession?.(sessionId)
+    }
+    if (attempt === 0 && ruined) {
       lastFailure = failure
       continue
     }
@@ -2784,6 +2820,26 @@ export async function* streamWebCompletion(
    * 所以必须在这里兜住它后续才返回的那些会话。
    */
   const owned = new Set<string>()
+  /**
+   * 本轮**账号级失败**（认证/限流）时不该被退役的会话（0.6.29）。
+   *
+   * 为什么不能放在 `finally` 里靠错误码判：建连阶段失败时外层 `sessionId` **还是 undefined**
+   * （它在 `await openCompletion(...)` 之后才赋值），`id === sessionId` 恒假 ⇒ 会连
+   * "本轮真正在用的那个会话"一起退役。必须先把它记下来 —— 只有 `openCompletion` 知道。
+   *
+   * 判据（在那里判，这里只消费）：`AUTH`（HTTP 401/403、信封 40003/40001）与
+   * `RATE_LIMIT`（HTTP 429、`user is muted`、`busy generating`、`throttled` 文案族）
+   * 说的都是**账号级**状态 —— 令牌过期、账号被限到某时刻、账号同时在生成。
+   * 换一个新网页端会话一点用都没有（账号照样被限），唯一的效果是把用户的对话丢掉：
+   * 他重新登录后只能新建会话、把整段历史全量重发一遍。
+   * 2026-10-02 现场：登录态过期 ⇒ 401 ⇒ 会话被弃 ⇒ `feed-decisions` 里同账号冒出
+   * `new-session`、网页端"又新建一个窗口"、29 条历史全量重发。
+   *
+   * ⚠️ 5xx / 网络失败 / 取消 / 空响应 **不在此列** —— 那些情况下服务端可能已经开始生成、
+   * 会话停在半路，照旧退役（N04 的意图不能削弱）；会话真的废了则由业务码
+   * `invalid chat session id` 显式告知。
+   */
+  const keepIds = new Set<string>()
   let finalized = false
   const tracked: CompletionTransport = {
     ...transport,
@@ -2829,6 +2885,7 @@ export async function* streamWebCompletion(
         { ...params, sessionReuseTurns: limit, onDeleteSession: cleanup },
         signal,
         tracked,
+        keepIds,
       ),
     )
     sessionId = opened.sessionId
@@ -2899,6 +2956,9 @@ export async function* streamWebCompletion(
     const roundOk = complete || sawTerminal
     lastRetireReason = undefined
     for (const id of owned) {
+      // 账号级失败（认证/限流）：这个会话**没被动过** ⇒ 一次都不许碰它 —— 用户重新登录后
+      // 要能接着原会话聊。见 keepIds 的说明。
+      if (limit > 0 && keepIds.has(id) && !poisoned) continue
       // N04 的意图保留：提前结束/取消（没见到显式终态）仍然要退役 —— 那个会话可能停在半路。
       if (id === sessionId && roundOk && !poisoned && limit > 0) continue
       // 记下"为什么退役"，下次这类"每轮新建会话"的排查不用再插桩（0.6.16 加的可见性）。
