@@ -2159,6 +2159,21 @@ export interface FeedDecisionNote {
    * 有了它，一眼能看出是"DSH 原地改写的那条运行时注入（比如下标 3）"还是"尾部被改了"。
    */
   firstDiff: number | null
+  /**
+   * 这一轮**发出去的提示词的结构**（只记条数，不记内容）。
+   *
+   * 🔴 为什么要有（2026-10-02 用户反复问"是不是把答案直接告诉模型了"）：
+   * 只看字符数回答不了"提示词里**有没有**模型的旧回答" —— 而这一条恰恰是用户最关心的。
+   * 现在不用去读分享页**估**，直接查：`assistant` > 0 就是"把模型自己说过的话又发了一遍"，
+   * `toolResult` > 0 才是工具返回（那是**正常且必要**的：模型调用工具，工具结果必须回灌）。
+   * ⚠️ 两者看起来都像"答案在提示词里"，但一个是缺陷、另一个是机制 —— 必须能一眼分开。
+   */
+  stats: {
+    assistant: number
+    user: number
+    toolResult: number
+    systemBlocks: number
+  }
 }
 
 /**
@@ -2578,6 +2593,12 @@ async function openCompletion(
         headChars: params.promptParts ? String(params.promptParts.head ?? '').length : null,
         firstDiff:
           !chainEntries || !currentEntries ? null : firstDifference(chainEntries, currentEntries),
+        stats: {
+          assistant: (feed.prompt.match(/^Assistant: /gm) ?? []).length,
+          user: (feed.prompt.match(/^User: /gm) ?? []).length,
+          toolResult: (feed.prompt.match(/^\[Tool Result/gm) ?? []).length,
+          systemBlocks: (feed.prompt.match(/^\[System\]/gm) ?? []).length,
+        },
         tailSame:
           !chainEntries || !currentEntries
             ? null

@@ -439,6 +439,23 @@ await test('★ 每轮决策落盘 feed-decisions.jsonl，并给出"链尾是否
     !notes[2].promptChars || notes[2].promptChars < notes[2].headChars + 1000,
     `这一轮只该发分歧点之后的条目（${notes[2].promptChars} 字符），不该把固定头（${notes[2].headChars}）再发一遍`,
   )
+  // ★ 0.6.36：光有字符数回答不了"提示词里**有没有**模型的旧回答" —— 那正是用户反复问的那件事。
+  //   结构计数把它变成可查的事实：`assistant > 0` 才是"把模型说过的话又发了一遍"。
+  const stats = notes[2].stats
+  assert.ok(stats && typeof stats === 'object', '每轮都要落结构计数')
+  for (const key of ['assistant', 'user', 'toolResult', 'systemBlocks']) {
+    assert.equal(typeof stats[key], 'number', `stats.${key} 必须是数字`)
+  }
+  assert.equal(
+    stats.assistant,
+    0,
+    `这一轮是"只发分歧点之后的条目"，里面**不许**有 Assistant 条目（实际 ${stats.assistant}）`,
+  )
+  assert.ok(stats.user >= 1, '正向对照：至少要有用户那一条 —— 否则这个断言在"发了空串"时也会绿')
+  assert.ok(
+    notes[1].stats.assistant >= 0 && typeof notes[1].stats.user === 'number',
+    '每一轮都要有结构计数（不是只给某一轮）',
+  )
 })
 
 // 收尾：把全局模式还原成默认，避免影响同进程里的其它用例/后续跑批
