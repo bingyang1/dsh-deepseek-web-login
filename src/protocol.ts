@@ -732,6 +732,19 @@ export function serializePromptParts(options: SerializeOptions): PromptParts {
   const protocol = toolSection ? `\n\n${protocolText}${toolSection}` : ''
 
   const lines: string[] = []
+  /**
+   * 上一条 assistant 消息里的工具调用 id —— 用来把**紧随其后的那条 user 文本**认成工具返回。
+   *
+   * 🔴 2026-10-02 现场（用户报「提示词把答案直接告诉模型了，所以它回『收到，…』」）：
+   * DSH 执行 `pwsh` 之后，把工具输出当成一条**普通的 user 文本消息**交给我们，于是我们照实
+   * 渲染成 `User: 2026-10-02 18:54:28 星期五` —— 模型读到的是"用户告诉了我时间"，
+   * 它自己的思考原话就是：「**我没拿到工具结果，用户直接给了时间**。那就接受。」
+   * 回答于是从"回答几点"变成"收到，…" —— 看着就像在复述一个已知答案。
+   *
+   * 判据为什么成立：在 agent 循环里，assistant 发出工具调用之后**必须先有工具返回**，
+   * 才轮得到下一条用户输入。所以紧跟其后的那条 user 文本，按构造只能是工具返回。
+   */
+  let pendingToolCallIds: string[] = []
   for (const message of options.messages ?? []) {
     if (!message || typeof message !== 'object') continue
     const blocks: any[] = Array.isArray(message.content) ? message.content : []
@@ -743,15 +756,36 @@ export function serializePromptParts(options: SerializeOptions): PromptParts {
     if (message.role === 'assistant') {
       const text = flattenText(blocks).join('')
       const renderedCalls = renderToolCalls(blocks)
+      // 只有**带工具调用**的这一轮才把"下一个 user 文本"预期成工具返回（见上面说明）
+      pendingToolCallIds = renderedCalls
+        ? blocks.filter((block) => block?.type === 'tool-call').map((block) => String(block.toolCallId ?? block.id ?? ''))
+        : []
       if (renderedCalls) lines.push(`Assistant: ${renderedCalls}`)
       else if (text.trim()) lines.push(`Assistant: ${text}`)
       continue
     }
-    // user 角色：可能是纯文本，也可能携带 tool-result 块
+    // user 角色：可能是纯文本、也可能携带 tool-result 块
     const toolResults = blocks.filter((block) => block?.type === 'tool-result')
     const text = flattenText(blocks.filter((block) => block?.type !== 'tool-result')).join('')
     const imageMarks = blockImageMarks(blocks, options.keptImageKeys)
     const images = imageMarks.length
+    if (toolResults.length === 0 && pendingToolCallIds.length > 0 && images === 0 && text.trim()) {
+      // 工具返回被 DSH 塞成了普通 user 文本 ⇒ 标出来，别让模型以为"这是用户告诉我的"
+      const textBlocks = blocks
+        .filter((block) => block?.type === 'text' && typeof block.text === 'string' && block.text.trim())
+        .map((block) => block.text as string)
+      const ids = pendingToolCallIds
+      pendingToolCallIds = []
+      if (textBlocks.length === ids.length && ids.length > 0) {
+        // 一一对应：一个调用一条返回，逐条标（最常见的形状）
+        for (let i = 0; i < ids.length; i += 1) lines.push(`[Tool Result for ${ids[i]}]\n${textBlocks[i]}`)
+      } else {
+        // 对不上就合并成一条 —— 宁可少标一层对应关系，也不能让它看起来像用户说的话
+        lines.push(`[Tool Result for ${ids.filter(Boolean).join(', ')}]\n${text}`)
+      }
+      continue
+    }
+    pendingToolCallIds = []
     if (text.trim() || (toolResults.length === 0 && images === 0) || images > 0) {
       // 图片本体由调用方上传后经 ref_file_ids 附在请求上；这里只放可定位的占位标记，
       // 让模型知道「图几」对应哪条消息（顺序与 uploadedImages 收集顺序一致）。

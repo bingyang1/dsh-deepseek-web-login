@@ -533,6 +533,120 @@ test('★ transcript 恒等于 full 里"属于历史的那一段"（未超预算
   assert.equal(parts.transcript, parts.entries.join('\n\n'), '未截断时它与条目拼出来的那份一致')
 })
 
+// ── ★ 工具返回被 DSH 塞成普通 user 文本 ⇒ 必须认出来并标注 ─────────────────────
+// 2026-10-02 现场：用户问"现在几点"，DSH 跑了 pwsh，然后把输出当成一条**普通 user 文本**交给我们
+// （而不是 `tool-result` 块）。我们照实渲染成 `User: 2026-10-02 18:54:28 星期五`，
+// 模型读到的是"用户告诉了我时间"，它自己的思考原话：「我没拿到工具结果，用户直接给了时间」，
+// 回答于是变成「收到，…」。判据：assistant 发过工具调用 ⇒ 紧随的那条 user 文本就是工具返回。
+
+const withCallThenText = (resultText) => ({
+  system: 'SYS',
+  messages: [
+    { role: 'user', content: [{ type: 'text', text: '现在几点' }] },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: '我查一下。' },
+        { type: 'tool-call', toolCallId: 'tc-1', toolName: 'pwsh', arguments: '{"command":"Get-Date"}' },
+      ],
+    },
+    { role: 'user', content: [{ type: 'text', text: resultText }] },
+  ],
+  tools: [{ name: 'pwsh', description: '跑命令', parameters: { type: 'object', properties: {} } }],
+  maxChars: 100_000,
+})
+
+test('★ 工具调用之后紧跟的 user 文本 ⇒ 标成 [Tool Result]，不许渲染成用户说的话', () => {
+  const parts = serializePromptParts(withCallThenText('2026-10-02 18:54:28 星期五'))
+  assert.match(parts.transcript, /\[Tool Result for tc-1\]\n2026-10-02 18:54:28 星期五/, '必须标成工具返回并带上 id')
+  assert.doesNotMatch(
+    parts.transcript,
+    /User: 2026-10-02 18:54:28 星期五/,
+    '★ 渲染成 `User: …` 会让模型以为这是用户说的（实测它就是这么以为的）',
+  )
+  // 正向对照：用户真正说的那条仍必须是 User
+  assert.match(parts.transcript, /User: 现在几点/, '真正的用户发言不许被误标')
+})
+
+test('assistant 没发工具调用 ⇒ 下一条 user 文本照旧是 User（防误标）', () => {
+  const parts = serializePromptParts({
+    system: 'SYS',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: '你好' }] },
+      { role: 'assistant', content: [{ type: 'text', text: '在' }] },
+      { role: 'user', content: [{ type: 'text', text: '现在几点' }] },
+    ],
+    tools: [{ name: 'pwsh', description: 'x', parameters: { type: 'object', properties: {} } }],
+    maxChars: 100_000,
+  })
+  assert.match(parts.transcript, /User: 现在几点/)
+  assert.doesNotMatch(parts.transcript, /\[Tool Result for/, '没有工具调用就不该凭空长出工具返回')
+})
+
+test('★ 多个工具调用 + 多个文本块 ⇒ 逐个配对', () => {
+  const parts = serializePromptParts({
+    system: 'SYS',
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', toolCallId: 'a', toolName: 't', arguments: '{}' },
+          { type: 'tool-call', toolCallId: 'b', toolName: 't', arguments: '{}' },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: '结果一' },
+          { type: 'text', text: '结果二' },
+        ],
+      },
+    ],
+    tools: [{ name: 't', description: 'x', parameters: { type: 'object', properties: {} } }],
+    maxChars: 100_000,
+  })
+  assert.match(parts.transcript, /\[Tool Result for a\]\n结果一/)
+  assert.match(parts.transcript, /\[Tool Result for b\]\n结果二/)
+})
+
+test('★ 数量对不齐 ⇒ 合并成一条（宁可少一层对应，也不能看起来像用户发言）', () => {
+  const parts = serializePromptParts({
+    system: 'SYS',
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', toolCallId: 'a', toolName: 't', arguments: '{}' },
+          { type: 'tool-call', toolCallId: 'b', toolName: 't', arguments: '{}' },
+        ],
+      },
+      { role: 'user', content: [{ type: 'text', text: '只有一个块' }] },
+    ],
+    tools: [{ name: 't', description: 'x', parameters: { type: 'object', properties: {} } }],
+    maxChars: 100_000,
+  })
+  assert.match(parts.transcript, /\[Tool Result for a, b\]\n只有一个块/)
+  assert.doesNotMatch(parts.transcript, /User: 只有一个块/)
+})
+
+test('★ 工具调用后紧跟**带图片**的 user 消息 ⇒ 不误标（图片消息是用户发的）', () => {
+  const parts = serializePromptParts({
+    system: 'SYS',
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'a', toolName: 't', arguments: '{}' }],
+      },
+      { role: 'user', content: [{ type: 'text', text: '看这张' }, { type: 'image', id: 'img-1' }] },
+    ],
+    tools: [{ name: 't', description: 'x', parameters: { type: 'object', properties: {} } }],
+    keptImageKeys: ['img-1'],
+    maxChars: 100_000,
+  })
+  assert.match(parts.transcript, /User: 看这张/, '带图的那条是用户发言，不该被当成工具返回')
+  assert.doesNotMatch(parts.transcript, /\[Tool Result for a\]/)
+})
+
 test('★ 超预算被截断时 transcript 也必须是**截断后**那份（否则"只发历史"会超出上限）', () => {
   const huge = {
     ...partsOptions,
