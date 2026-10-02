@@ -1050,6 +1050,19 @@ const checks = {
     /if \(!headers\[key\]\) headers\[key\] = value/.test(host),
   'host 缺 x-device-id 会被判为捕获缺陷（上游对缺设备指纹直接判 RISK_DEVICE_DETECTED）':
     /function captureDefect\(auth\) \{[\s\S]{0,700}?x-device-id/.test(host),
+
+  // ── 0.6.31：内部请求的脚手架会话不许留在用户的网页端 ──────────────────────
+  // 2026-10-02 用户报「就发了一句话，网页版直接俩窗口」：`no-parts` 那条（session-title）
+  // 建出来的会话在 keep 模式下**从没安排过删除**（`schedule()` 直接 return）⇒ 留在侧边栏。
+  'host 把内部请求（无 promptParts）的会话与用户的清理策略**分开**处理':
+    // ⚠️ 两个产物断言的坑（都踩过）：① 打包器去掉单语句的花括号（`if (x) { a() }` → `if (x) a()`）；
+    // ② 打包器把 `undefined` 改写成 `void 0`（写 `=== undefined` 必然假红）。
+    /if \(params\.promptParts === void 0\) \{[\s\S]{0,260}?params\.onDiscardSession\?\.\(id\)/.test(host),
+  'host 的 discard 删的是**那一个**会话，不 drain 队列（否则会把用户的会话顺手删了）':
+    /function discard\(auth, sessionId\) \{[\s\S]{0,90}?return deleteChunk\(\[\{[\s\S]{0,70}?sessionId/.test(host),
+  'host 的丢弃通道仍受 deleteWebSessions 总闸约束（"一个都不许删"的语义不能破）':
+    /onDiscardSession: deps\.config\.deleteWebSessions === false \? void 0 : /.test(host) &&
+    /deps\.sessionCleaner\.discard\(auth, sessionId\)/.test(host),
 }
 
 let failed = 0

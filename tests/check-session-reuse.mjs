@@ -107,6 +107,17 @@ async function runOnce({ auth = authA, transport, fetched, sessionReuseTurns, pr
 
 const okFetch = async () => new Response(SSE_OK, { status: 200, headers: SSE_HEADERS })
 
+/**
+ * ⚠️ 模拟**真实 chat 请求**的夹具**必须**带 `promptParts`。
+ *
+ * 0.6.31 起这条从"注意事项"升级成**硬约束**：不带 `promptParts` 的请求被当作**内部请求**
+ * （`session-title` / 压缩），它们的网页端会话是**脚手架** —— 收尾时**直接丢掉、不进用户的
+ * 清理策略**（见 webapi 里 `discard` 的长注释）。
+ * 于是拿裸 `params` 去测"chat 会话的轮换 / 回收 / 归属"，测到的是**另一条路径**，成批变红。
+ * 生产链路本身就是这么分的：adapter 只给 `chatLike`（用户可见的对话）传 `promptParts`。
+ */
+const CHAT_PARTS = { head: 'HEAD', entries: ['User: x'] }
+
 console.log('会话复用')
 
 await test('默认开启复用：连发 3 次只用 1 个会话，且结束后不删', async () => {
@@ -140,6 +151,7 @@ await test('到达轮次上限后轮换：建新会话，并把旧的交出来�
         modelType: 'default',
         idleTimeoutMs: 5_000,
         sessionReuseTurns: 2,
+        promptParts: CHAT_PARTS,
         onDeleteSession: (id) => deleted.push(id),
       },
       transport,
@@ -165,6 +177,7 @@ await test('关闭复用（0）：回到每请求一个会话，且用完即删'
         modelType: 'default',
         idleTimeoutMs: 5_000,
         sessionReuseTurns: 0,
+        promptParts: CHAT_PARTS,
         onDeleteSession: (id) => deleted.push(id),
       },
       transport,
@@ -256,6 +269,7 @@ await test('换账号不复用，旧会话交还原账号的回调', async () =>
       thinkingEnabled: false,
       modelType: 'default',
       idleTimeoutMs: 5_000,
+      promptParts: CHAT_PARTS,
       onDeleteSession: (id) => deleted.push([owner, id]),
     }
     for await (const _ of streamWebCompletion(auth, params, transport)) void _
@@ -305,7 +319,13 @@ await test('没给 dshSessionId（老宿主）⇒ 退化成共用一个槽，行
   const { created, transport } = mkTransport()
   setFetchImpl(okFetch)
   const once = async () => {
-    const params = { prompt: 'P', thinkingEnabled: false, modelType: 'default', idleTimeoutMs: 5_000 }
+    const params = {
+      prompt: 'P',
+      thinkingEnabled: false,
+      modelType: 'default',
+      idleTimeoutMs: 5_000,
+      promptParts: CHAT_PARTS,
+    }
     for await (const _ of streamWebCompletion(authA, params, transport)) void _
   }
   await once()

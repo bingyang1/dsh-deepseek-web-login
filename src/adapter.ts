@@ -21,6 +21,7 @@ import {
   FAILOVER_RETRY_MS,
   MAX_THROTTLE_RETRY_MS,
   scheduleDeleteSession,
+  discardSession,
   streamWebCompletion,
   uploadImageFile,
   type SessionCleaner,
@@ -1344,6 +1345,17 @@ export function createAdapter(deps: AdapterDeps) {
                 // 清理策略由宿主注入（攒批 / 立即 / 不删），缺省退回老行为
                 if (deps.sessionCleaner) deps.sessionCleaner.schedule(auth as WebAuth, sessionId)
                 else scheduleDeleteSession(auth as WebAuth, sessionId)
+              },
+        // 🔴 内部请求（不带 promptParts 的 session-title / 压缩）的会话是**脚手架**：
+        // `sessionCleanup: keep` 与 `manualOnly` 都拦不住它 —— 那两道只管用户的对话。
+        // 不丢它 ⇒ 网页端会凭空多出一个会话（2026-10-02 用户报「就发了一句话、网页版俩窗口」）。
+        // ⚠️ 仍然受 `deleteWebSessions === false` 约束：那个开关的语义是"一个都不许删"。
+        onDiscardSession:
+          deps.config.deleteWebSessions === false
+            ? undefined
+            : (sessionId: string) => {
+                if (deps.sessionCleaner) void deps.sessionCleaner.discard(auth as WebAuth, sessionId)
+                else discardSession(auth as WebAuth, sessionId)
               },
       })) {
         if (event.kind === 'thinking' || event.kind === 'text') roundUsage.outputChars += event.text.length

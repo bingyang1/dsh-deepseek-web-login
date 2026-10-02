@@ -139,6 +139,10 @@ async function scenario({ completionResponses, sessionReuseTurns = 0, canFailove
       modelType: 'default',
       idleTimeoutMs: 5_000,
       sessionReuseTurns,
+      // ⚠️ 模拟真实 chat：**必须**带 `promptParts`。不带会被当成内部请求（`session-title` 之类），
+      // 而内部请求的会话是**脚手架** —— 收尾时走 `onDiscardSession` 直接丢，
+      // 于是这里的 `delete:` 时序对不上（生产链路也是这么分的，见 adapter 的 `chatLike`）。
+      promptParts: { head: 'HEAD', entries: ['User: hi'] },
       onDeleteSession: (id) => log.push(`delete:${id}`),
       ...(canFailover !== undefined ? { canFailover } : {}),
     }, transport)) {

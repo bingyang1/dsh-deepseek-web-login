@@ -350,6 +350,8 @@ await test('退出收尾：disposeSessionReuse 把槽里的会话交回清理回
         modelType: 'default',
         idleTimeoutMs: 5_000,
         sessionReuseTurns: 20,
+        // ⚠️ 模拟真实 chat：必须带 promptParts，否则会被当成内部请求（会话是脚手架、用完就丢）
+        promptParts: { head: 'HEAD', entries: ['User: x'] },
         onDeleteSession: (id) => wanted.push(id),
       },
       transport,

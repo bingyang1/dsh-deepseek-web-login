@@ -828,6 +828,11 @@ export interface SessionCleanerOptions {
 
 export interface SessionCleaner {
   schedule(auth: WebAuth, sessionId: string): void
+  /**
+   * 丢掉一个**我们自己的脚手架会话**（内部请求用的那个）—— 不受 keep / manualOnly 影响，
+   * 也不 drain 队列。见实现处的长注释（2026-10-02「就发了一句话、网页端俩窗口」）。
+   */
+  discard(auth: WebAuth, sessionId: string): Promise<void>
   /** 立即清理队列（测试 / 面板「立即清理」/ 卸载时用）。**手动调用不受 manualOnly 限制**。 */
   flush(): Promise<void>
   pendingCount(): number
@@ -1122,6 +1127,28 @@ export function createSessionCleaner(options: SessionCleanerOptions = {}): Sessi
     for (const item of dropped) emitSessionLifecycle({ kind: 'abandoned', sessionId: item.sessionId })
   }
 
+  /**
+   * 立刻丢掉**一个我们自己的脚手架会话**（内部请求用的那个），**不受清理策略影响**。
+   *
+   * 为什么要单独一条路：`keep`（用户选的「不删」）与 `manualOnly`（链式模式下攒着等手动清）
+   * 都让 `schedule()` 变成空操作 —— 那对**用户的对话**是对的，对**我们自己建的会话**是错的。
+   * 内部请求（`session-title` / 压缩之类）必须有一条会话才能调 completion，而那条会话
+   * 既不是用户建的、用户也不需要它 —— 留在网页端就是**凭空多出来的一个会话**。
+   *
+   * 🔴 2026-10-02 用户现场：「刚在 dsh 中新建一个窗口聊天，就发了一句话，网页版直接俩窗口」。
+   * `feed-decisions.jsonl` 里对上了：12:55:54 `new-session`（对话，`04c63135`）＋
+   * 12:56:00 `no-parts`（内部请求，`de6a8d4f`）—— 后者正是网页端多出来的那一个，
+   * 而且它**连 ledger 都没有**（keep 模式下 `schedule()` 直接 return，从没安排过删除）。
+   *
+   * ⚠️ 只删**这一个**，**不去 drain 队列**：`manualOnly` 下队列里攒的是用户的会话，
+   * 借这次机会顺手把它们删掉，就变成"用户没点按钮却被删了"（0.6.1x 修过的那个 bug）。
+   * ⚠️ 仍然受 `deleteWebSessions === false`（总闸）约束 —— 那个开关的语义是"一个都不许删"，
+   * 接线在 adapter.ts。所以**关掉总闸时这类会话仍会留在网页端**，这是已知代价。
+   */
+  function discard(auth: WebAuth, sessionId: string): Promise<void> {
+    return deleteChunk([{ auth, sessionId }])
+  }
+
   function configure(next: Partial<SessionCleanupPolicy>): SessionCleanupPolicy {
     const modeChanged = next.mode !== undefined && next.mode !== policy.mode
     if (next.mode !== undefined) policy.mode = next.mode
@@ -1151,6 +1178,7 @@ export function createSessionCleaner(options: SessionCleanerOptions = {}): Sessi
 
   return {
     schedule,
+    discard,
     flush,
     pendingCount: () => queue.length,
     policy: () => ({ ...policy }),
@@ -1175,6 +1203,14 @@ const defaultCleaner = createSessionCleaner({
 
 export function scheduleDeleteSession(auth: WebAuth, sessionId: string): void {
   defaultCleaner.schedule(auth, sessionId)
+}
+
+/**
+ * 丢掉一个**脚手架会话**（内部请求用的那个）—— 没有注入清理器时的兜底路径。
+ * 语义与 `SessionCleaner.discard` 完全一致（不受 keep 影响）。
+ */
+export function discardSession(auth: WebAuth, sessionId: string): void {
+  void defaultCleaner.discard(auth, sessionId)
 }
 
 /**
@@ -2369,6 +2405,18 @@ export interface CompletionParams {
   dshSessionId?: string
   onDeleteSession?: (sessionId: string) => void
   /**
+   * 丢掉一个**内部请求的脚手架会话** —— 与 `onDeleteSession` 的区别是**不受清理策略约束**。
+   *
+   * 为什么必须分开：`session-title` / 压缩这类内部请求（**不带结构化 `promptParts`**）
+   * 也必须有一条网页端会话才能调 completion，而那条会话既不是用户建的、用户也不需要它。
+   * 用户的 `sessionCleanup`（尤其 `keep`）与 `manualOnly` 都会让 `onDeleteSession` 变成空操作 ——
+   * 那对**用户的对话**是对的，对**我们自己建的会话**是错的：留在网页端就是凭空多一个会话
+   * （2026-10-02 用户报「就发了一句话，网页版直接俩窗口」）。
+   *
+   * ⚠️ 宿主仍应让 `deleteWebSessions === false`（"一个都不许删"总闸）把它接成 undefined。
+   */
+  onDiscardSession?: (sessionId: string) => void
+  /**
    * 当前账号被限时问宿主：「换个账号还能不能接着干」。
    *
    * 用途只有一个 —— 决定这次失败给**长退避**还是**短退避**：
@@ -2974,17 +3022,30 @@ export async function* streamWebCompletion(
     // 判据必须取并集（理由见 `sawTerminal` 的注释）—— 只认前者会把成功的一轮判成没跑完。
     const roundOk = complete || sawTerminal
     lastRetireReason = undefined
-    for (const id of owned) {
-      // 账号级失败（认证/限流）：这个会话**没被动过** ⇒ 一次都不许碰它 —— 用户重新登录后
-      // 要能接着原会话聊。见 keepIds 的说明。
-      if (limit > 0 && keepIds.has(id) && !poisoned) continue
-      // N04 的意图保留：提前结束/取消（没见到显式终态）仍然要退役 —— 那个会话可能停在半路。
-      if (id === sessionId && roundOk && !poisoned && limit > 0) continue
-      // 记下"为什么退役"，下次这类"每轮新建会话"的排查不用再插桩（0.6.16 加的可见性）。
-      lastRetireReason =
-        id !== sessionId ? 'extra-session' : poisoned ? 'poisoned' : !roundOk ? 'not-finished' : 'rotated'
-      retireSession(id)
-      cleanup(id)
+    // ── 内部请求（不带结构化 promptParts）的会话是**我们自己的脚手架** ──────────
+    // 它们**不进用户的清理策略**（keep / manualOnly 都管不着），一律就地丢掉。
+    // 判据与 `requestSlotKey` 同一处：`promptParts` 有没有传。见 `discard` 的长注释。
+    if (params.promptParts === undefined) {
+      const scaffolding = new Set<string>(owned)
+      // ⚠️ 复用来的会话**不在 `owned` 里**（这一轮没调 createSession），但同样是脚手架 ⇒ 必须一起丢
+      if (sessionId) scaffolding.add(sessionId)
+      for (const id of scaffolding) {
+        retireSession(id)
+        params.onDiscardSession?.(id)
+      }
+    } else {
+      for (const id of owned) {
+        // 账号级失败（认证/限流）：这个会话**没被动过** ⇒ 一次都不许碰它 —— 用户重新登录后
+        // 要能接着原会话聊。见 keepIds 的说明。
+        if (limit > 0 && keepIds.has(id) && !poisoned) continue
+        // N04 的意图保留：提前结束/取消（没见到显式终态）仍然要退役 —— 那个会话可能停在半路。
+        if (id === sessionId && roundOk && !poisoned && limit > 0) continue
+        // 记下"为什么退役"，下次这类"每轮新建会话"的排查不用再插桩（0.6.16 加的可见性）。
+        lastRetireReason =
+          id !== sessionId ? 'extra-session' : poisoned ? 'poisoned' : !roundOk ? 'not-finished' : 'rotated'
+        retireSession(id)
+        cleanup(id)
+      }
     }
     // 链式投喂的记账（2026-09-14）：只有「流正常跑完 + 没被污染 + 拿到了本轮的
     // assistant message_id」才把这链接上；其余（报错/取消/提前 return/没收到 ready）

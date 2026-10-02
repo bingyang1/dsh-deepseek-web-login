@@ -307,6 +307,8 @@ await test('调用方取到正文就 return → 下一次必须换新会话', as
     thinkingEnabled: false,
     modelType: 'default',
     idleTimeoutMs: 5_000,
+    // ⚠️ 模拟真实 chat：必须带 promptParts，否则会被当成内部请求（会话是脚手架、用完就丢）
+    promptParts: { head: 'HEAD', entries: ['User: x'] },
     onDeleteSession: () => {},
   })
   for await (const _ of streamWebCompletion(authA, params(), transport)) break
@@ -323,6 +325,8 @@ await test('复用会话仍在消费中时，并发请求不得回收它', async
     thinkingEnabled: false,
     modelType: 'default',
     idleTimeoutMs: 5_000,
+    // ⚠️ 模拟真实 chat：必须带 promptParts（见上）
+    promptParts: { head: 'HEAD', entries: ['User: x'] },
     sessionReuseTurns: 1, // 第二次请求必然触发轮换
     onDeleteSession: (id) => deleted.push(id),
   })
