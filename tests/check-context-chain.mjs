@@ -168,7 +168,7 @@ await test('chained 模式连续三轮：每轮 parent 都是上一轮的 messag
   assert.equal(c.body.prompt, E3)
 })
 
-await test('历史被改写（链尾变了）⇒ 退回全量重发，但仍挂在链尾（不发根消息）', async () => {
+await test('★ 历史被改写（链尾变了）⇒ 只发从分歧点起的条目，仍挂链尾', async () => {
   resetSessionReuse()
   applyContextMode('chained')
   const { transport } = mkTransport()
@@ -177,7 +177,19 @@ await test('历史被改写（链尾变了）⇒ 退回全量重发，但仍挂�
   // ★ 0.6.23：不再退回根消息 —— 发 parent=null 会在网页端渲染成同层的另一条消息
   // （「修改 / 重新生成」+ `n / n`），用户明确要求"一个窗口一条对话线"。
   assert.equal(rewritten.body.parent_message_id, 2, '有链就挂链尾：根消息会让网页端分叉')
-  assert.equal(rewritten.body.prompt, rewritten.full, '但这一轮必须重发全量（增量会切错位置）')
+  // ★ 0.6.33：链还在 ⇒ 那条会话里固定头和历史都还在，只发服务端没见过的条目。
+  //   0.6.32 之前这里发的是 `full`（整份固定头 + 整份历史），而历史里全是 `Assistant:` 条目
+  //   ⇒ 模型被喂了自己刚说的话（用户 2026-10-02 的原话："相当于我发给网页版已知的答案"）。
+  assert.equal(
+    rewritten.body.prompt,
+    'User: 第一问（被压缩改写过）\n\n[Tool Result for c1]\n结果一',
+    '只发从分歧点（下标 0）起的条目',
+  )
+  assert.notEqual(rewritten.body.prompt, rewritten.full, '自证：没有退回整份')
+  assert.ok(
+    !rewritten.body.prompt.includes('SYSTEM+协议+工具目录'),
+    '★ 固定头不许再发一遍（它在会话首条消息里给过了）',
+  )
   assert.equal(contextChainInfo()?.parentId, 4, '这一轮的 id 成为下一轮的父消息')
 })
 
@@ -408,9 +420,25 @@ await test('★ 每轮决策落盘 feed-decisions.jsonl，并给出"链尾是否
   assert.equal(notes[1].reused, true)
   assert.equal(notes[1].tailSame, true, 'chain 是 entries 的前缀时 tailSame 必须为 true')
 
-  // 第三轮：历史被改写 ⇒ 退回全量，tailSame=false —— 这正是"为什么没续链"的直接答案
+  // 第三轮：历史被改写 ⇒ 不续链，tailSame=false —— 这是"为什么没续链"的直接答案
   assert.equal(notes[2].reason, 'not-appended')
   assert.equal(notes[2].tailSame, false, '链尾被改写时必须报 false，否则这条留痕没用')
+  // ★ 0.6.33：`tailSame=false` 只说"变了"，不说"从哪儿变" —— firstDiff 才回答得了"是哪一条"。
+  //   这一轮把链的第 0 条（`User: 第一问` → `User: 第一问（被改写）`）改了 ⇒ 分歧点在 0。
+  assert.equal(notes[2].firstDiff, 0, `本轮应从下标 0 开始不同，实际 ${notes[2].firstDiff}`)
+  // 体量：`promptChars` 必须小于整份 `full`（只发分歧点之后的条目）—— 这就是"5 个字发出去 4 万字符"的解药
+  assert.ok(
+    typeof notes[2].promptChars === 'number' && notes[2].promptChars > 0,
+    '体量必须落盘（2026-10-02 之前没有它，只能靠读分享页去估）',
+  )
+  assert.ok(
+    typeof notes[2].headChars === 'number' && notes[2].headChars > 0,
+    '固定头大小也要落盘，否则"重发一大段"里的"一大段"有多大只能猜',
+  )
+  assert.ok(
+    !notes[2].promptChars || notes[2].promptChars < notes[2].headChars + 1000,
+    `这一轮只该发分歧点之后的条目（${notes[2].promptChars} 字符），不该把固定头（${notes[2].headChars}）再发一遍`,
+  )
 })
 
 // 收尾：把全局模式还原成默认，避免影响同进程里的其它用例/后续跑批

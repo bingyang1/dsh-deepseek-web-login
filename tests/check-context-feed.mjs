@@ -217,8 +217,9 @@ test('固定头变了（系统提示/工具目录）：重发全量，但仍挂�
   assert.deepEqual(d.next?.entries, ENTRIES('User: 一', 'Assistant: 答一', '[Tool Result for c1]\n结果'))
 })
 
-test('链尾那条被改写（不是纯追加）：重发全量，但仍挂链尾', () => {
-  // 典型的"压缩/回退"：链的最后一条在新数组里变成了别的内容
+test('★ 链尾那条被改写（不是纯追加）：只发**从分歧点起**的条目，不再重发整份历史', () => {
+  // 2026-10-02 用户现场的核心：他只说了 5 个字，发出去 40193 字符，
+  // 而网页端的用户气泡里是"上一句回答 + 新消息" —— 等于把模型自己刚说的话又喂回去。
   const d = decideFeed(
     chainedInput({
       entries: ENTRIES('User: 一', 'Assistant: 答一（被压缩重写过）', '[Tool Result for c1]\n结果'),
@@ -226,11 +227,13 @@ test('链尾那条被改写（不是纯追加）：重发全量，但仍挂链�
     }),
   )
   assert.equal(d.reason, 'not-appended')
-  assert.equal(d.prompt, 'FULL-PROMPT')
+  // 分歧在下标 1 ⇒ 发 [1..]；其中 `Assistant:` 是模型自己刚说的 ⇒ 剔掉（与增量路径同一条网）
+  assert.equal(d.prompt, '[Tool Result for c1]\n结果', '只发服务端还没见过的部分')
+  assert.notEqual(d.prompt, 'FULL-PROMPT', '自证：不再重发整份历史')
   assert.equal(d.parentMessageId, 42, '★ 挂链尾，不发根消息')
 })
 
-test('历史变短（回退）：也算非追加 → 重发全量但挂链尾', () => {
+test('★ 历史变短（回退）⇒ 发剩下的条目（剔回声），仍挂链尾', () => {
   const d = decideFeed(
     chainedInput({
       entries: ENTRIES('User: 一'),
@@ -238,6 +241,7 @@ test('历史变短（回退）：也算非追加 → 重发全量但挂链尾', 
     }),
   )
   assert.equal(d.reason, 'not-appended')
+  assert.equal(d.prompt, 'User: 一', '链还在 ⇒ 不重发固定头、也不重发历史；分歧点之后无条目 ⇒ 退到"整份剔回声"')
   assert.equal(d.parentMessageId, 42, '★ 挂链尾，不发根消息')
 })
 
@@ -248,12 +252,13 @@ test('条目数没变（同一步重试）：重发全量但挂链尾', () => {
   assert.equal(d.parentMessageId, 42, '★ 挂链尾，不发根消息')
 })
 
-// ── 0.6.32：重发时**不重发固定头** ──────────────────────────────────────────
-// 走到 `replay` 说明链还在（同一网页端会话、同一账号）⇒ 那条会话的**首条消息**里
-// 已经把固定头给过了，重发它是纯重复。固定头 = system + 协议指令 + 工具目录，
-// 实测约 **6.35 万字符**，占一轮的大头 —— 用户 2026-10-02 报的"同一大段又出现一次"就是它。
+// ── 0.6.33：重发时**只发服务端没见过的部分**（并剔掉模型回声）─────────────────
+// 走到 `replay` 说明链还在（同一网页端会话、同一账号）⇒ 那条会话里**固定头和历史都还在**，
+// 重发它们纯属重复。2026-10-02 第二次现场（用户："我只说了『哇哦帅气』，
+// 发出去的提示词怎么这么长"）：历史里有全部 `Assistant:` 条目 ⇒ 模型被喂了它自己刚说的话，
+// 网页端的用户气泡里就是"上一句回答 + 新消息"。
 
-test('★ 链尾被改写 + 头没变 + 给了 transcript ⇒ 只发历史，**不重发固定头**', () => {
+test('★ 链尾被改写 + 头没变 ⇒ 只发分歧点之后的条目（4 档里最小的那档）', () => {
   const d = decideFeed(
     chainedInput({
       entries: ENTRIES('User: 一', 'Assistant: 答一（被压缩重写过）', '[Tool Result for c1]\n结果'),
@@ -262,8 +267,9 @@ test('★ 链尾被改写 + 头没变 + 给了 transcript ⇒ 只发历史，**�
     }),
   )
   assert.equal(d.reason, 'not-appended')
-  assert.equal(d.prompt, 'TRANSCRIPT-ONLY', '头没变 ⇒ 不许重发固定头（它已经在会话首条消息里了）')
-  assert.notEqual(d.prompt, 'FULL-PROMPT', '自证：确实没退回旧的全量行为')
+  assert.equal(d.prompt, '[Tool Result for c1]\n结果', '有更小的档就用它 —— 不该退到整份 transcript')
+  assert.notEqual(d.prompt, 'TRANSCRIPT-ONLY', '自证：确实没停在 0.6.32 那一档')
+  assert.notEqual(d.prompt, 'FULL-PROMPT', '自证：也没退回旧的全量行为')
   assert.equal(d.parentMessageId, 42, '★ 仍然挂链尾，不发根消息')
   assert.deepEqual(
     d.next?.entries,
@@ -272,7 +278,17 @@ test('★ 链尾被改写 + 头没变 + 给了 transcript ⇒ 只发历史，**�
   )
 })
 
-test('★ 头变了 ⇒ 即使给了 transcript 也必须**整份重发**（新头从没发过）', () => {
+test('★ 模型回声必须剔掉（这正是用户看到"答案被喂回去"的那一半）', () => {
+  // ⚠️ 必须构造成**非追加**：链尾那条被改写过（`答一` vs `旧回答`），否则走的是 chained（第一版就踩了）
+  const chainEntries = ENTRIES('User: 一', 'Assistant: 旧回答（被压缩改写）')
+  const entries = ENTRIES('User: 一', 'Assistant: 答一', 'User: 二')
+  const d = decideFeed(chainedInput({ entries, chainEntries, chainPatch: { entries: chainEntries } }))
+  assert.equal(d.reason, 'not-appended')
+  assert.equal(d.prompt, 'User: 二', '分歧点在 1 ⇒ 发 [1..]，其中 Assistant 那条要剔掉')
+  assert.doesNotMatch(d.prompt, /Assistant:/, '不许把模型自己刚说的话当输入发回去')
+})
+
+test('★ 头变了 ⇒ 即使有更小的档也必须**整份重发**（新头从没发过）', () => {
   const d = decideFeed(
     chainedInput({ input: { head: `${HEAD}（工具目录变了）`, transcript: 'TRANSCRIPT-ONLY' } }),
   )
@@ -280,18 +296,35 @@ test('★ 头变了 ⇒ 即使给了 transcript 也必须**整份重发**（新�
   assert.equal(d.prompt, 'FULL-PROMPT', '新头没给过 ⇒ 必须连头一起发，否则模型手里是旧头')
 })
 
-test('★ 没给 transcript ⇒ 退回旧行为（整份重发）。漏传只是少省一点，不会错', () => {
-  const d = decideFeed(
-    chainedInput({
-      entries: ENTRIES('User: 一', 'Assistant: 答一（被改写过）', '[Tool Result for c1]\n结果'),
-      chainEntries: ENTRIES('User: 一', 'Assistant: 答一'),
-    }),
-  )
+test('★ 算不出更小的档 ⇒ 退到"整份剔回声"（仍不发固定头、不发模型回声）', () => {
+  const same = ENTRIES('User: 一', 'Assistant: 答一')
+  const d = decideFeed(chainedInput({ entries: same, chainEntries: same }))
   assert.equal(d.reason, 'not-appended')
-  assert.equal(d.prompt, 'FULL-PROMPT')
+  assert.equal(d.prompt, 'User: 一', '条目没变 ⇒ 分歧点之后无内容 ⇒ 退一档：整份剔回声')
 })
 
-test('★ 历史变短（回退）+ 给了 transcript ⇒ 同样省掉固定头', () => {
+test('★ 全是被剔掉的内容时不许发空串（退回原样，宁可多发一段）', () => {
+  // 同样必须构造成**非追加**（链尾那条被改写），否则走 chained 而不是 replay
+  const chainEntries = ENTRIES('User: 一', 'Assistant: 旧回答')
+  const entries = ENTRIES('User: 一', 'Assistant: 答一')
+  const d = decideFeed(chainedInput({ entries, chainEntries, chainPatch: { entries: chainEntries } }))
+  assert.equal(d.reason, 'not-appended')
+  assert.equal(d.prompt, 'Assistant: 答一', '尾巴上只有回声 ⇒ 原样发它（发空串会让这一轮没法进行）')
+  assert.ok(d.prompt.trim().length > 0, '★ 永远不许给出空 prompt')
+})
+
+test('★ 四档都算不出来时退回整份（兜底仍在，且挂链尾）', () => {
+  // 条目为空 ⇒ 算不出任何更小的档 ⇒ 只能发 full
+  const chainEntries = ENTRIES('User: 一')
+  const d = decideFeed(
+    chainedInput({ entries: [], chainEntries, chainPatch: { entries: chainEntries } }),
+  )
+  assert.equal(d.reason, 'not-appended')
+  assert.equal(d.prompt, 'FULL-PROMPT', '兜底：什么都不会算时还是发整份')
+  assert.equal(d.parentMessageId, 42, '★ 即使发整份也挂链尾')
+})
+
+test('★ 历史变短（回退）+ 给了 transcript ⇒ 也走更小的档', () => {
   const d = decideFeed(
     chainedInput({
       entries: ENTRIES('User: 一'),
@@ -300,7 +333,19 @@ test('★ 历史变短（回退）+ 给了 transcript ⇒ 同样省掉固定头'
     }),
   )
   assert.equal(d.reason, 'not-appended')
-  assert.equal(d.prompt, 'TRANSCRIPT-ONLY')
+  assert.equal(d.prompt, 'User: 一')
+})
+
+test('★ 历史变短（回退）+ 给了 transcript ⇒ 同样只发更小的那档', () => {
+  const d = decideFeed(
+    chainedInput({
+      entries: ENTRIES('User: 一'),
+      chainEntries: ENTRIES('User: 一', 'Assistant: 答一', 'User: 二'),
+      input: { transcript: 'TRANSCRIPT-ONLY' },
+    }),
+  )
+  assert.equal(d.reason, 'not-appended')
+  assert.equal(d.prompt, 'User: 一', '有更小的档就别用整份 transcript')
 })
 
 test('追加了条目但内容全空白：当作没有新增 → 重发全量但挂链尾', () => {
@@ -343,15 +388,20 @@ test('★ 运行时注入被原地替换（DSH 每轮都这样）⇒ 仍然续�
   assert.equal(d.parentMessageId, 9)
 })
 
-test('★ 中途插入条目（不是原位替换）⇒ 不续链，但仍挂链尾（不发根消息）', () => {
+test('★ 中途插入条目（不是原位替换）⇒ 不续链，但只发**分歧点之后**的条目，且仍挂链尾', () => {
   const chainEntries = ENTRIES('User: 一', 'Assistant: 答一')
-  // 在中间插了一条 —— 增量会切错位置，必须退回全量重发
+  // 在中间插了一条 —— 就地算增量会切错位置，所以不能续链；
+  // 但链还在（同会话同账号）⇒ 只发 [1..] 即可，不必重发固定头与整份历史。
   const entries = ENTRIES('User: 一', 'User: <新注入>', 'Assistant: 答一', 'User: 二')
   const d = decideFeed(
     chainedInput({ entries, chainEntries, chainPatch: { entries: chainEntries, parentId: 9 } }),
   )
   assert.equal(d.reason, 'not-appended')
-  assert.equal(d.prompt, 'FULL-PROMPT', '退回全量')
+  assert.equal(
+    d.prompt,
+    'User: <新注入>\n\nUser: 二',
+    '从分歧点（下标 1）起发；`Assistant: 答一` 是模型自己刚说的 ⇒ 剔掉',
+  )
   assert.equal(d.parentMessageId, 9, '★ 仍挂链尾 —— 发根消息会在网页端产生分叉')
 })
 

@@ -149,6 +149,17 @@ export function isAssistantTranscriptEntry(entry: string): boolean {
 }
 
 /**
+ * 两个条目序列**从哪个下标开始不一样**（完全相同则返回较短的公共长度）。
+ *
+ * 用途：链没续上时（`not-appended`）算"服务端还没见过的部分"从哪里开始。
+ */
+export function firstDifference(prev: readonly string[], next: readonly string[]): number {
+  const shared = Math.min(prev.length, next.length)
+  for (let i = 0; i < shared; i += 1) if (prev[i] !== next[i]) return i
+  return shared
+}
+
+/**
  * 这一轮要不要**换一个干净会话**。
  *
  * 🔴 2026-09-30 实测的坑（用户报"换个窗口聊天就把上下文清理一次"）：
@@ -327,14 +338,49 @@ export function decideFeed(input: FeedInput): FeedDecision {
    * 用户在网页端看到的现象（同一段 Tool Calling Protocol 出现两次）就是它。
    * ⚠️ 只有 `head-changed` 必须重发头（新头没给过），所以那条路径**不**走这个优化。
    */
-  const replay = (reason: FeedReason, headUnchanged = false): FeedDecision => {
-    const prompt = headUnchanged && typeof input.transcript === 'string' ? input.transcript : full
+  const replay = (reason: FeedReason, options: { headUnchanged?: boolean; from?: number } = {}): FeedDecision => {
+    const prompt = replayPrompt(options)
     return {
       prompt,
       parentMessageId: chain.parentId,
       next: { head, entries: entries.slice(), sessionId: input.sessionId, accountKey: input.accountKey },
       reason,
     }
+  }
+
+  /**
+   * 重发时到底发哪一段。**按代价从小到大试，第一个可用的就用**，全都不行才退回整份。
+   *
+   * 🔴 2026-10-02 第二轮的现场（用户报"我只说了『哇哦帅气』，发出去的提示词怎么这么长"）：
+   *    `not-appended` 走这条路时发的是**整份历史**，而历史里全是 `Assistant: …` 条目 ——
+   *    也就是**模型自己刚说过的那段回答**。于是：① 5 个字的输入发出去 40193 字符；
+   *    ② 网页端的用户气泡里赫然是"上一句回答 + 我的新消息"，看着就像"我把答案喂给它让它复述"。
+   *    增量路径**早就有**"剔掉模型回声"这条规则（0.6.17 为同样的投诉加的），**这条路没走它** ——
+   *    当时注释还写着"只在增量里剔"，理由站在"全量是从零重述"那边；但 replay 根本不是从零重述：
+   *    链还在（同会话、同账号），该会话里什么都有。所以这里必须按**同一套网**来。
+   *
+   * 四档（每档都要求"非空且不超预算"）：
+   *   ① 从**第一个分歧点**起的条目（剔回声）—— 最小，通常就是这一句新消息；
+   *   ② 整份条目（剔回声）—— 分歧点算不出来时退一步，至少不再把模型的话喂回去；
+   *   ③ `transcript`（0.6.32：省掉固定头）；
+   *   ④ 整份 `full` —— 什么都算不出来时的兜底。
+   * ⚠️ 头**变了**时只有 ④ 合法（新头从没发过）。
+   */
+  const replayPrompt = ({ headUnchanged = false, from }: { headUnchanged?: boolean; from?: number }): string => {
+    if (headUnchanged) {
+      const budget = Number.isFinite(input.maxChars) ? (input.maxChars as number) : Number.POSITIVE_INFINITY
+      const usable = (text: string): boolean => text.trim().length > 0 && text.length <= budget
+      if (from !== undefined && from < entries.length) {
+        const tail = entries.slice(from)
+        const withoutEcho = tail.filter((line) => !isAssistantTranscriptEntry(line))
+        const tailText = (withoutEcho.length > 0 ? withoutEcho : tail).join('\n\n')
+        if (usable(tailText)) return tailText
+      }
+      const noEcho = entries.filter((line) => !isAssistantTranscriptEntry(line)).join('\n\n')
+      if (usable(noEcho)) return noEcho
+      if (typeof input.transcript === 'string' && usable(input.transcript)) return input.transcript
+    }
+    return full
   }
 
   if (!input.reused) return detach('new-session')
@@ -347,8 +393,11 @@ export function decideFeed(input: FeedInput): FeedDecision {
   if (chain.head !== head) return replay('head-changed')
   // ⚠️ 这里曾经是 `isStrictPrefix`。它会被**每条**被改写的运行时注入打穿（DSH 每轮都改），
   // 于是链式投喂在真机上"每轮都重开"—— 见 canExtendChain 的注释。
-  // 头这一行已经确认两者相同 ⇒ 下面这条只可能是"历史没按预期追加"，可以省掉固定头。
-  if (!canExtendChain(chain.entries, entries)) return replay('not-appended', true)
+  // 头这一行已经确认两者相同 ⇒ 下面这条只可能是"历史没按预期追加"。
+  // 既然链还在，就只发**从分歧点起**那些服务端没见过的条目（见 replayPrompt 的说明）。
+  if (!canExtendChain(chain.entries, entries)) {
+    return replay('not-appended', { headUnchanged: true, from: firstDifference(chain.entries, entries) })
+  }
 
   // 🔴 剔除「模型回声」（0.6.17）：增量里 `Assistant: …` 那些条目是**服务端上一轮的输出**，
   // 它已经在链上了（就在我们要挂的父消息位置）。再当输入发一遍既白烧 token，

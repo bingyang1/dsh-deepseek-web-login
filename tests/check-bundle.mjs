@@ -1070,13 +1070,20 @@ const checks = {
   // ── 0.6.32：重发时不重发固定头 ────────────────────────────────────────────
   // 固定头（system + 协议指令 + 工具目录）实测约 6.35 万字符；链还在时它在会话首条消息里
   // 已经给过了，重发纯属重复 —— 用户在网页端看到的"同一大段又出现一次"就是它。
-  'host 的 replay 在头没变时只发历史（省掉约 6.35 万字符的固定头）':
-    /const replay = \(reason, headUnchanged = false\)[\s\S]{0,140}?headUnchanged && typeof input\.transcript === "string" \? input\.transcript : full/.test(
-      host,
-    ),
-  'host 只对 head-changed 重发头；not-appended 走省头路径':
+  'host 的重发按"代价从小到大"挑档，全都不行才发整份 full':
+    /const replayPrompt = \(\{ headUnchanged = false, from \}\) => \{/.test(host) &&
+    /if \(headUnchanged\) \{/.test(host) &&
+    /if \(usable\(tailText\)\) return tailText;/.test(host) &&
+    /if \(typeof input\.transcript === "string" && usable\(input\.transcript\)\) return input\.transcript;/.test(host) &&
+    /return full;/.test(host),
+  'host 只对 head-changed 重发头；not-appended 走"从分歧点起"的路子':
     /if \(chain\.head !== head\) return replay\("head-changed"\)/.test(host) &&
-    /return replay\("not-appended", true\)/.test(host),
+    /return replay\("not-appended", \{[\s\S]{0,120}?from: firstDifference/.test(host),
+  'host 的重发按"代价从小到大"挑，且先剔掉模型回声':
+    /const withoutEcho = tail\.filter\(\(line\) => !isAssistantTranscriptEntry\(line\)\)/.test(host) &&
+    /const noEcho = entries\.filter\(\(line\) => !isAssistantTranscriptEntry\(line\)\)/.test(host),
+  'host 落盘 firstDiff（"是哪一条变了"的唯一答案）':
+    /firstDiff:[\s\S]{0,120}?firstDifference\(chainEntries, currentEntries\)/.test(host),
   'host 的 promptParts 带上了 transcript（漏传会静默退回旧行为）':
     /transcript: promptParts\.transcript/.test(host),
 }

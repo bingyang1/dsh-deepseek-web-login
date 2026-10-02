@@ -32,7 +32,7 @@ import {
   type CleanupRange,
 } from './gate.ts'
 // 上下文投喂方式（全量 / 链式增量）——决策是纯函数，见 context-feed.ts 的模块注释。
-import { currentContextMode, decideFeed, effectiveReuseLimit, needsFreshSession, type ChainState, type FeedDecision, type FeedReason } from './context-feed.ts'
+import { currentContextMode, decideFeed, effectiveReuseLimit, firstDifference, needsFreshSession, type ChainState, type FeedDecision, type FeedReason } from './context-feed.ts'
 
 export const DS_BASE = 'https://chat.deepseek.com'
 
@@ -2150,6 +2150,15 @@ export interface FeedDecisionNote {
   promptChars: number
   /** 固定头（system + 协议指令 + 工具目录）的字符数；没有结构化 prompt 时 null。 */
   headChars: number | null
+  /**
+   * 🔴 **本轮和链从第几个条目开始不一样**（链不在或没传结构化 prompt 时为 null）。
+   *
+   * 为什么必须有（2026-10-02 第三次排查仍然卡在这）：`tailSame=false` 只说"链尾变了"，
+   * 不说**是哪一条、从哪儿变的**。于是"为什么这一轮又断链"只能靠猜 ——
+   * 而断链的代价是重发（实测过一次：5 个字的输入发出去 40193 字符）。
+   * 有了它，一眼能看出是"DSH 原地改写的那条运行时注入（比如下标 3）"还是"尾部被改了"。
+   */
+  firstDiff: number | null
 }
 
 /**
@@ -2567,6 +2576,8 @@ async function openCompletion(
         // 体量：唯一权威来源（未截断的实际发送串）
         promptChars: feed.prompt.length,
         headChars: params.promptParts ? String(params.promptParts.head ?? '').length : null,
+        firstDiff:
+          !chainEntries || !currentEntries ? null : firstDifference(chainEntries, currentEntries),
         tailSame:
           !chainEntries || !currentEntries
             ? null
