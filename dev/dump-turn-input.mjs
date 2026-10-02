@@ -105,7 +105,16 @@ function renderAsEntry(message) {
 let lastTurn, lastStep
 for (const event of events) {
   const { type, data, time } = event
-  if (type === 'user/message') {
+  if (type === 'tool/result' || type === 'tool/call') {
+    // 🔴 2026-10-02：这里原先**没有这个分支**，于是"工具返回"在整个 dump 里看不见 ——
+    // 我据此得出"DSH 的消息列表里根本没有工具返回"的**错误结论**，白绕了一圈。
+    // 真机上工具返回就是这个事件：`message.role = "tool"`，带 `toolCallId` 与 `content`。
+    const msg = data?.message ?? data
+    const blocks = (msg?.content ?? []).map((b) => b?.type).filter(Boolean)
+    console.log(`\n[${clock(time)}] ${type}  role=${msg?.role ?? '?'} 类型块=${JSON.stringify(blocks)}`)
+    console.log(`    toolCallId=${msg?.toolCallId ?? '(无)'} isError=${msg?.isError ?? false}`)
+    console.log(`    → 内容(前160): ${JSON.stringify(String(renderAsEntry(msg)).slice(0, 160))}`)
+  } else if (type === 'user/message') {
     const msg = data?.message ?? data
     const role = msg?.role ?? 'user'
     const rendered = renderAsEntry({ role, content: msg?.content ?? data?.content })

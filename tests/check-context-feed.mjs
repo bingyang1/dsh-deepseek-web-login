@@ -556,7 +556,103 @@ const withCallThenText = (resultText) => ({
   maxChars: 100_000,
 })
 
-test('★ 工具调用之后紧跟的 user 文本 ⇒ 标成 [Tool Result]，不许渲染成用户说的话', () => {
+// ── ★★ 主路径：DSH 的工具返回是 `role: 'tool'`（不是 user + tool-result 块）────────
+// 形状取自真机会话日志的 `tool/result` 事件（session-2986baba，turn 3）：
+//   {"role":"tool","toolCallId":"call_c2cf288c12734112b11e",
+//    "content":[{"type":"text","text":"2026-10-02 18:54:28 星期五\r\n"}],"isError":false}
+// 原先**没有这个分支** ⇒ 它掉进 user 分支 ⇒ 渲染成 `User: 2026-10-02 18:54:28 星期五`
+// ⇒ 模型以为"用户告诉了我时间"（实测思考原话：「我没拿到工具结果，用户直接给了时间」）。
+const REAL_TOOL_RESULT = {
+  role: 'tool',
+  source: { kind: 'tool', callId: 'call_c2cf288c12734112b11e' },
+  toolCallId: 'call_c2cf288c12734112b11e',
+  content: [{ type: 'text', text: '2026-10-02 18:54:28 星期五\r\n' }],
+  isError: false,
+}
+
+test('★★ role:"tool" ⇒ 标成 [Tool Result for toolCallId]，不许掉进 user 分支', () => {
+  // ⚠️ assistant 那侧的 id 与本条 `toolCallId` **故意不同**：
+  //    两条路（主分支用消息自带的 `toolCallId`、次防线用 assistant 的调用 id）产出的文本才可区分。
+  //    第一版我把两边写成同一个 id ⇒ 关掉主分支时次防线照样给出同样结果、测试**仍然全绿**
+  //    —— 典型的"两个来源同一个值就测不出真伪"（今天已经踩过一次）。
+  const parts = serializePromptParts({
+    system: 'SYS',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: '你知道现在几点嘛' }] },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'call_FROM_ASSISTANT', toolName: 'pwsh', arguments: '{}' }],
+      },
+      REAL_TOOL_RESULT,
+      { role: 'assistant', content: [{ type: 'text', text: '收到，…' }] },
+    ],
+    tools: [{ name: 'pwsh', description: 'x', parameters: { type: 'object', properties: {} } }],
+    maxChars: 100_000,
+  })
+  assert.match(
+    parts.transcript,
+    /\[Tool Result for call_c2cf288c12734112b11e\]\n2026-10-02 18:54:28 星期五/,
+    '★ 必须用 `role:"tool"` 消息自带的 toolCallId（走主分支）；用 assistant 侧的 id 说明是次防线在兜',
+  )
+  assert.doesNotMatch(parts.transcript, /call_FROM_ASSISTANT/, '不该出现 assistant 侧的 id')
+  assert.doesNotMatch(
+    parts.transcript,
+    /User: 2026-10-02 18:54:28 星期五/,
+    '★ 掉进 user 分支就会让模型以为这是用户说的 —— 这就是"收到，…"的来源',
+  )
+  assert.match(parts.transcript, /User: 你知道现在几点嘛/, '正向对照：真正的用户发言仍是 User')
+})
+
+test('role:"tool" 带 isError ⇒ 标 [ERROR]', () => {
+  const parts = serializePromptParts({
+    system: 'SYS',
+    messages: [{ ...REAL_TOOL_RESULT, isError: true }],
+    tools: [{ name: 'pwsh', description: 'x', parameters: { type: 'object', properties: {} } }],
+    maxChars: 100_000,
+  })
+  assert.match(parts.transcript, /\[Tool Result \[ERROR\] for call_c2cf288c12734112b11e\]/)
+})
+
+test('★ role:"tool" 之后的**真正用户消息**仍必须是 User（主/次防线都不许误标）', () => {
+  const parts = serializePromptParts({
+    system: 'SYS',
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'call_FROM_ASSISTANT', toolName: 'pwsh', arguments: '{}' }],
+      },
+      REAL_TOOL_RESULT,
+      { role: 'user', content: [{ type: 'text', text: '再查一次' }] },
+    ],
+    tools: [{ name: 'pwsh', description: 'x', parameters: { type: 'object', properties: {} } }],
+    maxChars: 100_000,
+  })
+  assert.match(parts.transcript, /User: 再查一次/, '工具返回已经把"预期"清掉了 ⇒ 这句是用户说的')
+  assert.match(
+    parts.transcript,
+    /\[Tool Result for call_c2cf288c12734112b11e\]/,
+    '工具返回走的是主分支（用消息自带的 id）',
+  )
+  assert.equal(
+    (parts.transcript.match(/\[Tool Result/g) || []).length,
+    1,
+    '只该有一条工具返回，不许把用户消息也算进去',
+  )
+})
+
+test('role:"tool" 没有 toolCallId 时也要标（至少别让它看起来像用户发言）', () => {
+  const parts = serializePromptParts({
+    system: 'SYS',
+    messages: [
+      { role: 'tool', content: [{ type: 'text', text: '输出' }] },
+    ],
+    tools: [{ name: 'pwsh', description: 'x', parameters: { type: 'object', properties: {} } }],
+    maxChars: 100_000,
+  })
+  assert.match(parts.transcript, /\[Tool Result for \]\n输出/)
+  assert.doesNotMatch(parts.transcript, /User: 输出/)
+})
+test('★ 次要防线：工具返回若被折进普通 user 文本 ⇒ 也要标成 [Tool Result]', () => {
   const parts = serializePromptParts(withCallThenText('2026-10-02 18:54:28 星期五'))
   assert.match(parts.transcript, /\[Tool Result for tc-1\]\n2026-10-02 18:54:28 星期五/, '必须标成工具返回并带上 id')
   assert.doesNotMatch(
