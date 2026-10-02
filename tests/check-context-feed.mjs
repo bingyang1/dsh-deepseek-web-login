@@ -595,5 +595,18 @@ test('★ 放弃删除时要把欠账销掉（否则下次启动补扫又会删�
   }
 })
 
+test('★ 诊断留痕的路径必须跟着 DSH_HOME 走（否则跑批会污染用户的真实日志）', async () => {
+  const { feedDecisionLogPath } = await import('../src/webapi.ts')
+  const path = feedDecisionLogPath()
+  assert.ok(
+    path.startsWith(HOME),
+    `留痕路径没落在被测的临时目录里 ⇒ 会写进用户真实数据。实际：${path}`,
+  )
+  assert.ok(
+    path.includes('web-login'),
+    `留痕必须落在 web-login/ 下（与账号库、gate.json 同处）。实际：${path}`,
+  )
+})
+
 console.log(failed === 0 ? `\n通过 ${passed} 项，全部通过 ✅` : `\n通过 ${passed} 项，失败 ${failed} 项 ❌`)
 if (failed > 0) process.exitCode = 1

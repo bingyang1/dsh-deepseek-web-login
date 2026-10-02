@@ -25,7 +25,7 @@ import {
   uploadImageFile,
   type SessionCleaner,
 } from './webapi.ts'
-import { CONTINUE_INSTRUCTION, TOOL_CALL_RETRY_INSTRUCTION, collectImageRefs, imageUploadName, looksLikeUnexecutedToolProgram, serializePromptParts, stripSystemMarkers, SystemMarkerStreamFilter, BoilerplateFilter, drainTextPipeline, ToolCallStreamFilter, TranscriptEchoGuard, type ToolSchemaLike } from './protocol.ts'
+import { CONTINUE_INSTRUCTION, TOOL_CALL_RETRY_INSTRUCTION, collectImageRefs, imageUploadName, looksLikeUnexecutedToolProgram, serializePromptParts, stripSystemMarkers, SystemMarkerStreamFilter, BoilerplateFilter, drainTextPipeline, ToolCallStreamFilter, ReasoningSanitizer, TranscriptEchoGuard, type ToolSchemaLike } from './protocol.ts'
 
 /**
  * 把「被丢弃的完整载荷」落盘，专供事后定位。
@@ -1204,6 +1204,9 @@ export function createAdapter(deps: AdapterDeps) {
     // 自动续写的每一轮用全新的过滤器/守卫实例（上一轮的状态在轮次收尾时已吐净），
     // 否则跨请求的行缓冲会让续写内容与 hold 的尾部乱序。
     let filter = new ToolCallStreamFilter(knownNames)
+    // 思考通道净化器（0.6.28）：此前思考是**原样直通**的，标记既上网页端、又进历史
+    // ⇒ 下一轮被当增量重发 ⇒ 变成网页端可见的正文垃圾。见 ReasoningSanitizer 的说明。
+    let reasoningSanitizer = new ReasoningSanitizer()
     // 第二道网：模型会模仿 prompt 里的转写格式（`[Tool Result for …]` / `User:` / `Assistant:`…），
     // 把「对话转写」当回答吐出来。这与工具调用标记泄漏是两个独立来源，必须分开防。
     let echoGuard = new TranscriptEchoGuard()
@@ -1345,13 +1348,17 @@ export function createAdapter(deps: AdapterDeps) {
       })) {
         if (event.kind === 'thinking' || event.kind === 'text') roundUsage.outputChars += event.text.length
         if (event.kind === 'thinking') {
+          // 🔴 0.6.28 之前这里是 `block.text += event.text` 直接透出 —— 思考通道**一道网都没有**。
+          // 见 protocol.ts 的 ReasoningSanitizer：只净化和丢弃标记，不提取调用、不报拒绝。
+          const clean = reasoningSanitizer.push(event.text)
+          if (!clean) continue
           const block = openReasoning()
           if (!reasoningStarted) {
             reasoningStarted = true
             yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
           }
-          block.text += event.text
-          yield { type: 'reasoning-delta', index: block.index, text: event.text }
+          block.text += clean
+          yield { type: 'reasoning-delta', index: block.index, text: clean }
           continue
         }
         if (event.kind === 'text') {
@@ -1435,6 +1442,18 @@ export function createAdapter(deps: AdapterDeps) {
         // 那一层，而免责声明恰好 23 字 —— 实测整段从尾巴漏出去（会话 6c0dbc47：它是一个只有单个
         // delta 的独立 text 块，跟在工具调用后面）。所以轮末统一走 drainTextPipeline：
         // 反序吐净 + 对残余做一次性剥声明 / 剥伪系统标记。
+        // 思考通道收尾：吐出净化器扣住的尾巴（跨包半截标记的 hold-back）。
+        // ⚠️ 漏了这一步，被扣住的思考尾巴会**静默消失** —— 用户看到思考区莫名少一截。
+        const reasoningTail = reasoningSanitizer.flush()
+        if (reasoningTail) {
+          const block = openReasoning()
+          if (!reasoningStarted) {
+            reasoningStarted = true
+            yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+          }
+          block.text += reasoningTail
+          yield { type: 'reasoning-delta', index: block.index, text: reasoningTail }
+        }
         const drained = drainTextPipeline(filter, boilerplate, echoGuard, false)
         if (drained.echoed) echoedTranscript = true
         if (drained.disclaimers > 0) disclaimerStripped = true
@@ -1560,6 +1579,7 @@ export function createAdapter(deps: AdapterDeps) {
         currentPrompt = promptParts.full
         // 上一轮的过滤器/守卫状态已在上面收尾时吐净；续写用全新实例
         filter = new ToolCallStreamFilter(knownNames)
+        reasoningSanitizer = new ReasoningSanitizer()
         echoGuard = new TranscriptEchoGuard()
         systemMarkerFilter = new SystemMarkerStreamFilter()
         boilerplate = new BoilerplateFilter()

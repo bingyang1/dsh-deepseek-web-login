@@ -1729,6 +1729,59 @@ export class ToolCallStreamFilter {
   }
 }
 
+// ── 思考通道净化器 ────────────────────────────────────────
+
+/**
+ * 思考通道净化器（0.6.28）。
+ *
+ * ## 为什么需要它
+ *
+ * 正文通道有四道网（工具调用捕获、`stripStrayToolMarkup`、伪系统标记、
+ * 免责声明、回声守卫），而思考通道此前是**原样直通**的 —— `adapter.ts` 里
+ * `if (event.kind === 'thinking') { … ; continue }` 一句 `continue` 跳过了全部过滤。
+ *
+ * 后果是双份的，而且第二份更严重：
+ *  1. 标记原样显示在**网页端的思考区**（用户 2026-10-02：「我从没见过 cuckoo 有 DSML」）；
+ *  2. 它进了 **DSH 的历史** ⇒ 下一轮被我们当增量**重发** ⇒ 网页端看到的就是正文里的垃圾，
+ *     并且这团垃圾会**一直留在转写里**，每轮重复（这才是真正让对话看起来不像人的地方）。
+ *
+ * ## 与 `ToolCallStreamFilter` 的关键差别
+ *
+ * 复用它的**捕获**逻辑（跨包、配平、宽容抢救都是久经考验的），但三处不同：
+ *  - **不提取调用**：`out.calls` 直接丢掉。思考里出现调用标记时模型还在推理、
+ *    并没有决定要调 —— 从思考里执行工具是语义错误。
+ *  - **不报拒绝**：不设 `rejected`。思考里有杂音是常态，报拒绝会触发整步重试，
+ *    把一次本来正常的续写打断（正文通道必须报，因为丢掉的是真调用）。
+ *  - **剥离后照常透出**：只把标记本身抹掉，思考的其余部分一个字都不许少。
+ */
+export class ReasoningSanitizer {
+  private readonly filter = new ToolCallStreamFilter()
+  private didStrip = false
+
+  /** 喂一段思考增量，返回**可以上屏**的部分（可能为空串）。 */
+  push(text: string): string {
+    const out = this.filter.push(text)
+    if (out.calls.length > 0) this.didStrip = true
+    const body = stripStrayToolMarkup(out.text)
+    if (body !== out.text) this.didStrip = true
+    return body
+  }
+
+  /** 流结束：把扣住没吐的尾巴交出来。 */
+  flush(): string {
+    const out = this.filter.flush()
+    if (out.calls.length > 0 || out.rejected) this.didStrip = true
+    const body = stripStrayToolMarkup(out.text)
+    if (body !== out.text) this.didStrip = true
+    return body
+  }
+
+  /** 是否剥掉过东西（供日志与用例判定，不影响输出）。 */
+  get stripped(): boolean {
+    return this.didStrip
+  }
+}
+
 // ── 转写回声守卫 ──────────────────────────────────────────
 
 /**

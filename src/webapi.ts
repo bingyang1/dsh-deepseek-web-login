@@ -20,8 +20,8 @@
  *     {"p":"response/status","v":"FINISHED"}    状态
  */
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { resolveDshHome, webLoginDir } from './paths.ts'
 import type { WebAuth } from './auth.ts'
 import { AdapterLlmError, describeError, httpErrorCode, parseRetryAfterMs } from './auth.ts'
 // 默认区间来自 gate.ts —— 设置页的滑块边界与这里的默认值必须是**同一份**，否则界面显示的和实际跑的不是一回事。
@@ -1461,7 +1461,9 @@ const THINKING_WRAPPER_RE = /<\s*\/?\s*(analysis|summary|thinking|scratchpad|tho
 function dumpSinkPath(): string | null {
   if (process.env.DSH_WEB_LOGIN_DUMP_SSE !== '1') return null
   try {
-    const dir = join(homedir(), '.dsh', 'deepseek-web', 'frames')
+    // ⚠️ 走 resolveDshHome()，别自己拼 `~/.dsh` —— 否则 DSH_HOME 换过环境时
+    // 这份取证会写到别处（同一类问题刚在 feedDecisionLogPath 上踩过）。
+    const dir = join(resolveDshHome(), 'deepseek-web', 'frames')
     mkdirSync(dir, { recursive: true })
     const stamp = new Date().toISOString().replace(/[:.]/g, '-')
     return join(dir, `${stamp}-${Math.random().toString(36).slice(2, 8)}.sse`)
@@ -2045,9 +2047,15 @@ function dropSentRefIds(sessionId: string): void {
  */
 let lastFeedReason: FeedReason | undefined
 
-/** 投喂决策留痕的路径（与 gate.json 同目录）。 */
+/**
+ * 投喂决策留痕的路径（与 gate.json 同目录）。
+ * ⚠️ 必须走 `webLoginDir()` —— 曾经这里自己拼了一遍 `DSH_HOME || ~/.dsh`，
+ * 于是"测试隔离"只对走 webLoginDir 的模块生效，这一条照旧写进用户的真实目录
+ * （2026-10-02：一次 `npm run test` 往用户的 `feed-decisions.jsonl` 灌了 695 条测试噪声，
+ * 手工过滤才看得清真实数据）。路径只能有一个来源。
+ */
 export function feedDecisionLogPath(): string {
-  return join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'web-login', 'feed-decisions.jsonl')
+  return join(webLoginDir(), 'feed-decisions.jsonl')
 }
 
 /** 留痕保留多少条（环形）。 */

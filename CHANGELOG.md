@@ -2,6 +2,38 @@
 
 本项目大致遵循语义化版本；日期为本地时间。
 
+## 0.6.28 — 2026-10-02
+
+**修复：思考通道的垃圾（DSML 等工具调用标记）会显示在网页端、并且一直留在转写里。**
+
+起因是用户拿另一个项目（cuckoo-code）对照，说"用它从来没在网页端见过 DSML，一个项目就是一个会话"。
+读数之后确认真凶不在会话管理（0.6.22~0.6.26 已经修好，实机 `feed-decisions.jsonl` 里连续 6 轮
+`chained / tailSame=true` 为证），而在**思考通道**：
+
+- **思考通道此前一道网都没有**。正文通道有四道网（工具调用捕获 / 残片剥离 / 伪系统标记 /
+  免责声明 / 回声守卫），而 `adapter.ts` 里思考分支一句 `continue` 把网全跳过了。
+  模型在思考里起草工具调用（JSON 或 XML/DSML）或伪造 `<ds_system>` 块时，标记会：
+  ① 原样显示在网页端的思考区；② 进 DSH 历史 ⇒ 下一轮被当增量**重发** ⇒
+  变成网页端可见的正文垃圾，并且**一直留着**，每轮重复。
+- **新增 `ReasoningSanitizer`**（protocol.ts）：复用 `ToolCallStreamFilter` 那套久经考验的捕获逻辑，
+  但**不提取调用、不报拒绝** —— 思考里出现标记时模型还在推理，执行它是语义错误；报拒绝则会
+  把一次本来正常的续写打断。只把标记本身抹掉，思考的其余部分一个字都不许少。
+  轮末必须 `flush()`，否则被跨包 hold 住的尾巴会静默少一截。
+
+**顺带修一个把诊断数据搞脏的缺陷：**
+
+- 跑一次 `npm run test` 会往**用户真实的** `~/.dsh/web-login/feed-decisions.jsonl` 灌 695 条
+  测试噪声（`sess-1..7`、同一毫秒）。诊断数据被污染比没有数据更糟 —— 排查真实问题前得先手工
+  滤掉噪声。两层都漏：① 4 个用例（fetch-injection / session-lifecycle / session-reuse /
+  session-journal）没设 `DSH_HOME`；② 跑批脚本 `test-offline.mjs` 没有兜底。
+  现在跑批给每个子进程注入临时 `DSH_HOME`，另加 `check-test-isolation.mjs` 守"会写状态的用例
+  必须自己隔离"，新用例自动纳入。
+- `feedDecisionLogPath()` 改为走 `webLoginDir()`（原先自己拼了一遍 `DSH_HOME || ~/.dsh`，
+  是路径的第二份来源）；`dumpSinkPath()` 同理改走 `resolveDshHome()`。
+
+**新增：** `dev/scan-dsml.mjs`（扫会话日志里有没有工具调用标记，含多帧 zstd 解压）、
+`dev/scan-session-images.mjs`、`dev/dump-image-messages.mjs`、`dev/trace-session-images.mjs`。
+
 ## 0.6.27 — 2026-10-02
 
 **修复：早先发过的图片被反复重挂在后面的每条消息上（"我这轮没发图，网页端却又有图"）。**

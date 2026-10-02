@@ -1004,6 +1004,24 @@ const checks = {
     /const sentRefIds = sentRefIdsBySession\.get\(sessionId\)/.test(host) &&
     /sentRefIdsBySession\.set\(sessionId, sentRefIds\)/.test(host) &&
     !/\blet sentRefIdsSession\b/.test(host),
+
+  // ── 0.6.28：思考通道净化 ───────────────────────────────────────────────────
+  // 思考此前是**原样直通**的（正文四道网一道都不走）。标记既上网页端、又进历史 ⇒
+  // 下一轮被当增量重发 ⇒ 变成网页端可见的正文垃圾（用户现场 2026-10-02）。
+  // 断言钉的是"上屏的必须是净化后的文本"：把 `clean` 换回 `event.text` 就该红。
+  'host 的思考增量用净化后的文本上屏（不是原始 event.text）':
+    /const clean = reasoningSanitizer\.push\(event\.text\)/.test(host) &&
+    /block\.text \+= clean;[\s\S]{0,160}?text: clean\b/.test(host) &&
+    !/block\.text \+= event\.text;[\s\S]{0,160}?text: event\.text\b/.test(host),
+  'host 在轮末吐出思考净化器扣住的尾巴（漏了会让思考静默少一截）':
+    /const reasoningTail = reasoningSanitizer\.flush\(\)/.test(host) &&
+    /reasoningTail\) \{[\s\S]{0,400}?block\.text \+= reasoningTail;/.test(host),
+
+  // ── 0.6.28：诊断数据不许被测试污染 ─────────────────────────────────────────
+  // 路径必须单一来源（走 webLoginDir）—— 自己拼 `~/.dsh` 的那版让"测试隔离"形同虚设。
+  'host 的投喂留痕路径走 webLoginDir（单一来源，认 DSH_HOME）':
+    /function feedDecisionLogPath\(\) \{[\s\S]{0,120}?join\(webLoginDir\(\), "feed-decisions\.jsonl"\)/.test(host) &&
+    !/homedir\(\), "\.dsh", "web-login"/.test(host),
 }
 
 let failed = 0

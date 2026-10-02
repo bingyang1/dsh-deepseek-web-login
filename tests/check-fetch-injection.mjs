@@ -18,7 +18,13 @@
  * 用法: node tests/check-fetch-injection.mjs
  */
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fetchImplKind, setFetchImpl, streamWebCompletion } from '../src/webapi.ts'
+
+// 隔离：不设的话投喂留痕会写进用户真实的 ~/.dsh/web-login/（见 test-offline.mjs 的说明）
+process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-fetch-injection-'))
 
 let passed = 0
 const failures = []

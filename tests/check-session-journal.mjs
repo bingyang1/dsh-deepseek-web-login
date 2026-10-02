@@ -13,7 +13,7 @@
  * 用法: node tests/check-session-journal.mjs
  */
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -26,6 +26,9 @@ import {
   writeJournal,
 } from '../src/session-journal.ts'
 import { createSessionCleaner, disposeSessionReuse, resetSessionReuse, setSessionLifecycleHook, streamWebCompletion } from '../src/webapi.ts'
+
+// 隔离：不设的话投喂留痕会写进用户真实的 ~/.dsh/web-login/（见 test-offline.mjs 的说明）
+process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-session-journal-'))
 
 let passed = 0
 const failures = []

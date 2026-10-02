@@ -12,6 +12,12 @@
  * 本文件用假 transport + 假 fetch 覆盖这些行为（不打真实请求）。
  */
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+// 隔离：不设的话留痕会写进用户真实的 ~/.dsh/web-login/（见 test-offline.mjs 的说明）
+process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-session-reuse-'))
 
 const {
   streamWebCompletion,

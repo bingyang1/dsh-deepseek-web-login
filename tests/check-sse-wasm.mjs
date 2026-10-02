@@ -6,8 +6,14 @@
  * F12  PoW WASM 地址白名单：auth.wasmUrl 可来自导入的备份，须挡住 SSRF。
  */
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { checkedWasmUrl } from '../src/webapi.ts'
 import { parseWebSse } from '../src/webapi.ts'
+
+// 隔离：不设的话投喂留痕会写进用户真实的 ~/.dsh/web-login/（见 test-offline.mjs 的说明）
+process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-sse-wasm-'))
 
 let passed = 0
 const failures = []
