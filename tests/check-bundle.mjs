@@ -954,9 +954,12 @@ const checks = {
     })(),
   'host 的重发全量仍挂在链尾（parent 为 null 只可能是"这个会话的第一条"）':
     (() => {
-      const i = host.indexOf('const replay = (reason)')
+      // ⚠️ 别绑签名/形态：0.6.32 把 `replay` 从"箭头 + 对象字面量"改成了块体（要按头变没变选 prompt），
+      // 旧断言写死 `const replay = (reason)` + 120 字窗口，于是**这次无害改动**把它打红了。
+      // 守的是意图：replay 的 parent 必须是链尾，不是 null。
+      const i = host.indexOf('const replay = (reason')
       if (i < 0) return false
-      const body = host.slice(i, i + 120)
+      const body = host.slice(i, i + 400)
       return /parentMessageId: chain\.parentId/.test(body) && !/parentMessageId: null/.test(body)
     })(),
   'host 的投喂回执按 reason 判"是不是发了纯增量"（别拿 parent 判，那会说谎）':
@@ -1063,6 +1066,19 @@ const checks = {
   'host 的丢弃通道仍受 deleteWebSessions 总闸约束（"一个都不许删"的语义不能破）':
     /onDiscardSession: deps\.config\.deleteWebSessions === false \? void 0 : /.test(host) &&
     /deps\.sessionCleaner\.discard\(auth, sessionId\)/.test(host),
+
+  // ── 0.6.32：重发时不重发固定头 ────────────────────────────────────────────
+  // 固定头（system + 协议指令 + 工具目录）实测约 6.35 万字符；链还在时它在会话首条消息里
+  // 已经给过了，重发纯属重复 —— 用户在网页端看到的"同一大段又出现一次"就是它。
+  'host 的 replay 在头没变时只发历史（省掉约 6.35 万字符的固定头）':
+    /const replay = \(reason, headUnchanged = false\)[\s\S]{0,140}?headUnchanged && typeof input\.transcript === "string" \? input\.transcript : full/.test(
+      host,
+    ),
+  'host 只对 head-changed 重发头；not-appended 走省头路径':
+    /if \(chain\.head !== head\) return replay\("head-changed"\)/.test(host) &&
+    /return replay\("not-appended", true\)/.test(host),
+  'host 的 promptParts 带上了 transcript（漏传会静默退回旧行为）':
+    /transcript: promptParts\.transcript/.test(host),
 }
 
 let failed = 0

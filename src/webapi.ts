@@ -2139,6 +2139,17 @@ export interface FeedDecisionNote {
    * `null` 说明这一轮压根没传结构化 prompt。
    */
   tailSame: boolean | null
+  /**
+   * 这一轮**实际发出去的**字符数（`feed.prompt.length`）。
+   *
+   * 🔴 为什么必须记（2026-10-02 用户报"每次调用工具就重发一大段"被发现查不了）：
+   * 上面那几个字段只回答"**为什么**走了全量"，回答不了"**发了多大**"。
+   * 而"发了多大"才是"是不是在烧额度 / 像不像脚本"的直接证据 ——
+   * 没有它就只能靠读分享页去**估**，估出来的数字不能用来说服任何人（包括自己）。
+   */
+  promptChars: number
+  /** 固定头（system + 协议指令 + 工具目录）的字符数；没有结构化 prompt 时 null。 */
+  headChars: number | null
 }
 
 /**
@@ -2372,7 +2383,7 @@ export interface CompletionParams {
    * 不传 = 算不出"新增了哪几条"，只能走全量 —— 适配器两条序列化路径都要传，
    * 漏传会让链式模式静默退化成全量（靠 tests/check-bundle.mjs 的产物断言守）。
    */
-  promptParts?: { head: string; entries: readonly string[]; maxChars?: number }
+  promptParts?: { head: string; entries: readonly string[]; transcript?: string; maxChars?: number }
   /**
    * 链式投喂的决策回执（0.1.63）。**只在决策原因变化时**回调一次，
    * 用来回答"这一轮到底发了增量，还是退回全量、因为哪条判据"——
@@ -2508,6 +2519,8 @@ async function openCompletion(
           ? {
               head: params.promptParts.head,
               entries: params.promptParts.entries,
+              // 重发时省掉固定头（约 6.35 万字符）—— 见 FeedInput.transcript
+              ...(typeof params.promptParts.transcript === 'string' ? { transcript: params.promptParts.transcript } : {}),
               ...(params.promptParts.maxChars !== undefined ? { maxChars: params.promptParts.maxChars } : {}),
             }
           : {}),
@@ -2551,6 +2564,9 @@ async function openCompletion(
         account: accountKey(auth),
         chainLen: chainEntries ? chainEntries.length : null,
         entriesLen: currentEntries ? currentEntries.length : null,
+        // 体量：唯一权威来源（未截断的实际发送串）
+        promptChars: feed.prompt.length,
+        headChars: params.promptParts ? String(params.promptParts.head ?? '').length : null,
         tailSame:
           !chainEntries || !currentEntries
             ? null

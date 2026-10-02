@@ -33,6 +33,20 @@ const files = pickOfflineTests(testsDir)
  */
 const SANDBOX_HOME = mkdtempSync(join(tmpdir(), 'dsh-web-login-tests-'))
 
+/**
+ * 需要更长上限的用例 —— **按文件名给**，不要全局放宽。
+ *
+ * `check-browser-transport` 会**真启一个浏览器**来验"浏览器代理能否发 POST / 上传 FormData"，
+ * 而且每个用例各起一次。实测本机 **4 分 29 秒**（还只是"用户同时开着 DSH + Edge"的普通状态），
+ * 远超 180s 的通用上限 ⇒ 跑批每轮都把它报成 FAIL，而它其实**是通过的**。
+ *
+ * ⚠️ 这类"红"比没有用例更糟：它会训练人忽略 FAIL。所以宁可给这一个文件放宽，也不改通用上限
+ * （通用上限的语义是"超过就说明有东西挂住了"，放宽就失去意义）。
+ * ⚠️ 真正的修法是让它**复用同一个浏览器会话**（5 个用例只起一次），那才是把它压回几十秒；
+ * 在那之前先让跑批说实话。
+ */
+const SLOW_FILES = { 'check-browser-transport.mjs': 600_000 }
+
 const failed = []
 for (const file of files) {
   console.log(`\n=== ${file} ===`)
@@ -40,8 +54,8 @@ for (const file of files) {
     cwd: ROOT,
     stdio: 'inherit',
     env: { ...process.env, DSH_HOME: SANDBOX_HOME },
-    // 单个文件的上限：超过说明有东西挂住了（而不是"慢"）
-    timeout: 180_000,
+    // 单个文件的上限：超过说明有东西挂住了（而不是"慢"）。慢的用例见 SLOW_FILES。
+    timeout: SLOW_FILES[file] ?? 180_000,
   })
   if (result.error || result.status !== 0) {
     failed.push(file)

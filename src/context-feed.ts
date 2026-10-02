@@ -79,6 +79,14 @@ export interface FeedInput {
   head?: string
   entries?: readonly string[]
   full: string
+  /**
+   * `full` 里**属于历史的那一段**（不含固定头）。见 `protocol.ts` 的 `PromptParts.transcript`。
+   *
+   * 用途只有一个：链还在、头也没变时的"退回全量重发"**不必重发固定头**（它已经在会话首条
+   * 消息里给过了），只发这一段即可 —— 省下的就是那约 6.35 万字符。
+   * 没传时退回旧行为（重发整份 `full`），所以这是一个**纯优化**、不改变正确性前提。
+   */
+  transcript?: string
   /** 本轮用的网页端会话，以及它是不是复用来的。 */
   sessionId: string
   accountKey: string
@@ -311,13 +319,23 @@ export function decideFeed(input: FeedInput): FeedDecision {
    * （「修改 / 重新生成」+ `n / n` 翻页），用户看到的就是"聊着聊着分叉了"。
    * 挂在链尾的代价只是服务端上下文里多一段重复历史（多花一点 token），
    * 而分叉是**结构性**的坏：它会永久破坏"一个窗口一条对话线"这个形态。
+   *
+   * 🔴 2026-10-02 补：**头没变时不再重发固定头**。
+   * 走到这里说明链还在（同一个网页端会话、同一个账号）⇒ 那条会话的**首条消息**里
+   * 已经把固定头给过了，重发它是纯粹的重复。而它就是"重发一大段"里的**那一大段**
+   * （system + 协议指令 + 工具目录，实测约 **6.35 万字符**）。
+   * 用户在网页端看到的现象（同一段 Tool Calling Protocol 出现两次）就是它。
+   * ⚠️ 只有 `head-changed` 必须重发头（新头没给过），所以那条路径**不**走这个优化。
    */
-  const replay = (reason: FeedReason): FeedDecision => ({
-    prompt: full,
-    parentMessageId: chain.parentId,
-    next: { head, entries: entries.slice(), sessionId: input.sessionId, accountKey: input.accountKey },
-    reason,
-  })
+  const replay = (reason: FeedReason, headUnchanged = false): FeedDecision => {
+    const prompt = headUnchanged && typeof input.transcript === 'string' ? input.transcript : full
+    return {
+      prompt,
+      parentMessageId: chain.parentId,
+      next: { head, entries: entries.slice(), sessionId: input.sessionId, accountKey: input.accountKey },
+      reason,
+    }
+  }
 
   if (!input.reused) return detach('new-session')
   const chain = input.chain
@@ -325,10 +343,12 @@ export function decideFeed(input: FeedInput): FeedDecision {
   // 换了会话 / 换了账号 ⇒ 旧链的 message_id 在新会话里没有意义，只能当新会话的第一条。
   if (chain.sessionId !== input.sessionId) return detach('session-changed')
   if (chain.accountKey !== input.accountKey) return detach('account-changed')
+  // 头变了 ⇒ 新头从没发过，必须整份重发（这条**不能**省头）
   if (chain.head !== head) return replay('head-changed')
   // ⚠️ 这里曾经是 `isStrictPrefix`。它会被**每条**被改写的运行时注入打穿（DSH 每轮都改），
   // 于是链式投喂在真机上"每轮都重开"—— 见 canExtendChain 的注释。
-  if (!canExtendChain(chain.entries, entries)) return replay('not-appended')
+  // 头这一行已经确认两者相同 ⇒ 下面这条只可能是"历史没按预期追加"，可以省掉固定头。
+  if (!canExtendChain(chain.entries, entries)) return replay('not-appended', true)
 
   // 🔴 剔除「模型回声」（0.6.17）：增量里 `Assistant: …` 那些条目是**服务端上一轮的输出**，
   // 它已经在链上了（就在我们要挂的父消息位置）。再当输入发一遍既白烧 token，

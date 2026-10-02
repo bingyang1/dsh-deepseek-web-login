@@ -248,6 +248,61 @@ test('条目数没变（同一步重试）：重发全量但挂链尾', () => {
   assert.equal(d.parentMessageId, 42, '★ 挂链尾，不发根消息')
 })
 
+// ── 0.6.32：重发时**不重发固定头** ──────────────────────────────────────────
+// 走到 `replay` 说明链还在（同一网页端会话、同一账号）⇒ 那条会话的**首条消息**里
+// 已经把固定头给过了，重发它是纯重复。固定头 = system + 协议指令 + 工具目录，
+// 实测约 **6.35 万字符**，占一轮的大头 —— 用户 2026-10-02 报的"同一大段又出现一次"就是它。
+
+test('★ 链尾被改写 + 头没变 + 给了 transcript ⇒ 只发历史，**不重发固定头**', () => {
+  const d = decideFeed(
+    chainedInput({
+      entries: ENTRIES('User: 一', 'Assistant: 答一（被压缩重写过）', '[Tool Result for c1]\n结果'),
+      chainEntries: ENTRIES('User: 一', 'Assistant: 答一'),
+      input: { transcript: 'TRANSCRIPT-ONLY' },
+    }),
+  )
+  assert.equal(d.reason, 'not-appended')
+  assert.equal(d.prompt, 'TRANSCRIPT-ONLY', '头没变 ⇒ 不许重发固定头（它已经在会话首条消息里了）')
+  assert.notEqual(d.prompt, 'FULL-PROMPT', '自证：确实没退回旧的全量行为')
+  assert.equal(d.parentMessageId, 42, '★ 仍然挂链尾，不发根消息')
+  assert.deepEqual(
+    d.next?.entries,
+    ENTRIES('User: 一', 'Assistant: 答一（被压缩重写过）', '[Tool Result for c1]\n结果'),
+    '链的记账不受"发什么"影响',
+  )
+})
+
+test('★ 头变了 ⇒ 即使给了 transcript 也必须**整份重发**（新头从没发过）', () => {
+  const d = decideFeed(
+    chainedInput({ input: { head: `${HEAD}（工具目录变了）`, transcript: 'TRANSCRIPT-ONLY' } }),
+  )
+  assert.equal(d.reason, 'head-changed')
+  assert.equal(d.prompt, 'FULL-PROMPT', '新头没给过 ⇒ 必须连头一起发，否则模型手里是旧头')
+})
+
+test('★ 没给 transcript ⇒ 退回旧行为（整份重发）。漏传只是少省一点，不会错', () => {
+  const d = decideFeed(
+    chainedInput({
+      entries: ENTRIES('User: 一', 'Assistant: 答一（被改写过）', '[Tool Result for c1]\n结果'),
+      chainEntries: ENTRIES('User: 一', 'Assistant: 答一'),
+    }),
+  )
+  assert.equal(d.reason, 'not-appended')
+  assert.equal(d.prompt, 'FULL-PROMPT')
+})
+
+test('★ 历史变短（回退）+ 给了 transcript ⇒ 同样省掉固定头', () => {
+  const d = decideFeed(
+    chainedInput({
+      entries: ENTRIES('User: 一'),
+      chainEntries: ENTRIES('User: 一', 'Assistant: 答一', 'User: 二'),
+      input: { transcript: 'TRANSCRIPT-ONLY' },
+    }),
+  )
+  assert.equal(d.reason, 'not-appended')
+  assert.equal(d.prompt, 'TRANSCRIPT-ONLY')
+})
+
 test('追加了条目但内容全空白：当作没有新增 → 重发全量但挂链尾', () => {
   const d = decideFeed(
     chainedInput({
@@ -417,6 +472,41 @@ test('未超预算时 head + --- + entries 能拼回 full（增量才有意义�
   const parts = serializePromptParts(partsOptions)
   assert.equal(`${parts.head}\n\n---\n\n${parts.entries.join('\n\n')}`, parts.full)
   assert.ok(parts.entries.length >= 3, '转写条目要真的被拆出来')
+})
+
+// ── transcript：重发路径靠它省掉固定头，错了就会发错内容 ────────────────────
+// 0.6.32：`replay` 在"头没变"时只发 `transcript`（固定头已在会话首条消息里给过）。
+// 所以 `transcript` 必须**恒等于** full 里属于历史的那一段。
+test('★ transcript 恒等于 full 里"属于历史的那一段"（未超预算）', () => {
+  const parts = serializePromptParts(partsOptions)
+  assert.equal(parts.full, `${parts.head}\n\n---\n\n${parts.transcript}`, 'full = 头 + 分隔 + 历史')
+  assert.equal(parts.transcript, parts.entries.join('\n\n'), '未截断时它与条目拼出来的那份一致')
+})
+
+test('★ 超预算被截断时 transcript 也必须是**截断后**那份（否则"只发历史"会超出上限）', () => {
+  const huge = {
+    ...partsOptions,
+    maxChars: 12_000,
+    messages: [
+      ...partsOptions.messages,
+      { role: 'user', content: [{ type: 'text', text: '很长的历史。'.repeat(5_000) }] },
+    ],
+  }
+  const parts = serializePromptParts(huge)
+  assert.equal(parts.full, `${parts.head}\n\n---\n\n${parts.transcript}`, 'full = 头 + 分隔 + 历史（截断后）')
+  assert.notEqual(
+    parts.transcript,
+    parts.entries.join('\n\n'),
+    '自证：这份输入确实触发了截断（否则这条用例什么都没测到）',
+  )
+  assert.ok(
+    parts.transcript.length < parts.full.length,
+    '只发历史必须比发整份更短 —— 否则这个优化等于没做',
+  )
+  assert.ok(
+    parts.full.length <= huge.maxChars,
+    '整份要在预算内（自证：不是截断逻辑本身坏了）',
+  )
 })
 
 test('超预算被截断时：entries 仍是**未截断**的那份，full 才是截断后的', () => {

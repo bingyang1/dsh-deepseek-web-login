@@ -1306,6 +1306,9 @@ export function createAdapter(deps: AdapterDeps) {
               promptParts: {
                 head: promptParts.head,
                 entries: promptParts.entries,
+                // 重发（replay）时用来省掉固定头 —— 它在会话首条消息里已经给过了。
+                // 不传 ⇒ 退回旧行为（整份重发），所以漏传只是"少省一点"，不会错。
+                transcript: promptParts.transcript,
                 maxChars: deps.config.maxPromptChars ?? DEFAULT_MAX_PROMPT_CHARS,
               },
             }

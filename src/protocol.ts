@@ -685,6 +685,16 @@ export interface PromptParts {
   entries: string[]
   /** 真正发出去的那份字符串（超预算时是截断后的）—— 与 serializePrompt 的返回值一致。 */
   full: string
+  /**
+   * `full` 里**属于历史的那一段**（不含固定头；超预算时是截断后的那份）。
+   * 恒有 `full === head + '\n\n---\n\n' + transcript`（历史为空时 `transcript` 为空串）。
+   *
+   * 🔴 为什么需要它（2026-10-02）：链式投喂"退回全量重发"时，固定头**已经在会话首条消息里
+   * 给过了** —— 只要它没变，重发纯属重复。而实测这段固定头约 **6.35 万字符**，
+   * 占一轮的大头：用户在网页端看到的就是"同一大段又出现一次"。
+   * 有了它，重发时可以只发历史那一段（见 `context-feed.ts` 的 `replay`）。
+   */
+  transcript: string
 }
 
 export function serializePrompt(options: SerializeOptions): string {
@@ -762,7 +772,7 @@ export function serializePromptParts(options: SerializeOptions): PromptParts {
   const head = system ? `${system}${protocol}` : protocol.trim()
   const merged = transcript ? `${head}\n\n---\n\n${transcript}` : head
 
-  if (merged.length <= maxChars) return { head, entries: lines, full: merged }
+  if (merged.length <= maxChars) return { head, entries: lines, full: merged, transcript }
 
   // ⚠️ N07（2026-09-13 第二轮审计）：**固定头（system + 协议 + 工具目录）必须完整**，
   // 不能再按 `maxChars * HEAD_RATIO` 去截它。
@@ -779,7 +789,10 @@ export function serializePromptParts(options: SerializeOptions): PromptParts {
       'CONTEXT_WINDOW_EXCEEDED',
     )
   }
-  return { head, entries: lines, full: head + separator + truncateMiddle(transcript, budget, 0.7) }
+  // ⚠️ `transcript` 交出去的必须是**截断后**那一份 —— 否则"只发历史"的重发路径会比
+  //    原来的全量还长（超出 maxChars），那就把一次优化做成了事故。
+  const sentTranscript = truncateMiddle(transcript, budget, 0.7)
+  return { head, entries: lines, full: head + separator + sentTranscript, transcript: sentTranscript }
 
 }
 
