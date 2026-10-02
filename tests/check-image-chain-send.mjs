@@ -74,7 +74,7 @@ const E2 = '[Tool Result for c1]\n结果一'
 const E3 = 'User: 第二问'
 
 /** 跑一轮，返回**真正发出去的那个请求体**。 */
-async function runRound({ auth = authA, transport, head = HEAD, entries, refFileIds, id }) {
+async function runRound({ auth = authA, transport, head = HEAD, entries, refFileIds, id, dshSessionId }) {
   const bodies = []
   setFetchImpl(async (url, init) => {
     bodies.push(JSON.parse(String(init?.body ?? '{}')))
@@ -87,6 +87,7 @@ async function runRound({ auth = authA, transport, head = HEAD, entries, refFile
       prompt: full,
       promptParts: { head, entries, maxChars: 1_500_000 },
       ...(refFileIds ? { refFileIds } : {}),
+      ...(dshSessionId !== undefined ? { dshSessionId } : {}),
       thinkingEnabled: false,
       modelType: 'default',
       idleTimeoutMs: 5_000,
@@ -203,6 +204,32 @@ await test('full 模式（默认）不受影响：每轮都发全部', async () 
   assert.equal(b2.parent_message_id, null, 'full 模式恒为根消息')
   assert.deepEqual(b1.ref_file_ids, ['f1'])
   assert.deepEqual(b2.ref_file_ids, ['f1'], 'full 模式不参与"只发新增"的优化')
+})
+
+// ── 0.6.27：图片账本必须**按会话**分开 ──────────────────────────────────────
+// 现场（2026-10-02 用户报）：「我这轮没发图片，网页端却又有图片了」——
+// 图确实是他早先发的，但被**重复挂到了后面不含图的消息上**。
+//
+// 旧实现是「一个全局 Set + 一个 sentRefIdsSession 变量」，两个窗口交错时会互相覆盖：
+//   ① A 请求进来 ⇒ 记成 A
+//   ② B 请求进来（A 还没回来）⇒ **清空**，记成 B（A 的账没了）
+//   ③ A 的下一轮 ⇒ 发现 session 不是自己 ⇒ **再清一次**
+//   ⇒ A 里早就发出去过的图，每轮都被当成"没发过" ⇒ 反复重发。
+await test('★ 两个窗口交错：各自的图片账本互不干扰（A 发过的图不许再发）', async () => {
+  resetSessionReuse()
+  const t = mkTransport()
+  const imgs = ['f1']
+  const a1 = await runRound({ transport: t, entries: [E1], refFileIds: imgs, id: 2, dshSessionId: 'win-A' })
+  assert.deepEqual(a1.ref_file_ids, ['f1'], 'A 首轮：服务端没见过 ⇒ 要发')
+  // ⚠️ 这一步就是旧实现翻车的地方：B 进来会把 A 的账清掉
+  const b1 = await runRound({ transport: t, entries: [E1], refFileIds: imgs, id: 4, dshSessionId: 'win-B' })
+  assert.deepEqual(b1.ref_file_ids, ['f1'], 'B 是另一个会话 ⇒ 它也得发')
+  const a2 = await runRound({ transport: t, entries: [E1, E2], refFileIds: imgs, id: 6, dshSessionId: 'win-A' })
+  assert.equal(a2.parent_message_id, 2, '自证：A 这一轮是链式（不是 restart）')
+  assert.deepEqual(a2.ref_file_ids, [], '★ A 早就发过这张图 ⇒ 不许重发（旧实现会在这里重发）')
+  const b2 = await runRound({ transport: t, entries: [E1, E2], refFileIds: imgs, id: 8, dshSessionId: 'win-B' })
+  assert.equal(b2.parent_message_id, 4, '自证：B 这一轮是链式')
+  assert.deepEqual(b2.ref_file_ids, [], '★ B 也不许重发')
 })
 
 console.log(

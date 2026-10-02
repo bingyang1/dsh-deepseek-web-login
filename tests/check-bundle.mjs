@@ -899,12 +899,15 @@ const checks = {
     // ⚠️ 别写 `return { sessionId, resp, feed };` —— 打包器会把这个对象**折成多行**，
     // 那种断言会假红（第一版就栽在这）。用 `return \{` 收尾即可。
     /for \(const item of refItemsToSend\) sentRefIds\.add\(item\.key\);[\s\S]{0,60}?return \{/.test(host),
+  // 0.6.27 起形态变了（一个全局 Set → Map<sessionId, Set>），**意图不变**：
+  // 账本按会话归属，会话/账号换了就不复用上一份 —— 但并发窗口之间**不许互相清账**。
   'host 的"服务端已知"集合按会话归属（会话换了就整批作废）':
-    /if \(sentRefIdsSession !== sessionId\) \{[\s\S]{0,90}?sentRefIdsSession = sessionId;/.test(host),
+    /sentRefIdsBySession\.get\(sessionId\) \?\? /.test(host),
   // ⚠️ 只断 disposeSessionReuse：`resetSessionReuse` 是测试专用、没有生产调用点，
   // 会被打包器 tree-shake 掉（产物里 0 次命中）—— 拿它写断言必然假红。
   'host 的会话退役会清掉"服务端已知"集合（否则新会话会误以为图已经发过）':
-    /function disposeSessionReuse\(\) \{[\s\S]{0,200}?sentRefIds = /.test(host),
+    /function dropSentRefIds\(sessionId\) \{[\s\S]{0,80}?sentRefIdsBySession\.delete\(sessionId\)/.test(host) &&
+    /disposeSessionReuse\(\) \{[\s\S]{0,240}?sentRefIdsBySession\.clear\(\)/.test(host),
 
   // ── 0.1.84：0.2.0-a 修复批（R3 看门狗 / R7 浏览器清理 / relogin 泄漏 / R8 fail-closed）──
   'host 的闸门许可带看门狗（被丢弃的许可超阈值强制回收 + 告警，只在串行模式）':
@@ -991,6 +994,16 @@ const checks = {
     /params\.promptParts \? slotKeyFor\(auth, params\.dshSessionId\) : `internal\|\$\{accountKey\(auth\)\}`/.test(host),
   'client 的「自动换号」提示说清了"换号会在网页端多出一个会话"':
     client.includes('每换一次号，网页端就会多出一个新会话'),
+
+  // ── 0.6.27：图片账本按会话分开 ─────────────────────────────────────────────
+  // 旧实现「一个全局 Set + 一个 sentRefIdsSession 变量」在多窗口交错时会互相清账，
+  // 导致"早就发过的图每轮重发、被挂到后面每条消息上"（用户现场 2026-10-02）。
+  // ⚠️ 负向断言必须限定在**代码**里：注释里仍留着旧变量名（`sentRefIdsSession`），
+  //    全文扫"不存在某字符串"会误判 —— 这个项目为此踩过坑（见产物断言铁律第 5 条）。
+  'host 的图片账本按会话分开（多窗口交错不许互相清账 ⇒ 图不会被反复重挂）':
+    /const sentRefIds = sentRefIdsBySession\.get\(sessionId\)/.test(host) &&
+    /sentRefIdsBySession\.set\(sessionId, sentRefIds\)/.test(host) &&
+    !/\blet sentRefIdsSession\b/.test(host),
 }
 
 let failed = 0

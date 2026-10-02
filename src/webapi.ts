@@ -2016,13 +2016,27 @@ let lastRetireReason: string | undefined
  * 服务端**已知**的图片 file_id（0.1.83）：本会话内已经随请求发出去过的那批。
  *
  * 只用于链式投喂：走 `chained`（有父链）时服务端会回溯历史、那张图已经在它的上下文里，
- * 于是每轮重带整批是纯冗余 —— 真机实测见 tests/probe-image-chain.mjs（两张不同布局的图、
- * 第二轮都不带 `ref_file_ids`，仍都答对四个角）。
+ * 于是每轮重带整批是纯冗余 —— 真机实测见 tests/probe-image-chain.mjs。
  * 会话换掉就整批作废：新会话没有那份历史。
+ *
+ * 🔴 0.6.27：改成**按会话分别记账**（原来是「一个全局 Set + 一个 sentRefIdsSession 变量」）。
+ *
+ * 旧写法在**多窗口并发**下会互相覆盖，链条是：
+ *   ① 窗口 A 的请求进来 → `sentRefIdsSession !== A` ⇒ `sentRefIds` **清空**、记成 A
+ *   ② 窗口 B 的请求进来（A 还没回来）→ `sentRefIdsSession !== B` ⇒ **又清空**（A 的账没了）
+ *   ③ A 的下一轮进来 → `sentRefIdsSession` 是 B ⇒ **再清一次**
+ *   ⇒ A 里"早就发出去过"的图每轮都被当成没发过 ⇒ **反复重发**，
+ *     网页端于是把那些图挂到了**后面的每一条消息**上。
+ *
+ * 用户现场（2026-10-02）：「我这轮没发图片，网页端却又有图片了」——
+ * 那张图确实是他早先发的，但它被重复挂到了不含图的那几条消息上。
  */
-let sentRefIds = new Set<string>()
-/** `sentRefIds` 归属的会话 id（见上）。 */
-let sentRefIdsSession: string | undefined
+const sentRefIdsBySession = new Map<string, Set<string>>()
+
+/** 会话退役时连它的图片账一起销掉（否则 Map 会跟着开过的窗口一直涨）。 */
+function dropSentRefIds(sessionId: string): void {
+  sentRefIdsBySession.delete(sessionId)
+}
 
 /**
  * 上一次上报过的决策原因（0.1.63）。链式投喂的决策每轮都在做，
@@ -2211,6 +2225,7 @@ function evictIdleSlots(): void {
   for (const slot of idle.slice(0, reuseSlots.size - MAX_CONVERSATION_SLOTS)) {
     reuseSlots.delete(slot.key)
     contextChains.delete(slot.key)
+    dropSentRefIds(slot.sessionId)
     if (lastChainKey === slot.key) lastChainKey = undefined
   }
 }
@@ -2220,9 +2235,11 @@ export function retireSession(sessionId?: string): void {
   if (!sessionId) {
     reuseSlots.clear()
     contextChains.clear()
+    sentRefIdsBySession.clear()
     lastChainKey = undefined
     return
   }
+  dropSentRefIds(sessionId)
   for (const [key, slot] of [...reuseSlots]) {
     if (slot.sessionId === sessionId) reuseSlots.delete(key)
   }
@@ -2250,8 +2267,7 @@ export function disposeSessionReuse(): string | undefined {
   contextChains.clear()
   lastChainKey = undefined
   // 0.1.83：图片的"服务端已知"集合同样归会话所有，会话退役就作废
-  sentRefIds = new Set()
-  sentRefIdsSession = undefined
+  sentRefIdsBySession.clear()
   if (slots.length === 0) return undefined
   for (const slot of slots) {
     try {
@@ -2271,8 +2287,7 @@ export function resetSessionReuse(): void {
   // 决策回执的状态也是模块级的（见 lastFeedReason），一并清掉，测试之间才互不干扰
   lastFeedReason = undefined
   // 0.1.83：图片的"服务端已知"集合也是模块级的，一并清掉
-  sentRefIds = new Set()
-  sentRefIdsSession = undefined
+  sentRefIdsBySession.clear()
 }
 
 /** 链式投喂的决策回执（见 CompletionParams.onContextFeed）。 */
@@ -2485,12 +2500,11 @@ async function openCompletion(
     //   · 有父链 ⇒ 服务端手里已有 ⇒ 只发新增的那几张（多数轮是 0 张）
     //   · 全量重发（restart / 新会话 / 切号 / head 变了）⇒ 服务端手里没有 ⇒ 发全部
     // ⚠️ 不能写成"chained 就完全不带"：用户**这一轮新贴**的图只存在于增量里，漏了就是功能坏。
-    if (sentRefIdsSession !== sessionId) {
-      sentRefIds = new Set()
-      sentRefIdsSession = sessionId
-    }
+    // ⚠️ 取**本会话自己的**那本账（没有就是新的）。绝不能再写成"发现会话不同就清全局"——
+    // 那会让并发的另一个窗口把账抹掉，见 sentRefIdsBySession 的注释。
+    const sentRefIds = sentRefIdsBySession.get(sessionId) ?? new Set<string>()
     // 0.2.0：每项携带着与 id 一一对应的 key（缺省退回 id 本身，向后兼容）。
-    // sentRefIds 按 **key** 记账：fileId 会随 uploadCache 驱逐重传而变，
+    // 按 **key** 记账：fileId 会随 uploadCache 驱逐重传而变，
     // key 是内容寻址的稳定身份 —— "服务端见没见过这张图"不该取决于这一次用哪个 fileId 引用。
     const askedRefItems = (params.refFileIds ?? []).map((id, index) => ({
       id,
@@ -2578,6 +2592,7 @@ async function openCompletion(
       // 请求已被服务端接受 ⇒ 这批 file_id 进了它的上下文（下一轮起不必再带）。
       // ⚠️ 只在**接受之后**记：失败/被拒的请求不算，免得下一轮误以为服务端已经拿到了。
       for (const item of refItemsToSend) sentRefIds.add(item.key)
+      sentRefIdsBySession.set(sessionId, sentRefIds)
       return { sessionId, resp, feed }
     }
 
