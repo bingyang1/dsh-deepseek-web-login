@@ -214,8 +214,16 @@ await test('cookie 与 extraHeaders 双空 → 判为「捕获信息偏少」', 
   assert.ok(reason, '双空是这次现场的形态（acc_2df7cf2f）')
 })
 
+// ⚠️ 下面几条的 fixture 里**必须带上 `x-device-id`**：0.6.30 起"有头但缺设备指纹"本身就是
+// 一种缺陷（上游对"缺少浏览器设备指纹"直接判 `RISK_DEVICE_DETECTED`）。
+// 少了它，这几条会因为**另一个原因**变红，就测不到它们本来要守的那条（"cookie 为空不算缺陷"）。
+const HEADERS_OK = {
+  'x-client-version': '2.5.0',
+  'x-device-id': 'de915f65-0000-0000-0000-000000000000',
+}
+
 await test('只有 cookie 为空 → **不**判（鉴权只用 token，手工粘 token 就是没 cookie）', () => {
-  assert.equal(captureDefect({ token: 'tok', cookie: '', extraHeaders: { 'x-client-version': '1' } }), undefined)
+  assert.equal(captureDefect({ token: 'tok', cookie: '', extraHeaders: HEADERS_OK }), undefined)
 })
 
 await test('只有请求头为空 → 不判', () => {
@@ -223,7 +231,16 @@ await test('只有请求头为空 → 不判', () => {
 })
 
 await test('两者都在 → 不判', () => {
-  assert.equal(captureDefect({ token: 'tok', cookie: 'ds_session_id=x', extraHeaders: { a: 'b' } }), undefined)
+  assert.equal(captureDefect({ token: 'tok', cookie: 'ds_session_id=x', extraHeaders: HEADERS_OK }), undefined)
+})
+
+await test('★ 有头但缺 x-device-id → 判（上游对缺设备指纹直接 RISK_DEVICE_DETECTED）', () => {
+  const reason = captureDefect({ token: 'tok', cookie: 'ds_session_id=x', extraHeaders: { 'x-client-version': '2.5.0' } })
+  assert.match(
+    String(reason ?? ''),
+    /x-device-id/,
+    '缺设备指纹必须留痕 —— 它会被上游判 RISK_DEVICE_DETECTED，不是"信息少一点"',
+  )
 })
 
 await test('根本没有 token（不是捕获场景）→ 不判', () => {

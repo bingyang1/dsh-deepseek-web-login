@@ -43,34 +43,53 @@ export const DEFAULT_WASM_URL = 'https://fe-static.deepseek.com/chat/static/sha3
 export const FALLBACK_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
+/**
+ * 网页端 `x-client-version` 的兜底值（**抓取失败时**才用）。
+ *
+ * 🔴 这个值会随网页端发版过时，而且**没有任何自动机制会发现它过时** ——
+ * 旧实现写死 `2.0.0`，到 2026-10-02 已经落后到 `2.5.0`（真实捕获值）。
+ * 所以：① 优先永远用抓来的真值（`auth.extraHeaders`）；
+ * ② 这里只保证"万一没有真值时，不至于差得离谱"；③ 每次核对捕获时顺手校准一次。
+ */
+export const FALLBACK_CLIENT_VERSION = '2.5.0'
+
 export interface DsHeaders {
   [key: string]: string
 }
 
 /**
  * 组装一次网页端请求的头。
- * 优先复用登录时捕获的浏览器真实头（extraHeaders），再用最新登录态覆盖
- * authorization/cookie/指纹；user-agent 采用浏览器值（网页端接口需要浏览器指纹），
- * DSH 归属信息通过 `x-deepseek-harness` 头显式声明。
+ *
+ * 顺序与优先级（2026-10-02 重排，理由见下）：
+ *   ① 先铺**登录时从真实浏览器抓来的指纹头**（`auth.extraHeaders`）——
+ *      头的**顺序本身就是指纹**，浏览器给什么顺序就用什么顺序；
+ *      而且它的值比我们写死的兜底更可信（`x-client-version` 随网页端版本走，写死必然过时）。
+ *   ② 再补**兜底**，且只补浏览器没给的（写死值绝不能盖掉抓来的真值）。
+ *   ③ 最后放**逐请求现算**的头（token / cookie / hif / pow / content-type / origin / referer）——
+ *      这些必须用**当前**登录态，复用快照里的旧值会出错。
  */
 export function buildDsHeaders(auth: WebAuth, referer?: string): DsHeaders {
-  const headers: DsHeaders = {
-    'user-agent': auth.userAgent || FALLBACK_UA,
+  const headers: DsHeaders = { ...(auth.extraHeaders ?? {}) }
+  const defaults: DsHeaders = {
     accept: 'application/json, text/plain, */*',
     'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'content-type': 'application/json',
-    origin: DS_BASE,
-    referer: referer || `${DS_BASE}/`,
     'x-client-platform': 'web',
-    'x-client-version': '2.0.0',
-    'x-app-version': '2.0.0',
-    ...(auth.extraHeaders ?? {}),
+    // ⚠️ 只是**兜底**：抓取成功时用的一定是浏览器的真实值（实测 2026-10-02 是 `2.5.0`）。
+    // 写死值必然随网页端发版而过时 —— 过时的后果是功能降级（"更新到最新版才能用专家/识图"），
+    // 不是鉴权失败。
+    'x-client-version': FALLBACK_CLIENT_VERSION,
+    // ⚠️ 真实浏览器**不发**这个头（2026-10-02 核对真实捕获：7 个 `x-*` 里没有它）。
+    // 保留是为了不改变既有行为；想更贴近浏览器，删掉下面这行即可。
+    'x-app-version': FALLBACK_CLIENT_VERSION,
   }
-  headers.authorization = `Bearer ${auth.token}`
+  for (const [key, value] of Object.entries(defaults)) {
+    if (!headers[key]) headers[key] = value
+  }
+  headers['user-agent'] = auth.userAgent || FALLBACK_UA
   headers['content-type'] = 'application/json'
   headers.origin = DS_BASE
   headers.referer = referer || `${DS_BASE}/`
-  headers['user-agent'] = auth.userAgent || headers['user-agent'] || FALLBACK_UA
+  headers.authorization = `Bearer ${auth.token}`
   headers['x-deepseek-harness'] = 'deepseek-harness (+https://github.com/deepseek-ai/deepseek-harness); provider=deepseek-web'
   // 这两个头由本插件按次生成/捕获，绝不复用快照里的旧值
   delete headers['x-ds-pow-response']

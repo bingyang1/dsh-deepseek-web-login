@@ -83,13 +83,26 @@ export interface WebAuth {
  * 2026-09-21 的现场：`acc_2df7cf2f` 正是 cookie 与 extraHeaders 双空，
  * 且它 `capturedAt` 刷新后 19 秒就撞了 `code 9 / invalid ref file id`。
  * ⚠️ 但这只是**时间相关**，不是已证实的因果 —— 所以这里只留痕，不据此阻断。
+ *
+ * 2026-10-02 补一条：**抓到了头、但里面没有 `x-device-id`** 也算缺陷。
+ * 依据：真实捕获（同日 03:42Z）里 `x-device-id` 是一个 UUID（数美设备指纹），
+ * 且上游对"缺少浏览器设备指纹"会直接返回 `biz_code=11 / RISK_DEVICE_DETECTED`。
+ * 所以缺了它就不是"信息少一点"，而是**会被风控判定**。
+ * ⚠️ 只覆盖"有头但缺这一项"；`extraHeaders` 整个为空的手工粘 token 路径**故意不碰**
+ * （那条路本来就没有任何浏览器头，是既有设计，另议）。
  */
 export function captureDefect(auth: Pick<WebAuth, 'token' | 'cookie' | 'extraHeaders'>): string | undefined {
   if (!String(auth.token ?? '').trim()) return undefined
   const hasCookie = !!String(auth.cookie ?? '').trim()
-  const hasHeaders = !!auth.extraHeaders && Object.keys(auth.extraHeaders).length > 0
-  if (hasCookie || hasHeaders) return undefined
-  return '本次捕获只拿到 token（cookie 与请求头都为空）—— 若之后出现图片引用被拒（code 9）之类的异常，优先怀疑这份凭证'
+  const headers = auth.extraHeaders ?? {}
+  const hasHeaders = Object.keys(headers).length > 0
+  if (!hasCookie && !hasHeaders) {
+    return '本次捕获只拿到 token（cookie 与请求头都为空）—— 若之后出现图片引用被拒（code 9）之类的异常，优先怀疑这份凭证'
+  }
+  if (hasHeaders && !String(headers['x-device-id'] ?? '').trim()) {
+    return '本次捕获的请求头里没有 x-device-id（数美设备指纹）—— 上游对"缺少浏览器设备指纹"会直接判 RISK_DEVICE_DETECTED（biz_code=11），建议重新登录一次把这份凭证补全'
+  }
+  return undefined
 }
 
 /** 当前生效的登录凭证（没有选择账号 → undefined）。 */

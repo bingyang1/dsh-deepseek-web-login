@@ -17,7 +17,7 @@ import { pickCookieMeta, type CookieMeta } from './cookies.ts'
 import { createRequire } from 'node:module'
 import { captureDefect, clearAuth, maskIdentifier, readAuth, unwrapStoredToken, withVerifiedIdentity, type WebAuth } from './auth.ts'
 import { commitCapturedAuth } from './account-add.ts'
-import { clearBrowserLoginProfile } from './browser-login.ts'
+import { clearBrowserLoginProfile, pickExtraHeaders } from './browser-login.ts'
 import { DS_BASE, DEFAULT_WASM_URL, FALLBACK_UA, validateAuth } from './webapi.ts'
 
 const PARTITION = 'persist:dsh-deepseek-web-login'
@@ -617,15 +617,10 @@ function hookHeaders(ses: any, buffer: CaptureBuffer, onRewrite?: (info: { url: 
       if (cleanLower['cookie']) buffer.cookie = cleanLower['cookie']
       if (cleanLower['x-hif-dliq']) buffer.hifDliq = cleanLower['x-hif-dliq']
       if (cleanLower['x-hif-leim']) buffer.hifLeim = cleanLower['x-hif-leim']
+      // 收头的规则**只有一处**（`pickExtraHeaders`）：两条登录路径（CDP / webRequest）
+      // 必须收出同一套头，否则"同一个账号换个登录方式，指纹就变了"，而且不会有任何报错。
       if (!buffer.extraHeaders['x-client-version']) {
-        const snapshot: Record<string, string> = {}
-        for (const [key, value] of Object.entries(cleanLower)) {
-          if (!/^x-/.test(key)) continue
-          if (key === 'x-ds-pow-response' || key === 'x-hif-dliq' || key === 'x-hif-leim') continue
-          snapshot[key] = value
-        }
-        if (cleanLower['accept-language']) snapshot['accept-language'] = cleanLower['accept-language']
-        buffer.extraHeaders = snapshot
+        buffer.extraHeaders = pickExtraHeaders(cleanLower)
       }
     }
     callback({ requestHeaders: headers })

@@ -1037,6 +1037,19 @@ const checks = {
     /if \(accountLevel\)[\s\S]{0,24}?keepIds\?\.add\(sessionId\)/.test(host),
   'host 的收尾逻辑认 keepIds（新建出来的会话撞上账号级失败也不许被回收）':
     /for \(const id of owned\) \{[\s\S]{0,140}?if \(limit > 0 && keepIds\.has\(id\)/.test(host),
+
+  // ── 0.6.30：请求头补齐（L1）────────────────────────────────────────────────
+  // 旧规则只认 `x-*`，于是浏览器**自动加**的 `sec-ch-ua*` / `sec-fetch-*` / `priority`
+  // 全被丢掉 —— 这批是"是不是真浏览器"最表层的信号，补上是零成本的。
+  'host 的收头白名单覆盖浏览器自动加的那批（sec-ch-ua* / sec-fetch-* / priority / accept）':
+    /FINGERPRINT_HEADER_RE = \/\^\(\?:x-\|sec-ch-ua\|sec-fetch-\)\//.test(host) &&
+    /FINGERPRINT_HEADER_EXACT = \/\* @__PURE__ \*\/ new Set\(\[[\s\S]{0,120}?"priority"[\s\S]{0,80}?"accept"/.test(host),
+  'host 的 buildDsHeaders 先铺抓来的头（顺序即指纹），兜底只补缺失的':
+    /function buildDsHeaders\(auth, referer\) \{[\s\S]{0,120}?const headers = \{ \.\.\.auth\.extraHeaders \?\? \{\} \}/.test(host) &&
+    // ⚠️ 打包器会去掉单语句的花括号 ⇒ 断言里别写 `{ ... }`，否则必然假红（0.6.29 踩过）
+    /if \(!headers\[key\]\) headers\[key\] = value/.test(host),
+  'host 缺 x-device-id 会被判为捕获缺陷（上游对缺设备指纹直接判 RISK_DEVICE_DETECTED）':
+    /function captureDefect\(auth\) \{[\s\S]{0,700}?x-device-id/.test(host),
 }
 
 let failed = 0

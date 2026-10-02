@@ -104,19 +104,60 @@ export function buildCookieHeader(cookies: readonly any[]): string {
 }
 
 /**
- * 从 `/api/*` 请求头里挑出我们需要的指纹/版本头（与旧 webRequest 钩子同款规则）。
- * 纯函数，便于单测。
+ * 浏览器**指纹头**的名字判据 —— 只有"浏览器行为的一部分、且可跨请求复用"的才收。
+ *
+ * 这个判据**只能有一处**：原先它在 `browser-login.ts`（CDP 路径）和 `login.ts`
+ * （旧的 webRequest 路径）各写了一遍，收的还只有 `x-*`。两份一旦漂移，
+ * "同一账号用不同路径登录、指纹就不一样"，而且不会有任何报错。
+ */
+const FINGERPRINT_HEADER_RE = /^(?:x-|sec-ch-ua|sec-fetch-)/
+const FINGERPRINT_HEADER_EXACT = new Set(['priority', 'accept', 'accept-language'])
+
+/**
+ * 逐请求**现算**的头 —— 收进快照就是 bug：下一轮用旧值会把当前登录态盖掉。
+ *
+ * ⚠️ `accept-encoding` 是**故意**收在外面的，理由不是"不该收"而是"收了会坏"：
+ * 它是浏览器的解压能力声明，服务端可能据此回 `zstd`，而 Node 侧的 `fetch`（undici）
+ * 不保证能解 —— 一旦解不开，SSE 会**静默变成乱码**（不是报错，是内容全错）。
+ * 宁可少一个头，也不要静默坏掉。将来若要收，必须先验证整条解压链。
+ */
+const PER_REQUEST_HEADERS = new Set([
+  'x-ds-pow-response',
+  'x-hif-dliq',
+  'x-hif-leim',
+  'authorization',
+  'cookie',
+  'content-type',
+  'content-length',
+  'host',
+  'connection',
+  'transfer-encoding',
+  'accept-encoding',
+  'origin',
+  'referer',
+  'user-agent', // 单独存 auth.userAgent（它要参与请求头，但需要单独的字段）
+])
+
+/**
+ * 从浏览器请求头里挑出可复用的**指纹头**（纯函数，便于单测）。
+ *
+ * 为什么重要（2026-10-02 核对真实捕获）：
+ * 旧规则只留 `x-*`，于是浏览器**自动加**的那一批全被丢掉 ——
+ * `sec-ch-ua` / `sec-ch-ua-mobile` / `sec-ch-ua-platform`、`sec-fetch-dest/mode/site`、
+ * `priority`。这些是"是不是真浏览器"最表层、最容易被看到的一批信号，
+ * 而丢掉它们的代价是零成本就能避免的。
+ *
+ * ⚠️ 顺序必须保留：**头的顺序本身就是指纹**。`Object.entries` 按插入顺序遍历，
+ * 而调用方是按浏览器给的顺序建这个对象的 ⇒ 收出来的 `out` 就是浏览器的相对顺序。
  */
 export function pickExtraHeaders(headers: Record<string, any> | undefined): Record<string, string> {
   const out: Record<string, string> = {}
   for (const [key, value] of Object.entries(headers ?? {})) {
     const lower = key.toLowerCase()
-    if (!/^x-/.test(lower)) continue
-    if (lower === 'x-ds-pow-response' || lower === 'x-hif-dliq' || lower === 'x-hif-leim') continue
+    if (PER_REQUEST_HEADERS.has(lower)) continue
+    if (!FINGERPRINT_HEADER_RE.test(lower) && !FINGERPRINT_HEADER_EXACT.has(lower)) continue
     out[lower] = String(value)
   }
-  const acceptLanguage = Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === 'accept-language')
-  if (acceptLanguage) out['accept-language'] = String(acceptLanguage[1])
   return out
 }
 
